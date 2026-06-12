@@ -1,9 +1,9 @@
 """Phase 1 verification: flat-ground kinematic rollout vs the recorded run.
 
 Drives the kinematic twin with run 18_04_51's recorded wheel-velocity setpoints
-(ideal no-slip: alpha=1, x_ICR=0) and compares the chassis/prism trajectory to
-the total-station ground truth. This validates the data pipeline (order/sign/
-units), the twist model, and SE(2) integration before any terrain solve.
+(ideal no-slip: alpha=1, x_ICR=0) over a flat heightmap and compares the
+chassis/prism trajectory to the total-station ground truth. Validates the data
+pipeline (order/sign/units) and the twist model against real cruise speed.
 
 Run:  python -m kinematic_helhest.eval_phase1 [--run PATH] [--plot OUT.png]
 """
@@ -13,8 +13,8 @@ import pathlib
 import numpy as np
 
 from . import data
+from . import heightmap
 from . import rollout
-from . import twist
 
 
 def main():
@@ -34,11 +34,12 @@ def main():
     print(f"Run {run_id}: {setpoints.shape[0]} steps @ dt={args.dt}s "
           f"(alpha={args.alpha}, x_ICR={args.x_icr})")
 
-    pose2 = rollout.rollout_flat(setpoints, args.dt, alpha=args.alpha, x_icr=args.x_icr)
+    out = rollout.rollout_terrain(setpoints, args.dt, heightmap.flat(),
+                                  alpha=args.alpha, x_icr=args.x_icr)
+    pose2 = out["pose2"]
 
     # Sim prism track (start-relative), mirroring replay_real's comparison.
-    pose7 = twist.pose2_to_pose7(pose2)
-    sim_prism = data.prism_track(pose7)
+    sim_prism = data.prism_track(out["pose7"])
     sim_rel = sim_prism - sim_prism[0]
 
     net_sim = np.linalg.norm(pose2[-1, :2] - pose2[0, :2])

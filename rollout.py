@@ -1,117 +1,67 @@
-"""Flat-ground forward rollout (Phase 1), batched over B parameter sets.
+"""Drive the kinematic twin over a heightmap and collect the trajectory.
 
-Drives the kinematic twin with a recorded wheel-speed sequence and integrates the
-planar pose. No terrain solve yet: z = wheel radius, level. Phases 2+ replace the
-flat placement with the heightmap settling solve.
+`rollout_terrain` settles an initial pose into a valid State (state.py) and
+applies the physics step for each recorded wheel-speed command.
 """
 import numpy as np
 
-from . import placement
-from . import twist
 from .model import HALF_TRACK
 from .model import WHEEL_RADIUS
 
 
-def rollout_flat(setpoints, dt, alpha=1.0, x_icr=0.0, init_pose=None,
-                 R=WHEEL_RADIUS, b=HALF_TRACK):
-    """Roll out a wheel-speed sequence on flat ground.
-
-    setpoints : [T, 3] wheel speeds [left, right, rear] (rad/s).
-    alpha, x_icr : scalar, or [B] arrays to roll out B parameter sets at once.
-    init_pose : (x, y, yaw) or [B, 3]; defaults to origin.
-
-    Returns pose2 [B, T, 3] (x, y, yaw); B is squeezed out if params were scalar.
-    """
-    setpoints = np.asarray(setpoints, dtype=np.float64)
-    T = setpoints.shape[0]
-
-    alpha = np.atleast_1d(np.asarray(alpha, dtype=np.float64))
-    x_icr = np.atleast_1d(np.asarray(x_icr, dtype=np.float64))
-    B = max(alpha.shape[0], x_icr.shape[0])
-    alpha = np.broadcast_to(alpha, (B,))
-    x_icr = np.broadcast_to(x_icr, (B,))
-    scalar = (np.ndim(np.squeeze(alpha)) == 0) and B == 1
-
-    if init_pose is None:
-        pose = np.zeros((B, 3), dtype=np.float64)
-    else:
-        pose = np.broadcast_to(np.asarray(init_pose, dtype=np.float64), (B, 3)).copy()
-
-    poses = np.empty((B, T, 3), dtype=np.float64)
-    for t in range(T):
-        omega = np.broadcast_to(setpoints[t], (B, 3))
-        vx, vy, wz = twist.wheel_twist(omega, alpha, x_icr, R, b)
-        pose = twist.se2_integrate(pose, vx, vy, wz, dt)
-        poses[:, t] = pose
-
-    return poses[0] if scalar else poses
-
-
 def rollout_terrain(setpoints, dt, hm, alpha=1.0, x_icr=0.0, init_pose=(0.0, 0.0, 0.0),
                     mu_field=None, k=2.0, R=WHEEL_RADIUS, b=HALF_TRACK):
-    """Roll out on a heightmap: settle every step, advance through the tilt.
+    """Roll out on a heightmap by repeated `state.step` (predict->project).
 
-    The body-frame forward/lateral velocity is rotated into the world by the
-    settled orientation, so climbing pitches the velocity up and horizontal
-    progress slows by ~cos(pitch). z, roll, pitch are taken from the settle.
+    Settles the initial pose into a valid State, then applies the physics step T
+    times. pose7[t] is the valid (settled, non-penetrative) pose AFTER command t
+    — the end-of-step state. Per-step turning params (alpha, x_ICR) come from the
+    friction sampled at the contacts + the normal loads of the state each step
+    starts FROM (Phase 4 map, coefficient `k`); without `mu_field` the scalar
+    args are used.
 
-    If `mu_field` is given, the turning params (alpha, x_ICR) are computed each
-    step from the friction sampled at the 3 contacts + the normal loads (Phase 4
-    moment-centroid map, coefficient `k`); otherwise the scalar args are used.
+    Chassis non-penetration is a post-check only (the settle stays wheels-only):
+    `valid` is False if the belly high-centers at ANY step, so a planner can
+    simply reject the whole trajectory. `first_high_center` is the first such
+    step (-1 if none).
 
     Returns dict of arrays over T: pose7 [T,7], pose2 [T,3] (x,y,yaw),
-    loads [T,3] (N_i), alpha [T], x_icr [T], pitch/roll/residual [T],
-    chassis_clear [T], high_center [T]. Single rollout (no batch).
+    loads [T,3] (N_i), fz [T], chassis_clear [T], high_center [T],
+    alpha [T], x_icr [T], pitch/roll/residual [T]; plus scalars
+    valid (bool) and first_high_center (int). Single rollout (no batch).
     """
     from . import heightmap as _hm
-    from . import turning
+    from . import state as _state
     setpoints = np.asarray(setpoints, dtype=np.float64)
     T = setpoints.shape[0]
-    x, y, yaw = (float(v) for v in init_pose)
 
-    # Placement runs against the wheel-envelope (sphere-wheel) surface.
-    surf = _hm.wheel_envelope(hm, R)
+    surf = _hm.wheel_envelope(hm, R)  # sphere-wheel placement surface
+    x0, y0, yaw0 = (float(v) for v in init_pose)
+    st = _state.make_state(x0, y0, yaw0, surf, hm)  # valid initial state
 
     pose7 = np.empty((T, 7), dtype=np.float32)
     pose2 = np.empty((T, 3), dtype=np.float64)
     loads = np.empty((T, 3), dtype=np.float64)
-    fz = np.empty(T)
-    chassis_clear = np.empty(T)  # min chassis-point clearance (raw terrain)
+    fz = np.empty(T); chassis_clear = np.empty(T)
     alpha_log = np.empty(T); xicr_log = np.empty(T)
     pitch = np.empty(T); roll = np.empty(T); resid = np.empty(T)
 
-    place = None
     for t in range(T):
-        init = None if place is None else (place["z"], place["pitch"], place["roll"])
-        place = placement.settle(x, y, yaw, surf, init=init)
-        N = placement.normal_loads(place, x, y)
+        st = _state.step(st, setpoints[t], surf, hm, dt,
+                         mu_field=mu_field, k=k, alpha=alpha, x_icr=x_icr, R=R, b=b)
+        pose7[t] = st.pose7
+        pose2[t] = st.pose2
+        loads[t] = st.loads
+        fz[t] = st.fz
+        chassis_clear[t] = st.chassis_clear
+        alpha_log[t] = st.alpha; xicr_log[t] = st.x_icr
+        pitch[t] = st.place["pitch"]; roll[t] = st.place["roll"]; resid[t] = st.place["residual"]
 
-        if mu_field is not None:
-            c = place["contacts"]
-            mu_i = mu_field.sample(c[:, 0], c[:, 1])
-            alpha_t, xicr_t = turning.turning_params(mu_i, N, k)
-        else:
-            alpha_t, xicr_t = alpha, x_icr
-
-        vx, vy, wz = twist.wheel_twist(setpoints[t], alpha_t, xicr_t, R, b)
-        # Body velocity rotated to world; horizontal part advances (x, y).
-        v_world = place["R"] @ np.array([vx, vy, 0.0])
-        x += v_world[0] * dt
-        y += v_world[1] * dt
-        yaw += wz * dt
-
-        cc, _ = placement.chassis_clearance(place["R"], x, y, place["z"], hm)
-
-        pose7[t] = placement.place_pose7(place, x, y)
-        pose2[t] = (x, y, yaw)
-        loads[t] = N
-        fz[t] = float(N @ place["normals"][:, 2])  # vertical force balance (== mg)
-        chassis_clear[t] = float(cc.min())
-        alpha_log[t] = alpha_t; xicr_log[t] = xicr_t
-        pitch[t] = place["pitch"]; roll[t] = place["roll"]; resid[t] = place["residual"]
-
+    high_center = chassis_clear < 0.0
     return {"pose7": pose7, "pose2": pose2, "loads": loads, "fz": fz,
-            "chassis_clear": chassis_clear, "high_center": chassis_clear < 0.0,
+            "chassis_clear": chassis_clear, "high_center": high_center,
+            "valid": not bool(high_center.any()),
+            "first_high_center": int(np.argmax(high_center)) if high_center.any() else -1,
             "alpha": alpha_log, "x_icr": xicr_log,
             "pitch": pitch, "roll": roll, "residual": resid}
 

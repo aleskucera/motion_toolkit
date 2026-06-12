@@ -19,9 +19,9 @@ each independently verifiable:
 | Phase | Content | Verify | Status |
 |-------|---------|--------|--------|
 | 0 | scaffold, heightmap rasterizer + bilinear sampler, rosbag loader | height under wheel matches scene; run loads | ✅ |
-| 1 | flat-ground forward twist, scalar `(alpha, x_ICR)`, SE(2) integration, batched | reproduces ~0.40 m/s cruise + displacement on run 18_04_51 | ✅ |
+| 1 | flat-ground forward twist, scalar `(alpha, x_ICR)` | reproduces ~0.40 m/s cruise on run 18_04_51 | ✅ |
 | 2 | heightmap placement (settle), wheels bilateral, normal loads `N_i`, sphere-wheel envelope | flat→level; ramp→pitched; loads=scale meas.; box climbs | ✅ |
-| 3 | chassis non-penetration → high-center feasibility signal (wheels stay grounded; pose-resolving active-set deferred to Phase 5) | benign→clear; tall block→high-center w/ depth | ✅ |
+| 3 | chassis non-penetration = post-check only → high-center ⇒ reject trajectory (`valid` flag). Settle stays wheels-only (no hard constraint) | benign→valid; tall block→high-center w/ depth | ✅ |
 | 4 | per-cell `mu` field + moment-centroid turning map | uniform→`1+k·mu`/CoM_x; slippery rear turns more; signs correct | ✅ |
 | 5 | implicit gradients (`d/dh`, `d/dmu`, `d/dk`), BPTT | finite-diff check < 1e-2 | ⬜ |
 | 6 | calibration vs rosbags | RMSE ≤ full-physics bar; cross-run | ⬜ |
@@ -31,3 +31,23 @@ each independently verifiable:
 Geometry/masses are pulled from `examples/helhest_junior/common.py`
 (`HelhestJuniorConfig`); the wheel order/sign remap from
 `examples/helhest_junior/replay_real.py` is reproduced in `data.py`.
+
+## Known limitations
+
+- **Spherical wheel is laterally too fat (near walls).** `heightmap.wheel_envelope`
+  inflates the terrain by an *isotropic* disk of radius R, so the wheel is modeled
+  as a sphere. R is only correct in the rolling plane (body X–Z); across the axle
+  (body Y) the real wheel is thin (half-width 0.05 m, ~7× narrower). Effect: the
+  robot "feels" walls up to R≈0.35 m to its side and acts ~1.4 m wide instead of
+  ~0.83 m, so it cannot hug walls or thread narrow gaps. Fine for open/gentle
+  terrain (current scenes). **Fix when wall-navigation is needed:** anisotropic
+  thin-cylinder wheel contact (cap radius R only in the rolling direction, thin
+  across the axle, evaluated per-step in the body frame since it's yaw-dependent),
+  and/or treat walls as obstacles via a separate 2D thin-footprint clearance check
+  (heightmap = traversable ground only). Both slot in at `wheel_envelope` + a new
+  in-plane clearance without disturbing the rest.
+- **High-center is detection-only, by design** (Phase 3): belly non-penetration is
+  not *enforced* (wheels stay grounded — assumption 1). A high-centering trajectory
+  is **rejected** via the `valid` flag, not resolved by lifting a wheel. This keeps
+  the settle a clean wheels-only 3×3 equality solve (no chassis complementarity),
+  which in turn keeps the Phase-5 implicit gradient simple.
