@@ -83,7 +83,7 @@ def _cost(planar, clear, resid, Ub, goal, clear_margin, resid_tol, w):
 
 def plan(scene, mu, start, goal, T=70, B=2048, n_refine=3, max_steps=260, dt=0.05,
          sigma=2.5, lam=0.5, wmax=4.0, goal_tol=0.3, resid_tol=1e-2, clear_margin=0.05,
-         device="cuda", seed=0, weights=None):
+         device="cuda", seed=0, weights=None, record=False, n_show=60):
     params = SolverParams(dt=dt, k_turn=2.0, newton_iters=12)
     br = BatchRollout(scene, mu, B, T, params, device=device)
     w = weights or dict(term=3.0, run=0.3, invalid=1e5, eff=2e-3, smooth=2e-3)
@@ -93,27 +93,34 @@ def plan(scene, mu, start, goal, T=70, B=2048, n_refine=3, max_steps=260, dt=0.0
     U = np.full((T, 2), 1.5, np.float32)        # nominal wheel speeds, gentle forward
     state = np.asarray(start, np.float32)        # (x, y, yaw)
     path = [state.copy()]
+    idx = np.linspace(0, B - 1, n_show).astype(int)  # sampled rollouts to display
+    frames = []
     reached = False
     for k in range(max_steps):
         if np.linalg.norm(state[:2] - goal) < goal_tol:
             reached = True
             break
+        samp = inv = None
         for _ in range(n_refine):
             eps = rng.normal(0.0, sigma, (B, T, 2)).astype(np.float32)
             eps[0] = 0.0                          # keep the nominal as a sample
             Ub = np.clip(U[None] + eps, -wmax, wmax)
             planar, clear, resid = br.rollout(_to_omega(Ub), state)
-            J, _ = _cost(planar, clear, resid, Ub, goal, clear_margin, resid_tol, w)
+            J, invalid = _cost(planar, clear, resid, Ub, goal, clear_margin, resid_tol, w)
             beta = np.exp(-(J - J.min()) / lam)
             beta /= beta.sum()
             U = np.clip(np.einsum("b,btc->tc", beta, Ub), -wmax, wmax).astype(np.float32)
+            samp, inv = planar[:, idx, :2].copy(), invalid[idx].copy()  # last refine's fan
         # execute first control: roll the nominal out and take the step-1 pose
         planar, clear, resid = br.rollout(_to_omega(np.tile(U, (B, 1, 1))), state)
+        if record:
+            frames.append({"state": state.copy(), "samples": samp,
+                           "invalid": inv, "chosen": planar[:, 0, :2].copy()})
         state = planar[1, 0].astype(np.float32).copy()
         path.append(state.copy())
         U = np.roll(U, -1, axis=0)
         U[-1] = U[-2]
-    return np.array(path), reached
+    return (np.array(path), reached, frames) if record else (np.array(path), reached)
 
 
 def _plot(scene, path, start, goal, out):
@@ -135,6 +142,39 @@ def _plot(scene, path, start, goal, out):
     print(f"saved {out}")
 
 
+def _animate(scene, frames, path, start, goal, out, stride=3, fps=12):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.animation import FuncAnimation, PillowWriter
+
+    nx, ny = scene.nx, scene.ny
+    ext = [scene.x0, scene.x0 + (nx - 1) * scene.cell, scene.y0, scene.y0 + (ny - 1) * scene.cell]
+    sel = list(range(0, len(frames), stride))
+    fig, ax = plt.subplots(figsize=(9, 6))
+
+    def draw(fi):
+        ax.clear()
+        ax.imshow(scene.H, origin="lower", extent=ext, cmap="terrain", alpha=0.9)
+        f = frames[fi]
+        for s, bad in zip(f["samples"].transpose(1, 0, 2), f["invalid"]):  # [n_show][T+1,2]
+            ax.plot(s[:, 0], s[:, 1], "-", lw=0.4, alpha=0.25,
+                    color=("crimson" if bad else "deepskyblue"))
+        ax.plot(f["chosen"][:, 0], f["chosen"][:, 1], "-", color="yellow", lw=2.0)  # plan
+        tr = path[:fi + 1]
+        ax.plot(tr[:, 0], tr[:, 1], "-", color="orange", lw=2.5)                    # driven
+        ax.plot(f["state"][0], f["state"][1], "o", color="white", mec="k", ms=9)    # robot
+        ax.plot(*start[:2], "o", color="0.4", ms=7)
+        ax.plot(*goal[:2], "*", color="red", ms=18)
+        ax.set_xlim(-1.0, 6.0); ax.set_ylim(-2.5, 3.0)
+        ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]")
+        ax.set_title(f"MPPI live — blue=valid / red=invalid samples, yellow=plan  (step {fi})")
+
+    anim = FuncAnimation(fig, draw, frames=sel, interval=1000 / fps)
+    anim.save(out, writer=PillowWriter(fps=fps))
+    print(f"saved {out}  ({len(sel)} frames)")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--device", default="cuda")
@@ -142,17 +182,22 @@ def main():
     ap.add_argument("--gx", type=float, default=4.0)
     ap.add_argument("--gy", type=float, default=1.5)
     ap.add_argument("--B", type=int, default=2048)
+    ap.add_argument("--animate", action="store_true", help="save a GIF of the planning")
     args = ap.parse_args()
 
     scene = demo_terrain()
     mu = friction.uniform(0.8, xlim=(-3.0, 10.0), ylim=(-4.0, 4.0), cell=0.06)
     start = np.array([0.0, 0.0, 0.0], np.float32)
     goal = np.array([args.gx, args.gy], np.float64)
-    path, reached = plan(scene, mu, start, goal, B=args.B, device=args.device)
+    out = plan(scene, mu, start, goal, B=args.B, device=args.device, record=args.animate)
+    path, reached = out[0], out[1]
     d = np.linalg.norm(path[-1, :2] - goal)
     print(f"reached={reached}  final=({path[-1,0]:+.2f},{path[-1,1]:+.2f})  "
           f"dist_to_goal={d:.2f}m  steps={len(path)-1}")
-    _plot(scene, path, start, goal, args.out)
+    if args.animate:
+        _animate(scene, out[2], path, start, goal, args.out)
+    else:
+        _plot(scene, path, start, goal, args.out)
 
 
 if __name__ == "__main__":
