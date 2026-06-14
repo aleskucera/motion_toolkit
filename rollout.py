@@ -10,7 +10,7 @@ from .model import WHEEL_RADIUS
 
 
 def rollout_terrain(setpoints, dt, hm, alpha=1.0, x_icr=0.0, init_pose=(0.0, 0.0, 0.0),
-                    mu_field=None, k=2.0, R=WHEEL_RADIUS, b=HALF_TRACK):
+                    mu_field=None, k=2.0, R=WHEEL_RADIUS, b=HALF_TRACK, resid_tol=1e-2):
     """Roll out on a heightmap by repeated `state.step` (predict->project).
 
     Settles the initial pose into a valid State, then applies the physics step T
@@ -58,10 +58,16 @@ def rollout_terrain(setpoints, dt, hm, alpha=1.0, x_icr=0.0, init_pose=(0.0, 0.0
         pitch[t] = st.place["pitch"]; roll[t] = st.place["roll"]; resid[t] = st.place["residual"]
 
     high_center = chassis_clear < 0.0
+    # Settle couldn't place the robot (e.g. driving into a wall / terrain steeper
+    # than the tilt clamp): residual stays large -> the pose is non-physical.
+    infeasible = resid > resid_tol
+    bad = high_center | infeasible
     return {"pose7": pose7, "pose2": pose2, "loads": loads, "fz": fz,
             "chassis_clear": chassis_clear, "high_center": high_center,
-            "valid": not bool(high_center.any()),
+            "infeasible": infeasible,
+            "valid": not bool(bad.any()),
             "first_high_center": int(np.argmax(high_center)) if high_center.any() else -1,
+            "first_invalid": int(np.argmax(bad)) if bad.any() else -1,
             "alpha": alpha_log, "x_icr": xicr_log,
             "pitch": pitch, "roll": roll, "residual": resid}
 

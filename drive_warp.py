@@ -55,7 +55,7 @@ class WarpDriver:
                   outputs=[planar, tilt], device=device)
         self.planar = planar.numpy()[0, 0].copy()  # (x, y, yaw)
         self.tilt = tilt.numpy()[0, 0].copy()       # (z, pitch, roll)
-        self.clear, self.alpha = 1.0, 1.0
+        self.clear, self.alpha, self.resid = 1.0, 1.0, 0.0
 
     def step(self, omega3):
         dev = self.dev
@@ -67,21 +67,24 @@ class WarpDriver:
         loads = wp.zeros((1, 1), dtype=wp.vec3, device=dev)
         turn = wp.zeros((1, 1), dtype=wp.vec2, device=dev)
         clear = wp.zeros((1, 1), dtype=float, device=dev)
+        resid = wp.zeros((1, 1), dtype=float, device=dev)
         wp.launch(wstep, 1,
                   inputs=[0, self.te.H, self.tr.H, self.te.g, self.tm.H, self.tm.g,
                           self.robot, self.sp, omega],
-                  outputs=[planar, tilt, loads, turn, clear], device=dev)
+                  outputs=[planar, tilt, loads, turn, clear, resid], device=dev)
         self.planar = planar.numpy()[1, 0].copy()
         self.tilt = tilt.numpy()[1, 0].copy()
         self.clear = float(clear.numpy()[0, 0])
+        self.resid = float(resid.numpy()[0, 0])
         self.alpha = float(turn.numpy()[0, 0][0])
 
     def render_state(self):
         x, y, yaw = (float(v) for v in self.planar)
         z, pitch, roll = (float(v) for v in self.tilt)
         R = placement.euler_zyx(yaw, pitch, roll)
+        valid = self.clear >= 0.0 and self.resid < 1e-2  # belly clears AND settle feasible
         return SimpleNamespace(
-            x=x, y=y, yaw=yaw, alpha=self.alpha, valid=self.clear >= 0.0,
+            x=x, y=y, yaw=yaw, alpha=self.alpha, valid=valid,
             place={"z": z, "R": R, "pitch": pitch, "roll": roll},
         )
 

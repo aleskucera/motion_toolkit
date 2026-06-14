@@ -274,7 +274,8 @@ def step(t: int,
          tilt: wp.array2d(dtype=wp.vec3),  # [T+1, B] (z, pitch, roll)
          loads_out: wp.array2d(dtype=wp.vec3),  # [T, B] N_i of the NEW state
          turn_out: wp.array2d(dtype=wp.vec2),  # [T, B] (alpha, x_icr) used this step
-         clear_out: wp.array2d(dtype=float)):  # [T, B] belly clearance of the NEW state
+         clear_out: wp.array2d(dtype=float),  # [T, B] belly clearance of the NEW state
+         resid_out: wp.array2d(dtype=float)):  # [T, B] settle residual (max|c|) of NEW state
     tid = wp.tid()
     pc = planar[t, tid]
     tc = tilt[t, tid]
@@ -322,10 +323,12 @@ def step(t: int,
     loads_out[t, tid] = normal_loads(Henv, g, robot, Rn, pn)
     turn_out[t, tid] = wp.vec2(alpha, x_icr)
     clear_out[t, tid] = chassis_clearance(Hraw, g, robot, Rn, pn)
+    cres = clearances(Henv, g, robot, xn, yn, yawn, u[0], u[1], u[2])
+    resid_out[t, tid] = wp.max(wp.max(wp.abs(cres[0]), wp.abs(cres[1])), wp.abs(cres[2]))
 
 
 def rollout_device(scene, mu_field, setpoints, init_pose, params,
-                   robot_params=None, device="cpu"):
+                   robot_params=None, device="cpu", resid_tol=1e-2):
     """Single-rollout (B=1) device rollout. Returns numpy logs to match the oracle."""
     from .. import heightmap as hmmod
     from .solver import RobotParams
@@ -349,17 +352,22 @@ def rollout_device(scene, mu_field, setpoints, init_pose, params,
     loads = wp.zeros((T, 1), dtype=wp.vec3, device=device)
     turn = wp.zeros((T, 1), dtype=wp.vec2, device=device)
     clear = wp.zeros((T, 1), dtype=float, device=device)
+    resid = wp.zeros((T, 1), dtype=float, device=device)
 
     wp.launch(init_state, 1, inputs=[te.H, te.g, robot, sp, pose0],
               outputs=[planar, tilt], device=device)
     for t in range(T):
         wp.launch(step, 1,
                   inputs=[t, te.H, tr.H, te.g, tm.H, tm.g, robot, sp, omega],
-                  outputs=[planar, tilt, loads, turn, clear], device=device)
+                  outputs=[planar, tilt, loads, turn, clear, resid], device=device)
+    clear_np, resid_np = clear.numpy()[:, 0], resid.numpy()[:, 0]
+    bad = (clear_np < 0.0) | (resid_np > resid_tol)
     return {
         "planar": planar.numpy()[:, 0, :], "tilt": tilt.numpy()[:, 0, :],
         "loads": loads.numpy()[:, 0, :], "turn": turn.numpy()[:, 0, :],
-        "clear": clear.numpy()[:, 0],
+        "clear": clear_np, "residual": resid_np,
+        "valid": not bool(bad.any()),
+        "first_invalid": int(np.argmax(bad)) if bad.any() else -1,
     }
 
 

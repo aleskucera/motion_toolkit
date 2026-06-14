@@ -183,6 +183,7 @@ def _fwd(envH, rawH, muH, g, gmu, robot, sp, omega_np, init_pose, wpv, wtv, grad
     loads = wp.zeros((T, 1), dtype=wp.vec3, device=dev)
     turn = wp.zeros((T, 1), dtype=wp.vec2, device=dev)
     clear = wp.zeros((T, 1), dtype=float, device=dev)
+    resid = wp.zeros((T, 1), dtype=float, device=dev)
     loss = wp.zeros(1, dtype=float, device=dev, requires_grad=grad)
 
     def launches():
@@ -190,7 +191,7 @@ def _fwd(envH, rawH, muH, g, gmu, robot, sp, omega_np, init_pose, wpv, wtv, grad
                   outputs=[planar, tilt], device=dev)
         for t in range(T):
             wp.launch(step, 1, inputs=[t, Henv, Hraw, g, Hmu, gmu, robot, sp, omega],
-                      outputs=[planar, tilt, loads, turn, clear], device=dev)
+                      outputs=[planar, tilt, loads, turn, clear, resid], device=dev)
         wp.launch(_row_loss, 1, inputs=[planar, tilt, wpv, wtv, T], outputs=[loss], device=dev)
 
     if not grad:
@@ -269,6 +270,7 @@ def _fwd_h(rawH, muH, g, gmu, Rwheel, robot, sp, omega_np, init_pose, wpv, wtv, 
     loads = wp.zeros((T, 1), dtype=wp.vec3, device=dev)
     turn = wp.zeros((T, 1), dtype=wp.vec2, device=dev)
     clear = wp.zeros((T, 1), dtype=float, device=dev)
+    resid = wp.zeros((T, 1), dtype=float, device=dev)
     loss = wp.zeros(1, dtype=float, device=dev, requires_grad=grad)
 
     def launches():
@@ -277,7 +279,7 @@ def _fwd_h(rawH, muH, g, gmu, Rwheel, robot, sp, omega_np, init_pose, wpv, wtv, 
                   outputs=[planar, tilt], device=dev)
         for t in range(T):
             wp.launch(step, 1, inputs=[t, Henv, Hraw, g, Hmu, gmu, robot, sp, omega],
-                      outputs=[planar, tilt, loads, turn, clear], device=dev)
+                      outputs=[planar, tilt, loads, turn, clear, resid], device=dev)
         wp.launch(_row_loss, 1, inputs=[planar, tilt, wpv, wtv, T], outputs=[loss], device=dev)
 
     if not grad:
@@ -354,6 +356,7 @@ def _fwd_batch(envH, rawH, muH, g, gmu, robot, sp, omega_np, poses, wpv, wtv, gr
     loads = wp.zeros((T, B), dtype=wp.vec3, device=dev)
     turn = wp.zeros((T, B), dtype=wp.vec2, device=dev)
     clear = wp.zeros((T, B), dtype=float, device=dev)
+    resid = wp.zeros((T, B), dtype=float, device=dev)
     loss = wp.zeros(1, dtype=float, device=dev, requires_grad=grad)
 
     def launches():
@@ -361,7 +364,7 @@ def _fwd_batch(envH, rawH, muH, g, gmu, robot, sp, omega_np, poses, wpv, wtv, gr
                   outputs=[planar, tilt], device=dev)
         for t in range(T):
             wp.launch(step, B, inputs=[t, Henv, Hraw, g, Hmu, gmu, robot, sp, omega],
-                      outputs=[planar, tilt, loads, turn, clear], device=dev)
+                      outputs=[planar, tilt, loads, turn, clear, resid], device=dev)
         wp.launch(_row_loss, B, inputs=[planar, tilt, wpv, wtv, T], outputs=[loss], device=dev)
 
     if not grad:
