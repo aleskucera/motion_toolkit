@@ -100,22 +100,23 @@ def plan(scene, mu, start, goal, T=70, B=2048, n_refine=3, max_steps=260, dt=0.0
         if np.linalg.norm(state[:2] - goal) < goal_tol:
             reached = True
             break
-        samp = inv = None
+        samp = badstep = None
         for _ in range(n_refine):
             eps = rng.normal(0.0, sigma, (B, T, 2)).astype(np.float32)
             eps[0] = 0.0                          # keep the nominal as a sample
             Ub = np.clip(U[None] + eps, -wmax, wmax)
             planar, clear, resid = br.rollout(_to_omega(Ub), state)
-            J, invalid = _cost(planar, clear, resid, Ub, goal, clear_margin, resid_tol, w)
+            J, _ = _cost(planar, clear, resid, Ub, goal, clear_margin, resid_tol, w)
             beta = np.exp(-(J - J.min()) / lam)
             beta /= beta.sum()
             U = np.clip(np.einsum("b,btc->tc", beta, Ub), -wmax, wmax).astype(np.float32)
-            samp, inv = planar[:, idx, :2].copy(), invalid[idx].copy()  # last refine's fan
+            samp = planar[:, idx, :2].copy()      # last refine's fan [T+1, n_show, 2]
+            badstep = ((clear[:, idx] < clear_margin) | (resid[:, idx] > resid_tol)).copy()  # [T, n_show]
         # execute first control: roll the nominal out and take the step-1 pose
         planar, clear, resid = br.rollout(_to_omega(np.tile(U, (B, 1, 1))), state)
         if record:
             frames.append({"state": state.copy(), "samples": samp,
-                           "invalid": inv, "chosen": planar[:, 0, :2].copy()})
+                           "stepbad": badstep, "chosen": planar[:, 0, :2].copy()})
         state = planar[1, 0].astype(np.float32).copy()
         path.append(state.copy())
         U = np.roll(U, -1, axis=0)
@@ -157,9 +158,15 @@ def _animate(scene, frames, path, start, goal, out, stride=3, fps=12):
         ax.clear()
         ax.imshow(scene.H, origin="lower", extent=ext, cmap="terrain", alpha=0.9)
         f = frames[fi]
-        for s, bad in zip(f["samples"].transpose(1, 0, 2), f["invalid"]):  # [n_show][T+1,2]
-            ax.plot(s[:, 0], s[:, 1], "-", lw=0.4, alpha=0.25,
-                    color=("crimson" if bad else "deepskyblue"))
+        samp = f["samples"].transpose(1, 0, 2)   # [n_show, T+1, 2]
+        bad = f["stepbad"].transpose(1, 0)       # [n_show, T]  per-step violation
+        for s, b in zip(samp, bad):
+            if b.any():
+                j = int(b.argmax())              # first step that goes invalid
+                ax.plot(s[:j + 1, 0], s[:j + 1, 1], "-", lw=0.4, alpha=0.3, color="deepskyblue")
+                ax.plot(s[j:, 0], s[j:, 1], "-", lw=0.5, alpha=0.4, color="crimson")
+            else:
+                ax.plot(s[:, 0], s[:, 1], "-", lw=0.4, alpha=0.3, color="deepskyblue")
         ax.plot(f["chosen"][:, 0], f["chosen"][:, 1], "-", color="yellow", lw=2.0)  # plan
         tr = path[:fi + 1]
         ax.plot(tr[:, 0], tr[:, 1], "-", color="orange", lw=2.5)                    # driven
