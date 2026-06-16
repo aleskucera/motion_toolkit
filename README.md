@@ -13,8 +13,33 @@ Differentiable w.r.t. the heightmap `h`, the friction field `mu`, and the
 turning coefficient `k` (implicit gradients through the settling solve).
 Batched over many rollouts for sampling-based planning.
 
-See the design discussion for the full math. This package is built in phases,
-each independently verifiable:
+## Install
+
+```bash
+uv sync                       # core (numpy + warp-lang)
+uv sync --extra viz --extra data   # + viewers (glfw/PyOpenGL/matplotlib) + rosbag loader (h5py)
+```
+or plain pip: `pip install -e ".[viz,data]"`.
+
+## Run
+
+```bash
+# interactive driver (I/J/K/L drive, mouse orbit, scroll zoom, Q quit)
+python -m kinematic_helhest.drive_warp            # Warp engine (--device cuda for GPU)
+python -m kinematic_helhest.follow                # drive + follow a live MPPI plan
+python -m kinematic_helhest.mppi --animate        # sampling planner -> GIF
+
+# verify the Warp engine against the numpy oracle (CPU)
+python -m kinematic_helhest.warp_engine.kinematics
+python -m kinematic_helhest.warp_engine.implicit
+```
+
+The package is `kinematic_helhest`; `warp_engine/` is the runtime engine,
+`reference/` is the numpy finite-difference oracle (verification only).
+
+## Phases
+
+This package is built in phases, each independently verifiable:
 
 | Phase | Content | Verify | Status |
 |-------|---------|--------|--------|
