@@ -109,6 +109,31 @@ class Simulator:
         """Per-cell friction from a numpy Heightmap matching the grid (copied in place)."""
         self.friction.assign(np.ascontiguousarray(friction_hm.H, np.float32))
 
+    def rollout_launch(self):
+        """Launch init_state + T*step into the owned device buffers; NO host I/O.
+
+        `self.omega` must already hold the controls and `self.start_pose` the init pose
+        (e.g. filled on-device by the GPU MPPI sampler). Results stay on device in
+        controlled/derived/loads/turning/clearance/residual -- the graph-capturable core.
+        """
+        wp.launch(
+            init_state,
+            self.B,
+            inputs=[self.envelope, self.grid, self.robot, self.solver, self.start_pose],
+            outputs=[self.controlled, self.derived],
+            device=self.device,
+        )
+        for t in range(self.T):
+            wp.launch(
+                kernel=wstep,
+                dim=self.B,
+                inputs=[t, self.envelope, self.elevation, self.grid, self.friction, self.grid,
+                        self.robot, self.solver, self.omega],
+                outputs=[self.controlled, self.derived, self.loads, self.turning,
+                         self.clearance, self.residual],
+                device=self.device,
+            )
+
     def rollout(self, omega_np, init_pose):
         """omega_np [T, B, 3], init_pose (x,y,yaw) shared by all rollouts. Returns
         controlled [T+1,B,3] (x,y,yaw), derived [T+1,B,3] (z,pitch,roll), clear/resid [T,B]."""
@@ -118,38 +143,5 @@ class Simulator:
                 np.tile(np.asarray(init_pose, np.float32), (self.B, 1)), np.float32
             )
         )
-
-        wp.launch(
-            init_state,
-            self.B,
-            inputs=[self.envelope, self.grid, self.robot, self.solver, self.start_pose],
-            outputs=[self.controlled, self.derived],
-            device=self.device,
-        )
-
-        for t in range(self.T):
-            wp.launch(
-                kernel=wstep,
-                dim=self.B,
-                inputs=[
-                    t,
-                    self.envelope,
-                    self.elevation,
-                    self.grid,
-                    self.friction,
-                    self.grid,
-                    self.robot,
-                    self.solver,
-                    self.omega,
-                ],
-                outputs=[
-                    self.controlled,
-                    self.derived,
-                    self.loads,
-                    self.turning,
-                    self.clearance,
-                    self.residual,
-                ],
-                device=self.device,
-            )
+        self.rollout_launch()
         return self.controlled.numpy(), self.derived.numpy(), self.clearance.numpy(), self.residual.numpy()

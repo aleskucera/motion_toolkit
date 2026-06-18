@@ -24,8 +24,8 @@ from ..engine import GridParams
 from ..engine import RobotParams
 from ..engine import Simulator
 from ..engine import SolverParams
-from .mppi import _cost
 from .mppi import _to_omega
+from .mppi_gpu import MppiGpu
 from .synthetic_perception import crop_window
 from .synthetic_perception import to_local
 
@@ -63,8 +63,9 @@ class Navigator:
         self.dev = device
         self.rp = robot_params or RobotParams()
         self.params = SolverParams(dt=cfg.dt, k_turn=2.0, newton_iters=12)
-        self.rng = np.random.default_rng(seed)
+        self.seed = seed
         self.sim = None  # built lazily on the first map (grid sizes from it)
+        self.drv = None  # MppiGpu, built with the sim
 
         # Window must cover the worst-case horizon reach, else rollouts sample
         # off-grid (clamped -> wrong). v_max = wheel_radius * wmax.
@@ -81,25 +82,20 @@ class Navigator:
         # one cell-center convention end-to-end: the grid origin IS the bounds min corner.
         x0, y0 = local_map.bounds[0], local_map.bounds[2]
         raw_H, cell = local_map.elevation, local_map.resolution
-        if self.sim is None:  # fixed window dims -> build the preallocated sim once
+        if self.sim is None:  # fixed window dims -> build the preallocated sim + driver once
             ny, nx = raw_H.shape
             grid = GridParams(nx, ny, cell, x0, y0)
             self.sim = Simulator(self.rp, self.params, grid, cfg.B, cfg.T, self.dev)
+            w = dict(_W, tilt=cfg.tilt_w, tilt_free=np.radians(cfg.tilt_free_deg))
+            self.drv = MppiGpu(self.sim, cfg.sigma, cfg.lam, cfg.wmax, w,
+                               cfg.clear_margin, cfg.resid_tol, self.seed)
         self.sim.set_terrain(raw_H)            # borrow + dilate, no alloc
         self.sim.set_uniform_friction(cfg.mu_value)
 
-        w = dict(_W, tilt=cfg.tilt_w, tilt_free=np.radians(cfg.tilt_free_deg))
-        state = np.zeros(3, np.float32)  # robot at local origin
-        for _ in range(cfg.n_refine):
-            eps = self.rng.normal(0.0, cfg.sigma, (cfg.B, cfg.T, 2)).astype(np.float32)
-            eps[0] = 0.0
-            Ub = np.clip(U[None] + eps, -cfg.wmax, cfg.wmax)
-            controlled, derived, clear, resid = self.sim.rollout(_to_omega(Ub), state)
-            J, _ = _cost(controlled, derived, clear, resid, Ub, goal_local, cfg.clear_margin,
-                         cfg.resid_tol, w)
-            beta = np.exp(-(J - J.min()) / cfg.lam)
-            beta /= beta.sum()
-            U = np.clip(np.einsum("b,btc->tc", beta, Ub), -cfg.wmax, cfg.wmax).astype(np.float32)
+        state = (0.0, 0.0, 0.0)  # robot at local origin
+        self.drv.set_nominal(U)
+        self.drv.replan(state, goal_local, cfg.n_refine)   # whole MPPI refine on GPU
+        U = self.drv.nominal()
         controlled, _, _, _ = self.sim.rollout(_to_omega(np.tile(U, (cfg.B, 1, 1))), state)
         return U, controlled[:, 0, :2].copy()
 

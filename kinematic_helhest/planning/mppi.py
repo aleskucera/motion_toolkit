@@ -22,6 +22,7 @@ from ..engine import GridParams
 from ..engine import RobotParams
 from ..engine import Simulator
 from ..engine import SolverParams
+from .mppi_gpu import MppiGpu
 
 
 def _to_omega(Ub):
@@ -70,9 +71,9 @@ def plan(scene, mu, start, goal, T=70, B=2048, n_refine=3, max_steps=260, dt=0.0
     sim.set_friction(mu)
     w = weights or dict(term=3.0, run=0.3, invalid=1e5, eff=2e-3, smooth=2e-3)
     goal = np.asarray(goal[:2], np.float64)
-    rng = np.random.default_rng(seed)
+    drv = MppiGpu(sim, sigma, lam, wmax, w, clear_margin, resid_tol, seed)
+    drv.reset_nominal(1.5)  # nominal wheel speeds, gentle forward
 
-    U = np.full((T, 2), 1.5, np.float32)        # nominal wheel speeds, gentle forward
     state = np.asarray(start, np.float32)        # (x, y, yaw)
     path = [state.copy()]
     idx = np.linspace(0, B - 1, n_show).astype(int)  # sampled rollouts to display
@@ -82,18 +83,12 @@ def plan(scene, mu, start, goal, T=70, B=2048, n_refine=3, max_steps=260, dt=0.0
         if np.linalg.norm(state[:2] - goal) < goal_tol:
             reached = True
             break
-        samp = badstep = None
-        for _ in range(n_refine):
-            eps = rng.normal(0.0, sigma, (B, T, 2)).astype(np.float32)
-            eps[0] = 0.0                          # keep the nominal as a sample
-            Ub = np.clip(U[None] + eps, -wmax, wmax)
-            controlled, derived, clear, resid = sim.rollout(_to_omega(Ub), state)
-            J, _ = _cost(controlled, derived, clear, resid, Ub, goal, clear_margin, resid_tol, w)
-            beta = np.exp(-(J - J.min()) / lam)
-            beta /= beta.sum()
-            U = np.clip(np.einsum("b,btc->tc", beta, Ub), -wmax, wmax).astype(np.float32)
-            samp = controlled[:, idx, :2].copy()      # last refine's fan [T+1, n_show, 2]
-            badstep = ((clear[:, idx] < clear_margin) | (resid[:, idx] > resid_tol)).copy()  # [T, n_show]
+        drv.replan(state, goal, n_refine)   # the whole MPPI refine, on GPU
+        U = drv.nominal()
+        if record:  # read back the last refine's fan for the animation (slow path)
+            samp = sim.controlled.numpy()[:, idx, :2].copy()      # [T+1, n_show, 2]
+            badstep = ((sim.clearance.numpy()[:, idx] < clear_margin)
+                       | (sim.residual.numpy()[:, idx] > resid_tol)).copy()  # [T, n_show]
         # execute first control: roll the nominal out and take the step-1 pose
         controlled, _, _, _ = sim.rollout(_to_omega(np.tile(U, (B, 1, 1))), state)
         if record:
@@ -103,6 +98,7 @@ def plan(scene, mu, start, goal, T=70, B=2048, n_refine=3, max_steps=260, dt=0.0
         path.append(state.copy())
         U = np.roll(U, -1, axis=0)
         U[-1] = U[-2]
+        drv.set_nominal(U)
     return (np.array(path), reached, frames) if record else (np.array(path), reached)
 
 
