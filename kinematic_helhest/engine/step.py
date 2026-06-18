@@ -211,52 +211,40 @@ def adj_settle(
     dRp = Rz * drot_y(derived[1]) * Rx
     dRr = Rz * Ry * drot_x(derived[2])
     dRyaw = drot_z(yaw) * Ry * Rx
-    w0 = robot.wheel_pos[0]
-    w1 = robot.wheel_pos[1]
-    w2 = robot.wheel_pos[2]
     p = wp.vec3(x, y, derived[0])
-    wheel_center0 = p + Rot * w0
-    wheel_center1 = p + Rot * w1
-    wheel_center2 = p + Rot * w2
-    s0 = sample_height_grad(envelope, grid, wheel_center0[0], wheel_center0[1])  # (h, gx, gy)
-    s1 = sample_height_grad(envelope, grid, wheel_center1[0], wheel_center1[1])
-    s2 = sample_height_grad(envelope, grid, wheel_center2[0], wheel_center2[1])
 
-    dp0 = dRp * w0
-    dp1 = dRp * w1
-    dp2 = dRp * w2
-    dr0 = dRr * w0
-    dr1 = dRr * w1
-    dr2 = dRr * w2
-    J = wp.mat33(
-        1.0,
-        dp0[2] - s0[1] * dp0[0] - s0[2] * dp0[1],
-        dr0[2] - s0[1] * dr0[0] - s0[2] * dr0[1],
-        1.0,
-        dp1[2] - s1[1] * dp1[0] - s1[2] * dp1[1],
-        dr1[2] - s1[1] * dr1[0] - s1[2] * dr1[1],
-        1.0,
-        dp2[2] - s2[1] * dp2[0] - s2[2] * dp2[1],
-        dr2[2] - s2[1] * dr2[0] - s2[2] * dr2[1],
-    )
+    # build J (same formula as the forward) and stash the terrain slopes for phase 2
+    J = wp.mat33()
+    gx = wp.vec3()
+    gy = wp.vec3()
+    for i in range(wp.static(3)):
+        st_i = wp.static(i)
+        wheel_pos = robot.wheel_pos[st_i]
+        wheel_center = p + Rot * wheel_pos
+        s = sample_height_grad(envelope, grid, wheel_center[0], wheel_center[1])
+        gx[st_i] = s[1]
+        gy[st_i] = s[2]
+        dp = dRp * wheel_pos
+        dr = dRr * wheel_pos
+        J[st_i, 0] = 1.0
+        J[st_i, 1] = dp[2] - s[1] * dp[0] - s[2] * dp[1]
+        J[st_i, 2] = dr[2] - s[1] * dr[0] - s[2] * dr[1]
     lam = solve3(wp.transpose(J), adj_ret)
 
-    # pose adjoints w.r.t. controlled = (x, y, yaw); dc_i/dx = -gx_i, dc_i/dy = -gy_i
-    adj_x = s0[1] * lam[0] + s1[1] * lam[1] + s2[1] * lam[2]
-    adj_y = s0[2] * lam[0] + s1[2] * lam[1] + s2[2] * lam[2]
-    dy0 = dRyaw * w0
-    dy1 = dRyaw * w1
-    dy2 = dRyaw * w2
-    cw0 = dy0[2] - s0[1] * dy0[0] - s0[2] * dy0[1]
-    cw1 = dy1[2] - s1[1] * dy1[0] - s1[2] * dy1[1]
-    cw2 = dy2[2] - s2[1] * dy2[0] - s2[2] * dy2[1]
-    adj_yaw = -(cw0 * lam[0] + cw1 * lam[1] + cw2 * lam[2])
-    wp.adjoint[controlled] += wp.vec3(adj_x, adj_y, adj_yaw)
-
-    # envelope adjoint: adj_H[node] += lambda_i * (stencil of wheel-center i)  (per wheel)
-    _scatter_h(wp.adjoint[envelope], grid, wheel_center0[0], wheel_center0[1], lam[0])
-    _scatter_h(wp.adjoint[envelope], grid, wheel_center1[0], wheel_center1[1], lam[1])
-    _scatter_h(wp.adjoint[envelope], grid, wheel_center2[0], wheel_center2[1], lam[2])
+    # adj_controlled = -(dc/dcontrolled)^T lambda  (dc_i/dx = -gx_i, dc_i/dy = -gy_i, yaw via dRyaw);
+    # adj_envelope: scatter lambda_i into wheel-center i's bilinear stencil.
+    adj_pose = wp.vec3()
+    for i in range(wp.static(3)):
+        st_i = wp.static(i)
+        wheel_pos = robot.wheel_pos[st_i]
+        wheel_center = p + Rot * wheel_pos  # cheap recompute (no re-sample)
+        dy = dRyaw * wheel_pos
+        cw = dy[2] - gx[st_i] * dy[0] - gy[st_i] * dy[1]
+        adj_pose[0] = adj_pose[0] + gx[st_i] * lam[st_i]
+        adj_pose[1] = adj_pose[1] + gy[st_i] * lam[st_i]
+        adj_pose[2] = adj_pose[2] - cw * lam[st_i]
+        _scatter_h(wp.adjoint[envelope], grid, wheel_center[0], wheel_center[1], lam[st_i])
+    wp.adjoint[controlled] += adj_pose
 
 
 @wp.func
