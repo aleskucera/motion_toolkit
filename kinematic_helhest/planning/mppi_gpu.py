@@ -16,15 +16,24 @@ import warp as wp
 
 
 @wp.kernel
-def _sample_omega(U: wp.array2d(dtype=float), sigma: float, wmax: float,
+def _sample_omega(U: wp.array2d(dtype=float), sigma: float, sigma_bias: float, wmax: float,
                   seed: wp.array(dtype=int), omega: wp.array2d(dtype=wp.vec3)):
     t, b = wp.tid()
+    B = omega.shape[1]
     el = U[t, 0]
     er = U[t, 1]
     if b > 0:  # b == 0 keeps the nominal (eps = 0)
-        state = wp.rand_init(seed[0], t * omega.shape[1] + b)
-        el += sigma * wp.randn(state)
-        er += sigma * wp.randn(state)
+        # Sustained per-rollout bias: keyed on b ALONE, so it is identical across all t
+        # of this rollout -> the sample commits to an arc. This correlated (low-frequency)
+        # noise is what gives a broad SPATIAL fan; white per-step noise averages out and
+        # only ever jitters around straight-ahead. This is a planner, so we want coverage.
+        bias = wp.rand_init(seed[0], b)
+        el += sigma_bias * wp.randn(bias)
+        er += sigma_bias * wp.randn(bias)
+        # Light per-step jitter on top (distinct stream) for local variation/refinement.
+        jit = wp.rand_init(seed[0] + 9176, t * B + b)
+        el += sigma * wp.randn(jit)
+        er += sigma * wp.randn(jit)
     omega[t, b] = wp.vec3(wp.clamp(el, -wmax, wmax), wp.clamp(er, -wmax, wmax), 0.0)
 
 
@@ -115,11 +124,12 @@ class MppiGpu:
     `goal` and `start_pose` are device arrays set per replan, so the captured graph picks
     up new values; the weights/sigma/lam/wmax are baked at capture (fixed per planner)."""
 
-    def __init__(self, sim, sigma, lam, wmax, weights, clear_margin, resid_tol, seed=0):
+    def __init__(self, sim, sigma, lam, wmax, weights, clear_margin, resid_tol, seed=0, sigma_bias=0.0):
         self.sim = sim
         self.dev = sim.device
         self.B, self.T = sim.B, sim.T
         self.sigma, self.lam, self.wmax = float(sigma), float(lam), float(wmax)
+        self.sigma_bias = float(sigma_bias)
         self.clear_margin, self.resid_tol = float(clear_margin), float(resid_tol)
         w = weights
         self.w_term = float(w.get("term", 0.0))
@@ -152,7 +162,8 @@ class MppiGpu:
     def _refine(self):
         s, d = self.sim, self.dev
         wp.launch(_bump_seed, 1, inputs=[self.seed], device=d)
-        wp.launch(_sample_omega, (self.T, self.B), inputs=[self.U, self.sigma, self.wmax, self.seed],
+        wp.launch(_sample_omega, (self.T, self.B),
+                  inputs=[self.U, self.sigma, self.sigma_bias, self.wmax, self.seed],
                   outputs=[s.omega], device=d)
         s.rollout_launch()
         wp.launch(_cost, self.B, inputs=[s.controlled, s.derived, s.clearance, s.residual, s.omega,

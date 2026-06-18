@@ -34,13 +34,14 @@ _W = dict(term=3.0, run=0.3, invalid=1e5, eff=2e-3, smooth=2e-3)
 
 @dataclass
 class NavConfig:
-    half_extent: float = 7.0   # local window half-size [m]
+    half_extent: float = 8.0   # local window half-size [m] (must cover the T=100 horizon reach)
     res: float = 0.06          # local window cell size [m]
-    T: int = 70                # MPPI horizon
+    T: int = 100               # MPPI horizon (5 s lookahead; under the 50 ms control budget)
     B: int = 2048              # MPPI samples
     dt: float = 0.05
     n_refine: int = 3
-    sigma: float = 2.5
+    sigma: float = 0.5         # per-step jitter std (local variation)
+    sigma_bias: float = 1.0    # sustained per-rollout bias std (broad spatial fan)
     lam: float = 0.5
     wmax: float = 4.0
     clear_margin: float = 0.05
@@ -88,7 +89,7 @@ class Navigator:
             self.sim = Simulator(self.rp, self.params, grid, cfg.B, cfg.T, self.dev)
             w = dict(_W, tilt=cfg.tilt_w, tilt_free=np.radians(cfg.tilt_free_deg))
             self.drv = MppiGpu(self.sim, cfg.sigma, cfg.lam, cfg.wmax, w,
-                               cfg.clear_margin, cfg.resid_tol, self.seed)
+                               cfg.clear_margin, cfg.resid_tol, self.seed, sigma_bias=cfg.sigma_bias)
         self.sim.set_terrain(raw_H)            # borrow + dilate, no alloc
         self.sim.set_uniform_friction(cfg.mu_value)
 
