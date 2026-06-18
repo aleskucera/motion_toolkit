@@ -114,7 +114,7 @@ def _loads_probe(Henv: wp.array2d(dtype=wp.float32), Hraw: wp.array2d(dtype=wp.f
 
 def _build_test(device="cpu", iters=12):
     robot = RobotParams().build(device)
-    sp = SolverParams(newton_iters=iters, max_step=0.2, tilt_clamp=1.2).build()
+    sp = SolverParams(newton_iters=iters, tilt_clamp=1.2).build()
     return robot, sp
 
 

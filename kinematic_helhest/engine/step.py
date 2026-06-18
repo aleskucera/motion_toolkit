@@ -50,7 +50,7 @@ class Solver:
     """
 
     newton_iters: wp.int32
-    max_step: wp.float32
+    max_step: wp.vec3  # per-iter Newton cap (z[m], pitch[rad], roll[rad])
     tilt_clamp: wp.float32
     dt: wp.float32
     k_turn: wp.float32
@@ -60,14 +60,14 @@ class Solver:
 class SolverParams:  # settle/integration numerics — tuning, separate from the robot
     dt: float = 0.05
     newton_iters: int = 8
-    max_step: float = 0.2
+    max_step: tuple = (0.1, 0.2, 0.2)  # per-iter Newton cap (z[m], pitch[rad], roll[rad])
     tilt_clamp: float = 1.2
     k_turn: float = 2.0
 
     def build(self) -> Solver:
         s = Solver()
         s.newton_iters = self.newton_iters
-        s.max_step = self.max_step
+        s.max_step = wp.vec3(self.max_step[0], self.max_step[1], self.max_step[2])
         s.tilt_clamp = self.tilt_clamp
         s.dt = self.dt
         s.k_turn = self.k_turn
@@ -152,19 +152,13 @@ def settle(
             J[st_i, 2] = dr[2] - gx * dr[0] - gy * dr[1]
 
         delta = solve3(J, res)  # Newton step: J @ delta = res
-        derived = wp.vec3(
-            derived[0] - wp.clamp(delta[0], -sp.max_step, sp.max_step),
-            wp.clamp(
-                derived[1] - wp.clamp(delta[1], -sp.max_step, sp.max_step),
-                -sp.tilt_clamp,
-                sp.tilt_clamp,
-            ),
-            wp.clamp(
-                derived[2] - wp.clamp(delta[2], -sp.max_step, sp.max_step),
-                -sp.tilt_clamp,
-                sp.tilt_clamp,
-            ),
-        )
+        # damped Newton step on every DOF...
+        for i in range(wp.static(3)):
+            st_i = wp.static(i)
+            derived[st_i] = derived[st_i] - wp.clamp(delta[st_i], -sp.max_step[st_i], sp.max_step[st_i])
+        # ...then clamp the tilt angles; z (height) is left free
+        derived[1] = wp.clamp(derived[1], -sp.tilt_clamp, sp.tilt_clamp)
+        derived[2] = wp.clamp(derived[2], -sp.tilt_clamp, sp.tilt_clamp)
     return derived
 
 
