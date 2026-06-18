@@ -86,7 +86,7 @@ def clearances(
     pitch: float,
     roll: float,
 ):
-    """Signed wheel clearances c_i = hub_z - H_env(hub_xy) - r_wheel for the 3 wheels."""
+    """Signed wheel clearances c_i = wc_z - H_env(wc_xy) - r_wheel for the 3 wheels (wc = wheel center)."""
     R = euler_zyx(yaw, pitch, roll)
     p = wp.vec3(x, y, z)
 
@@ -112,18 +112,15 @@ def settle(
     """Solve (z, pitch, roll) with an ANALYTIC 3x3 Newton Jacobian.
 
     `controlled` = (x, y, yaw) the fixed planar pose; solve `derived` = (z, pitch, roll).
-    c_i = hub_iz - envelope(hub_ixy) - R, hub_i = (x,y,z) + Rz Ry Rx wheel_i.
+    c_i = wc_iz - envelope(wc_ixy) - r_wheel, wc_i = (x,y,z) + Rz Ry Rx wheel_i.
     dc_i/dz = 1; dc_i/dpitch and dc_i/droll come from dR/dpitch, dR/droll applied
-    to wheel_i, combined with the terrain gradient (gx,gy) at the hub. One
+    to wheel_i, combined with the terrain gradient (gx,gy) at the wheel center. One
     euler + one value+grad sample per wheel per iter (vs 4 evals numerically).
     """
     x = controlled[0]
     y = controlled[1]
     yaw = controlled[2]
     Rz = rot_z(yaw)
-    w0 = robot.wheel_pos[0]
-    w1 = robot.wheel_pos[1]
-    w2 = robot.wheel_pos[2]
     derived = derived_init
     for _ in range(sp.newton_iters):
         Ry = rot_y(derived[1])
@@ -132,42 +129,40 @@ def settle(
         dRp = Rz * drot_y(derived[1]) * Rx  # d(Rot)/dpitch
         dRr = Rz * Ry * drot_x(derived[2])  # d(Rot)/droll
         p = wp.vec3(x, y, derived[0])
-        hub0 = p + Rot * w0
-        hub1 = p + Rot * w1
-        hub2 = p + Rot * w2
-        s0 = sample_height_grad(envelope, grid, hub0[0], hub0[1])  # (h, gx, gy)
-        s1 = sample_height_grad(envelope, grid, hub1[0], hub1[1])
-        s2 = sample_height_grad(envelope, grid, hub2[0], hub2[1])
-        c = wp.vec3(
-            hub0[2] - s0[0] - robot.wheel_radius,
-            hub1[2] - s1[0] - robot.wheel_radius,
-            hub2[2] - s2[0] - robot.wheel_radius,
-        )
-        dp0 = dRp * w0
-        dp1 = dRp * w1
-        dp2 = dRp * w2
-        dr0 = dRr * w0
-        dr1 = dRr * w1
-        dr2 = dRr * w2
-        J = wp.mat33(
-            1.0,
-            dp0[2] - s0[1] * dp0[0] - s0[2] * dp0[1],
-            dr0[2] - s0[1] * dr0[0] - s0[2] * dr0[1],
-            1.0,
-            dp1[2] - s1[1] * dp1[0] - s1[2] * dp1[1],
-            dr1[2] - s1[1] * dr1[0] - s1[2] * dr1[1],
-            1.0,
-            dp2[2] - s2[1] * dp2[0] - s2[2] * dp2[1],
-            dr2[2] - s2[1] * dr2[0] - s2[2] * dr2[1],
-        )
-        step = solve3(J, c)
+
+        res = wp.vec3()  # residual: per-wheel clearance c_i
+        J = wp.mat33()  # Jacobian: row i = dc_i/d(z, pitch, roll)
+        for i in range(wp.static(3)):
+            st_i = wp.static(i)
+
+            wheel_pos = robot.wheel_pos[st_i]
+            wheel_center = p + Rot * wheel_pos
+
+            s = sample_height_grad(envelope, grid, wheel_center[0], wheel_center[1])
+            height, gx, gy = s[0], s[1], s[2]  # surface height + slope under the wheel center
+
+            res[st_i] = wheel_center[2] - height - robot.wheel_radius
+
+            # z lifts the wheel center (dc/dz = 1); pitch/roll swing it (dRp/dRr * wheel)
+            # across the terrain slope (gx, gy).
+            dp = dRp * wheel_pos
+            dr = dRr * wheel_pos
+            J[st_i, 0] = 1.0
+            J[st_i, 1] = dp[2] - gx * dp[0] - gy * dp[1]
+            J[st_i, 2] = dr[2] - gx * dr[0] - gy * dr[1]
+
+        delta = solve3(J, res)  # Newton step: J @ delta = res
         derived = wp.vec3(
-            derived[0] - wp.clamp(step[0], -sp.max_step, sp.max_step),
+            derived[0] - wp.clamp(delta[0], -sp.max_step, sp.max_step),
             wp.clamp(
-                derived[1] - wp.clamp(step[1], -sp.max_step, sp.max_step), -sp.tilt_clamp, sp.tilt_clamp
+                derived[1] - wp.clamp(delta[1], -sp.max_step, sp.max_step),
+                -sp.tilt_clamp,
+                sp.tilt_clamp,
             ),
             wp.clamp(
-                derived[2] - wp.clamp(step[2], -sp.max_step, sp.max_step), -sp.tilt_clamp, sp.tilt_clamp
+                derived[2] - wp.clamp(delta[2], -sp.max_step, sp.max_step),
+                -sp.tilt_clamp,
+                sp.tilt_clamp,
             ),
         )
     return derived
@@ -212,7 +207,9 @@ def adj_settle(
     x = controlled[0]
     y = controlled[1]
     yaw = controlled[2]
-    derived = settle(envelope, grid, robot, sp, controlled, derived_init)  # recompute the converged derived
+    derived = settle(
+        envelope, grid, robot, sp, controlled, derived_init
+    )  # recompute the converged derived
     Rz = rot_z(yaw)
     Ry = rot_y(derived[1])
     Rx = rot_x(derived[2])
@@ -224,12 +221,12 @@ def adj_settle(
     w1 = robot.wheel_pos[1]
     w2 = robot.wheel_pos[2]
     p = wp.vec3(x, y, derived[0])
-    hub0 = p + Rot * w0
-    hub1 = p + Rot * w1
-    hub2 = p + Rot * w2
-    s0 = sample_height_grad(envelope, grid, hub0[0], hub0[1])  # (h, gx, gy)
-    s1 = sample_height_grad(envelope, grid, hub1[0], hub1[1])
-    s2 = sample_height_grad(envelope, grid, hub2[0], hub2[1])
+    wheel_center0 = p + Rot * w0
+    wheel_center1 = p + Rot * w1
+    wheel_center2 = p + Rot * w2
+    s0 = sample_height_grad(envelope, grid, wheel_center0[0], wheel_center0[1])  # (h, gx, gy)
+    s1 = sample_height_grad(envelope, grid, wheel_center1[0], wheel_center1[1])
+    s2 = sample_height_grad(envelope, grid, wheel_center2[0], wheel_center2[1])
 
     dp0 = dRp * w0
     dp1 = dRp * w1
@@ -262,10 +259,10 @@ def adj_settle(
     adj_yaw = -(cw0 * lam[0] + cw1 * lam[1] + cw2 * lam[2])
     wp.adjoint[controlled] += wp.vec3(adj_x, adj_y, adj_yaw)
 
-    # envelope adjoint: adj_H[node] += lambda_i * (stencil of hub_i)  (per wheel)
-    _scatter_h(wp.adjoint[envelope], grid, hub0[0], hub0[1], lam[0])
-    _scatter_h(wp.adjoint[envelope], grid, hub1[0], hub1[1], lam[1])
-    _scatter_h(wp.adjoint[envelope], grid, hub2[0], hub2[1], lam[2])
+    # envelope adjoint: adj_H[node] += lambda_i * (stencil of wheel-center i)  (per wheel)
+    _scatter_h(wp.adjoint[envelope], grid, wheel_center0[0], wheel_center0[1], lam[0])
+    _scatter_h(wp.adjoint[envelope], grid, wheel_center1[0], wheel_center1[1], lam[1])
+    _scatter_h(wp.adjoint[envelope], grid, wheel_center2[0], wheel_center2[1], lam[2])
 
 
 @wp.func
@@ -279,15 +276,15 @@ def normal_loads(
     `envelope` is the wheel-envelope grid (same surface the contacts sit on).
     """
     com_world = p + R * robot.com
-    hub0 = p + R * robot.wheel_pos[0]
-    hub1 = p + R * robot.wheel_pos[1]
-    hub2 = p + R * robot.wheel_pos[2]
-    n0 = sample_normal(envelope, grid, hub0[0], hub0[1])
-    n1 = sample_normal(envelope, grid, hub1[0], hub1[1])
-    n2 = sample_normal(envelope, grid, hub2[0], hub2[1])
-    r0 = (hub0 - robot.wheel_radius * n0) - com_world
-    r1 = (hub1 - robot.wheel_radius * n1) - com_world
-    r2 = (hub2 - robot.wheel_radius * n2) - com_world
+    wheel_center0 = p + R * robot.wheel_pos[0]
+    wheel_center1 = p + R * robot.wheel_pos[1]
+    wheel_center2 = p + R * robot.wheel_pos[2]
+    n0 = sample_normal(envelope, grid, wheel_center0[0], wheel_center0[1])
+    n1 = sample_normal(envelope, grid, wheel_center1[0], wheel_center1[1])
+    n2 = sample_normal(envelope, grid, wheel_center2[0], wheel_center2[1])
+    r0 = (wheel_center0 - robot.wheel_radius * n0) - com_world
+    r1 = (wheel_center1 - robot.wheel_radius * n1) - com_world
+    r2 = (wheel_center2 - robot.wheel_radius * n2) - com_world
     m0 = wp.cross(r0, n0)
     m1 = wp.cross(r1, n1)
     m2 = wp.cross(r2, n2)
@@ -365,12 +362,12 @@ def step(
     w0v = robot.wheel_pos[0]
     w1v = robot.wheel_pos[1]
     w2v = robot.wheel_pos[2]
-    h0 = p + R * w0v
-    h1 = p + R * w1v
-    h2 = p + R * w2v
-    ct0 = h0 - robot.wheel_radius * sample_normal(envelope, grid, h0[0], h0[1])
-    ct1 = h1 - robot.wheel_radius * sample_normal(envelope, grid, h1[0], h1[1])
-    ct2 = h2 - robot.wheel_radius * sample_normal(envelope, grid, h2[0], h2[1])
+    wheel_center0 = p + R * w0v
+    wheel_center1 = p + R * w1v
+    wheel_center2 = p + R * w2v
+    ct0 = wheel_center0 - robot.wheel_radius * sample_normal(envelope, grid, wheel_center0[0], wheel_center0[1])
+    ct1 = wheel_center1 - robot.wheel_radius * sample_normal(envelope, grid, wheel_center1[0], wheel_center1[1])
+    ct2 = wheel_center2 - robot.wheel_radius * sample_normal(envelope, grid, wheel_center2[0], wheel_center2[1])
     mw0 = sample_height(friction, grid_mu, ct0[0], ct0[1]) * N[0]
     mw1 = sample_height(friction, grid_mu, ct1[0], ct1[1]) * N[1]
     mw2 = sample_height(friction, grid_mu, ct2[0], ct2[1]) * N[2]
