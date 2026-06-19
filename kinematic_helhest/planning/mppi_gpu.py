@@ -24,8 +24,8 @@ def _sample_omega_kernel(U: wp.array2d(dtype=float), sigma: float, sigma_knot: f
     t, b = wp.tid()
     B = omega.shape[1]
     T = omega.shape[0]
-    el = U[t, 0]
-    er = U[t, 1]
+    wl = U[t, 0]
+    wr = U[t, 1]
     if b > 0:  # b == 0 keeps the nominal (eps = 0)
         # SPLINE bias (option A): sample n_knots correlated knots per rollout and linearly
         # interpolate them over the horizon. Each knot is keyed on (b, knot) so it is shared
@@ -42,14 +42,14 @@ def _sample_omega_kernel(U: wp.array2d(dtype=float), sigma: float, sigma_knot: f
         be1 = wp.randn(wp.rand_init(seed[0], (b * n_knots + j1) * 2))
         br0 = wp.randn(wp.rand_init(seed[0], (b * n_knots + j0) * 2 + 1))
         br1 = wp.randn(wp.rand_init(seed[0], (b * n_knots + j1) * 2 + 1))
-        el += sigma_knot * ((1.0 - frac) * be0 + frac * be1)
-        er += sigma_knot * ((1.0 - frac) * br0 + frac * br1)
+        wl += sigma_knot * ((1.0 - frac) * be0 + frac * be1)
+        wr += sigma_knot * ((1.0 - frac) * br0 + frac * br1)
         # Light per-step jitter on top (distinct stream) for local variation/refinement.
         jit = wp.rand_init(seed[0] + 9176, t * B + b)
-        el += sigma * wp.randn(jit)
-        er += sigma * wp.randn(jit)
+        wl += sigma * wp.randn(jit)
+        wr += sigma * wp.randn(jit)
     # wmin >= 0 -> forward arcs only: no reverse (vx>=0) and no in-place spin (no counter-rotation)
-    omega[t, b] = wp.vec3(wp.clamp(el, wmin, wmax), wp.clamp(er, wmin, wmax), 0.0)
+    omega[t, b] = wp.vec3(wp.clamp(wl, wmin, wmax), wp.clamp(wr, wmin, wmax), 0.0)
 
 
 @wp.struct
@@ -77,19 +77,19 @@ def _cost_kernel(controlled: wp.array2d(dtype=wp.vec3), derived: wp.array2d(dtyp
     tilt_sum = float(0.0)
     term = float(0.0)
     for t in range(T + 1):
-        c = controlled[t, b]
-        dx = c[0] - goal[0]
-        dy = c[1] - goal[1]
+        pc = controlled[t, b]
+        dx = pc[0] - goal[0]
+        dy = pc[1] - goal[1]
         d2 = dx * dx + dy * dy
         run_sum += d2
         term = d2  # last iter (t = T) sticks
-        dv = derived[t, b]
-        ang = wp.acos(wp.clamp(wp.cos(dv[1]) * wp.cos(dv[2]), -1.0, 1.0))
+        tc = derived[t, b]
+        ang = wp.acos(wp.clamp(wp.cos(tc[1]) * wp.cos(tc[2]), -1.0, 1.0))
         over = wp.max(ang - cw.tilt_free, 0.0)
         tilt_sum += over * over
     eff = float(0.0)
     smooth = float(0.0)
-    inv = float(0.0)
+    penalty = float(0.0)
     prev_l = float(0.0)
     prev_r = float(0.0)
     for t in range(T):
@@ -107,9 +107,9 @@ def _cost_kernel(controlled: wp.array2d(dtype=wp.vec3), derived: wp.array2d(dtyp
         clear_viol = wp.max(cw.clear_margin - clearance[t, b], 0.0)
         resid_viol = wp.max(residual[t, b] - cw.resid_tol, 0.0)
         early = float(T - t) / float(T)  # earlier violations hurt more (imminent)
-        inv += early * (clear_viol + resid_viol)
+        penalty += early * (clear_viol + resid_viol)
     Jout[b] = (cw.term * term + cw.run * (run_sum / float(T + 1)) + cw.tilt * (tilt_sum / float(T + 1))
-               + cw.eff * eff + cw.smooth * smooth + inv * cw.invalid)
+               + cw.eff * eff + cw.smooth * smooth + penalty * cw.invalid)
 
 
 # --- CEM reweight (option B): elite = top-k lowest-cost samples; U = their mean. Rank-based,
