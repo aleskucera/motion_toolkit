@@ -258,26 +258,30 @@ def normal_loads(
 ):
     """Quasi-static contact normal loads N_i from gravity (3x3 force/torque solve).
 
+    The body pose is (R, p): R is the orientation (body->world, from euler_zyx of
+    yaw/pitch/roll) and p is the body-origin position (x, y, z). Body-frame points
+    map to world as q_world = p + R * q_body, so the CoM and each wheel center are
+    placed at this pose; the contacts then sit on `envelope` (the wheel-envelope
+    grid). `robot` carries mass/gravity/com/wheel_pos/wheel_radius.
+
     Row 0: vertical force balance Sum N_i n_iz = m g.
     Rows 1-2: horizontal torque balance about the CoM. Returns N = vec3(N0,N1,N2).
-    `envelope` is the wheel-envelope grid (same surface the contacts sit on).
     """
     com_world = p + R * robot.com
 
-    fz = wp.vec3()  # row 0: n_i[2]      (vertical force coefficients)
-    mx = wp.vec3()  # row 1: (r_i x n_i)[0]  (torque-x coefficients)
-    my = wp.vec3()  # row 2: (r_i x n_i)[1]  (torque-y coefficients)
+    A = wp.mat33()  # row 0: n_iz (vertical force); rows 1-2: (r_i x n_i)_xy (torque about CoM)
     for i in range(wp.static(3)):
         st_i = wp.static(i)
-        wheel_center = p + R * robot.wheel_pos[st_i]
+        wheel_pos = robot.wheel_pos[st_i]
+        wheel_center = p + R * wheel_pos
         n = sample_normal(envelope, grid, wheel_center[0], wheel_center[1])
-        r = (wheel_center - robot.wheel_radius * n) - com_world
+        ct = wheel_center - robot.wheel_radius * n  # contact point
+        r = ct - com_world                          # moment arm about the CoM
         m = wp.cross(r, n)
-        fz[st_i] = n[2]
-        mx[st_i] = m[0]
-        my[st_i] = m[1]
+        A[0, st_i] = n[2]
+        A[1, st_i] = m[0]
+        A[2, st_i] = m[1]
 
-    A = wp.mat33(fz[0], fz[1], fz[2], mx[0], mx[1], mx[2], my[0], my[1], my[2])
     b = wp.vec3(robot.mass * robot.gravity, 0.0, 0.0)
     return solve3(A, b)
 
