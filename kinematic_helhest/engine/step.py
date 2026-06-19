@@ -338,7 +338,6 @@ def step_kernel(
     elevation: wp.array2d(dtype=wp.float32),
     friction: wp.array2d(dtype=wp.float32),
     grid: Grid,
-    grid_mu: Grid,
     robot: Robot,
     solver: Solver,
     omega: wp.array(dtype=wp.vec3),  # [B] (wL, wR, w_rear) this step
@@ -370,7 +369,7 @@ def step_kernel(
         wheel_center = p + R * wheel_pos
         n = sample_normal(envelope, grid, wheel_center[0], wheel_center[1])
         ct = wheel_center - robot.wheel_radius * n  # contact point
-        mw = sample_height(friction, grid_mu, ct[0], ct[1]) * N[st_i]  # grip = mu * load
+        mw = sample_height(friction, grid, ct[0], ct[1]) * N[st_i]  # grip = mu * load
         sw += mw
         xicr_num += mw * wheel_pos[0]
     x_icr = xicr_num / sw
@@ -408,7 +407,6 @@ def rollout_kernel(
     elevation: wp.array2d(dtype=wp.float32),
     friction: wp.array2d(dtype=wp.float32),
     grid: Grid,
-    grid_mu: Grid,
     robot: Robot,
     solver: Solver,
     start_pose: wp.array(dtype=wp.vec3),  # [B] (x, y, yaw)
@@ -454,7 +452,7 @@ def rollout_kernel(
             wheel_center = p + R * wheel_pos
             n = sample_normal(envelope, grid, wheel_center[0], wheel_center[1])
             ct = wheel_center - robot.wheel_radius * n
-            mw = sample_height(friction, grid_mu, ct[0], ct[1]) * N[st_i]
+            mw = sample_height(friction, grid, ct[0], ct[1]) * N[st_i]
             sw += mw
             xicr_num += mw * wheel_pos[0]
         x_icr = xicr_num / sw

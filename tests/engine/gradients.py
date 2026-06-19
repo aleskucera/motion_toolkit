@@ -189,7 +189,7 @@ def _gmeta(hm):
     return g
 
 
-def _fwd(envH, rawH, muH, g, gmu, robot, sp, omega_np, init_pose, wpv, wtv, grad=False):
+def _fwd(envH, rawH, muH, g, robot, sp, omega_np, init_pose, wpv, wtv, grad=False):
     """Forward init + T steps + loss on the FINAL state (B=1). If grad, taped
     backward -> (loss, gHenv, gHmu). T inferred from omega_np."""
     from kinematic_helhest.engine import init_state_kernel, step_kernel
@@ -213,7 +213,7 @@ def _fwd(envH, rawH, muH, g, gmu, robot, sp, omega_np, init_pose, wpv, wtv, grad
         wp.launch(init_state_kernel, 1, inputs=[Henv, g, robot, sp, pose0],
                   outputs=[controlled, derived], device=dev)
         for t in range(T):
-            wp.launch(step_kernel, 1, inputs=[Henv, Hraw, Hmu, g, gmu, robot, sp, omega[t], controlled[t], derived[t]],
+            wp.launch(step_kernel, 1, inputs=[Henv, Hraw, Hmu, g, robot, sp, omega[t], controlled[t], derived[t]],
                       outputs=[controlled[t + 1], derived[t + 1], loads[t], turn[t], clear[t], resid[t]], device=dev)
         wp.launch(_row_loss, 1, inputs=[controlled, derived, wpv, wtv, T], outputs=[loss], device=dev)
 
@@ -239,7 +239,7 @@ def _selftest_step_grad():
     mu = friction.uniform(0.8)
     robot = RobotParams().build("cpu")
     sp = SolverParams(newton_iters=12, dt=0.05, k_turn=2.0).build()
-    g, gmu = _gmeta(env), _gmeta(mu)
+    g = _gmeta(env)
     omega_np = np.array([[[1.0, 2.0, 1.5]]], np.float32)  # [T=1,B=1,3]: a turn
     wpv, wtv = wp.vec3(0.5, 0.3, 1.0), wp.vec3(0.2, 1.0, 0.5)
     init_pose = (0.0, 0.0, 0.0)
@@ -248,12 +248,12 @@ def _selftest_step_grad():
     rawH = np.ascontiguousarray(scene.H, np.float32)
     muH = np.ascontiguousarray(mu.H, np.float32)
 
-    _, gHenv, gHmu = _fwd(envH, rawH, muH, g, gmu, robot, sp, omega_np, init_pose, wpv, wtv, grad=True)
+    _, gHenv, gHmu = _fwd(envH, rawH, muH, g, robot, sp, omega_np, init_pose, wpv, wtv, grad=True)
 
     eps = 1e-3
-    err_e = _fd_grid(envH, rawH, muH, g, gmu, robot, sp, omega_np, init_pose, wpv, wtv,
+    err_e = _fd_grid(envH, rawH, muH, g, robot, sp, omega_np, init_pose, wpv, wtv,
                      gHenv, "env", eps)
-    err_m = _fd_grid(envH, rawH, muH, g, gmu, robot, sp, omega_np, init_pose, wpv, wtv,
+    err_m = _fd_grid(envH, rawH, muH, g, robot, sp, omega_np, init_pose, wpv, wtv,
                      gHmu, "mu", eps)
     worst = max(err_e, err_m)
     print(f"  dHenv: {np.count_nonzero(np.abs(gHenv) > 1e-5)} cells ||g||={np.abs(gHenv).max():.3f}  "
@@ -263,20 +263,20 @@ def _selftest_step_grad():
     print(f"step grad d/dHenv,d/dHmu vs FD  worst={worst:.2e}  {'OK' if worst < 5e-2 else 'REVIEW'}")
 
 
-def _fd_grid(envH, rawH, muH, g, gmu, robot, sp, omega_np, init_pose, wpv, wtv, g_an, which, eps):
+def _fd_grid(envH, rawH, muH, g, robot, sp, omega_np, init_pose, wpv, wtv, g_an, which, eps):
     cells = list(zip(*np.where(np.abs(g_an) > 1e-5)))
     err = 0.0
     for (i, j) in cells:
         def loss_at(delta):
             e, r, m = envH.copy(), rawH.copy(), muH.copy()
             (e if which == "env" else m)[i, j] += delta
-            return _fwd(e, r, m, g, gmu, robot, sp, omega_np, init_pose, wpv, wtv)
+            return _fwd(e, r, m, g, robot, sp, omega_np, init_pose, wpv, wtv)
         g_fd = (loss_at(+eps) - loss_at(-eps)) / (2 * eps)
         err = max(err, abs(g_an[i, j] - g_fd))
     return err
 
 
-def _fwd_h(rawH, muH, g, gmu, Rwheel, robot, sp, omega_np, init_pose, wpv, wtv, grad=False):
+def _fwd_h(rawH, muH, g, Rwheel, robot, sp, omega_np, init_pose, wpv, wtv, grad=False):
     """Like _fwd but the leaf is the RAW heightmap: Henv = wheel_envelope(rawH) is
     computed on the tape, so backward yields d(loss)/d(raw h)."""
     from kinematic_helhest.engine import init_state_kernel, step_kernel
@@ -300,7 +300,7 @@ def _fwd_h(rawH, muH, g, gmu, Rwheel, robot, sp, omega_np, init_pose, wpv, wtv, 
         wp.launch(init_state_kernel, 1, inputs=[Henv, g, robot, sp, pose0],
                   outputs=[controlled, derived], device=dev)
         for t in range(T):
-            wp.launch(step_kernel, 1, inputs=[Henv, Hraw, Hmu, g, gmu, robot, sp, omega[t], controlled[t], derived[t]],
+            wp.launch(step_kernel, 1, inputs=[Henv, Hraw, Hmu, g, robot, sp, omega[t], controlled[t], derived[t]],
                       outputs=[controlled[t + 1], derived[t + 1], loads[t], turn[t], clear[t], resid[t]], device=dev)
         wp.launch(_row_loss, 1, inputs=[controlled, derived, wpv, wtv, T], outputs=[loss], device=dev)
 
@@ -326,7 +326,7 @@ def _selftest_dh():
     mu = friction.uniform(0.8, xlim=(scene.x0, scene.x0 + (scene.nx - 1) * scene.cell))
     robot = RobotParams().build("cpu")
     sp = SolverParams(newton_iters=12, dt=0.05, k_turn=2.0).build()
-    g, gmu = _gmeta(scene), _gmeta(mu)
+    g = _gmeta(scene)
     omega_np = np.tile([1.0, 2.0, 1.5], (T, 1, 1)).astype(np.float32)
     wpv, wtv = wp.vec3(0.5, 0.3, 1.0), wp.vec3(0.2, 1.0, 0.5)
     init_pose = (1.5, 0.0, 0.0)  # on the slope
@@ -334,10 +334,10 @@ def _selftest_dh():
     rawH = np.ascontiguousarray(scene.H, np.float32)
     muH = np.ascontiguousarray(mu.H, np.float32)
 
-    _, gH, gMu = _fwd_h(rawH, muH, g, gmu, R, robot, sp, omega_np, init_pose, wpv, wtv, grad=True)
+    _, gH, gMu = _fwd_h(rawH, muH, g, R, robot, sp, omega_np, init_pose, wpv, wtv, grad=True)
 
     eps = 1e-3
-    fwd = lambda rh, mh: _fwd_h(rh, mh, g, gmu, R, robot, sp, omega_np, init_pose, wpv, wtv)
+    fwd = lambda rh, mh: _fwd_h(rh, mh, g, R, robot, sp, omega_np, init_pose, wpv, wtv)
     err_h = _fd_cells(rawH, muH, gH, "raw", eps, fwd)
     err_m = _fd_cells(rawH, muH, gMu, "mu", eps, fwd)
     worst = max(err_h, err_m)
@@ -361,7 +361,7 @@ def _fd_cells(rawH, muH, g_an, which, eps, fwd):
     return err
 
 
-def _fwd_batch(envH, rawH, muH, g, gmu, robot, sp, omega_np, poses, wpv, wtv, grad=False):
+def _fwd_batch(envH, rawH, muH, g, robot, sp, omega_np, poses, wpv, wtv, grad=False):
     """Batched (B>1) forward init + T steps + summed loss over all rollouts.
     omega_np: [T, B, 3]; poses: [B, 3]. Grads accumulate into shared Henv/Hmu."""
     from kinematic_helhest.engine import init_state_kernel, step_kernel
@@ -385,7 +385,7 @@ def _fwd_batch(envH, rawH, muH, g, gmu, robot, sp, omega_np, poses, wpv, wtv, gr
         wp.launch(init_state_kernel, B, inputs=[Henv, g, robot, sp, pose0],
                   outputs=[controlled, derived], device=dev)
         for t in range(T):
-            wp.launch(step_kernel, B, inputs=[Henv, Hraw, Hmu, g, gmu, robot, sp, omega[t], controlled[t], derived[t]],
+            wp.launch(step_kernel, B, inputs=[Henv, Hraw, Hmu, g, robot, sp, omega[t], controlled[t], derived[t]],
                       outputs=[controlled[t + 1], derived[t + 1], loads[t], turn[t], clear[t], resid[t]], device=dev)
         wp.launch(_row_loss, B, inputs=[controlled, derived, wpv, wtv, T], outputs=[loss], device=dev)
 
@@ -412,7 +412,7 @@ def _selftest_batch():
     mu = friction.uniform(0.8)
     robot = RobotParams().build("cpu")
     sp = SolverParams(newton_iters=12, dt=0.05, k_turn=2.0).build()
-    g, gmu = _gmeta(env), _gmeta(mu)
+    g = _gmeta(env)
     wpv, wtv = wp.vec3(0.5, 0.3, 1.0), wp.vec3(0.2, 1.0, 0.5)
 
     # B distinct rollouts: different turn rates and start poses
@@ -424,11 +424,11 @@ def _selftest_batch():
     rawH = np.ascontiguousarray(scene.H, np.float32)
     muH = np.ascontiguousarray(mu.H, np.float32)
 
-    lb, gHb, gMb = _fwd_batch(envH, rawH, muH, g, gmu, robot, sp, omega, poses, wpv, wtv, grad=True)
+    lb, gHb, gMb = _fwd_batch(envH, rawH, muH, g, robot, sp, omega, poses, wpv, wtv, grad=True)
 
     ls, gHs, gMs = 0.0, np.zeros_like(gHb), np.zeros_like(gMb)
     for b in range(B):
-        lo, gh, gm = _fwd_batch(envH, rawH, muH, g, gmu, robot, sp,
+        lo, gh, gm = _fwd_batch(envH, rawH, muH, g, robot, sp,
                                 omega[:, b:b + 1], poses[b:b + 1], wpv, wtv, grad=True)
         ls += lo
         gHs += gh
@@ -456,7 +456,7 @@ def _selftest_bptt():
     mu = friction.uniform(0.8)
     robot = RobotParams().build("cpu")
     sp = SolverParams(newton_iters=12, dt=0.05, k_turn=2.0).build()
-    g, gmu = _gmeta(env), _gmeta(mu)
+    g = _gmeta(env)
     omega_np = np.tile([1.0, 2.0, 1.5], (T, 1, 1)).astype(np.float32)  # [T,1,3]: a turn
     wpv, wtv = wp.vec3(0.5, 0.3, 1.0), wp.vec3(0.2, 1.0, 0.5)
     init_pose = (0.0, 0.0, 0.0)
@@ -465,11 +465,11 @@ def _selftest_bptt():
     rawH = np.ascontiguousarray(scene.H, np.float32)
     muH = np.ascontiguousarray(mu.H, np.float32)
 
-    _, gHenv, gHmu = _fwd(envH, rawH, muH, g, gmu, robot, sp, omega_np, init_pose, wpv, wtv, grad=True)
+    _, gHenv, gHmu = _fwd(envH, rawH, muH, g, robot, sp, omega_np, init_pose, wpv, wtv, grad=True)
 
     eps = 1e-3
-    err_e = _fd_grid(envH, rawH, muH, g, gmu, robot, sp, omega_np, init_pose, wpv, wtv, gHenv, "env", eps)
-    err_m = _fd_grid(envH, rawH, muH, g, gmu, robot, sp, omega_np, init_pose, wpv, wtv, gHmu, "mu", eps)
+    err_e = _fd_grid(envH, rawH, muH, g, robot, sp, omega_np, init_pose, wpv, wtv, gHenv, "env", eps)
+    err_m = _fd_grid(envH, rawH, muH, g, robot, sp, omega_np, init_pose, wpv, wtv, gHmu, "mu", eps)
     worst = max(err_e, err_m)
     print(f"  T={T}  dHenv: {np.count_nonzero(np.abs(gHenv) > 1e-5)} cells "
           f"||g||={np.abs(gHenv).max():.3f}  max|err|={err_e:.2e}")

@@ -61,7 +61,7 @@ def rollout_device(scene, mu_field, setpoints, init_pose, params,
               outputs=[controlled, derived], device=device)
     for t in range(T):
         wp.launch(step_kernel, 1,
-                  inputs=[te, tr, tm, g, g, robot, sp, omega[t], controlled[t], derived[t]],
+                  inputs=[te, tr, tm, g, robot, sp, omega[t], controlled[t], derived[t]],
                   outputs=[controlled[t + 1], derived[t + 1], loads[t], turn[t], clear[t], resid[t]],
                   device=device)
     clear_np, resid_np = clear.numpy()[:, 0], resid.numpy()[:, 0]
@@ -225,13 +225,13 @@ def selftest_rollout_kernel():
                 wp.zeros((T, B), dtype=float, device="cpu"), wp.zeros((T, B), dtype=float, device="cpu")]
 
     fused = buffers()
-    wp.launch(rollout_kernel, B, inputs=[T, te, tr, tm, g, g, robot, sp, pose0, omega],
+    wp.launch(rollout_kernel, B, inputs=[T, te, tr, tm, g, robot, sp, pose0, omega],
               outputs=fused, device="cpu")
     perstep = buffers()
     wp.launch(init_state_kernel, B, inputs=[te, g, robot, sp, pose0],
               outputs=[perstep[0], perstep[1]], device="cpu")
     for t in range(T):
-        wp.launch(step_kernel, B, inputs=[te, tr, tm, g, g, robot, sp, omega[t], perstep[0][t], perstep[1][t]],
+        wp.launch(step_kernel, B, inputs=[te, tr, tm, g, robot, sp, omega[t], perstep[0][t], perstep[1][t]],
                   outputs=[perstep[0][t + 1], perstep[1][t + 1], perstep[2][t], perstep[3][t],
                            perstep[4][t], perstep[5][t]], device="cpu")
     worst = max(np.abs(f.numpy() - s.numpy()).max() for f, s in zip(fused, perstep))
