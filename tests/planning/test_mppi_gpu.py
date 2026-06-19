@@ -51,14 +51,16 @@ def selftest_cost_parity(device="cuda", B=2048, T=70):
     cw = mg.CostWeights()
     cw.term, cw.run, cw.tilt, cw.head = _W["term"], _W["run"], _W["tilt"], _W["head"]
     cw.ctg = 0.0  # Euclidean goal term
+    cw.lattice = 0.0  # no orientation-aware cost-to-go in parity
     cw.oob = 0.0  # no out-of-bounds penalty in parity
     cw.term_v = 0.0  # no terminal-speed penalty in parity (the cost-to-go path is verified e2e, not here)
     cw.eff, cw.smooth, cw.invalid = _W["eff"], _W["smooth"], _W["invalid"]
     cw.tilt_free, cw.clear_margin, cw.resid_tol = _W["tilt_free"], _CM, _RT
     ctg_field = wp.zeros((sim.grid.cells_y, sim.grid.cells_x), dtype=float, device=device)  # unused at ctg=0
+    lat_field = wp.zeros((sim.grid.cells_y, sim.grid.cells_x, 16), dtype=float, device=device)  # unused at lattice=0
     wp.launch(mg._cost_kernel, B,
               inputs=[sim.controlled, sim.derived, sim.clearance, sim.residual, sim.omega, goal_d,
-                      ctg_field, sim.grid, cw, T],
+                      ctg_field, sim.grid, lat_field, 16, cw, T],
               outputs=[Jg], device=device)
     J_gpu = Jg.numpy()
 

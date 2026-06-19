@@ -72,3 +72,57 @@ class CostToGo:
         wp.launch(_clamp_kernel, dim=(self.ny, self.nx),
                   inputs=[v, self._vcap], outputs=[self.V], device=self.device)
         return self.V
+
+
+@wp.kernel
+def _clamp3d_kernel(
+    v_in: wp.array3d(dtype=wp.float32), vcap: wp.float32, v_out: wp.array3d(dtype=wp.float32)
+):
+    r, c, t = wp.tid()
+    val = v_in[r, c, t]
+    if val > vcap:
+        v_out[r, c, t] = vcap
+    else:
+        v_out[r, c, t] = val
+
+
+class CostToGoLattice:
+    """Like CostToGo, but the ORIENTATION-AWARE cost-to-go V(x, y, theta) -- so the MPPI cost
+    penalizes misaligned approaches a forward-only robot can't recover from (the pocket/ridge
+    failure that position-only V causes). Runs the same terrain_toolkit traversability + the GPU
+    LatticeValueSolver (forward-arc lattice value iteration), at the sim resolution with a larger
+    arc step so its grid matches the sim grid. compute() updates the clamped V[ny,nx,n_theta] in
+    place (stable buffer -> graph-safe)."""
+
+    def __init__(self, nx, ny, cell, x0, y0, device, *, n_theta=16, turn_radius=0.6,
+                 robot_radius=0.3, step=0.3, obstacle_threshold=0.8, config=None):
+        try:
+            from terrain_toolkit import (
+                GeometricTraversabilityAnalyzer,
+                LatticeValueSolver,
+            )
+        except ImportError as e:
+            raise ImportError(
+                "orientation-aware cost-to-go needs terrain_toolkit; install it, e.g. "
+                "`uv pip install -e ../terrain_toolkit --no-deps`"
+            ) from e
+        self.nx, self.ny, self.cell = int(nx), int(ny), float(cell)
+        self.x0, self.y0 = float(x0), float(y0)
+        self.bounds = (self.x0, self.x0 + self.nx * self.cell, self.y0, self.y0 + self.ny * self.cell)
+        self.n_theta = int(n_theta)
+        self.obstacle_threshold = float(obstacle_threshold)
+        self.device = device
+        self._vcap = float(1.5 * (self.nx + self.ny) * self.cell)
+        self.analyzer = GeometricTraversabilityAnalyzer(self.cell, self.ny, self.nx, config, device=device)
+        self.solver = LatticeValueSolver(self.cell, self.ny, self.nx, n_theta=self.n_theta,
+                                         turn_radius=turn_radius, robot_radius=robot_radius,
+                                         step=step, device=device)
+        self.V = wp.zeros((self.ny, self.nx, self.n_theta), dtype=wp.float32, device=device)
+
+    def compute(self, elevation, goal_xy):
+        """elevation [ny, nx] + world goal -> V[ny, nx, n_theta] (wp.array, clamped meters)."""
+        trav = self.analyzer.compute(elevation).total
+        v = self.solver.compute(trav, goal_xy, self.bounds, obstacle_threshold=self.obstacle_threshold)
+        wp.launch(_clamp3d_kernel, dim=(self.ny, self.nx, self.n_theta),
+                  inputs=[v, self._vcap], outputs=[self.V], device=self.device)
+        return self.V

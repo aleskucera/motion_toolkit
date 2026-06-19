@@ -15,9 +15,39 @@ import numpy as np
 import warp as wp
 
 from ..engine.terrain import Grid
+from ..engine.terrain import _locate
 from ..engine.terrain import sample_field
 
 _N_BISECT = 14  # device-side bisection iterations for the CEM top-k threshold
+
+
+@wp.func
+def sample_lattice(field: wp.array3d(dtype=float), grid: Grid, n_theta: int,
+                   x: float, y: float, yaw: float):
+    """Trilinear sample of the orientation-aware cost-to-go V(x, y, theta): bilinear in (x, y),
+    linear in the (wrapped) heading. Misaligned poses read high/inf, so MPPI's rollouts prefer an
+    approach the forward-only robot can actually complete."""
+    c = _locate(grid, x, y)
+    two_pi = 6.2831853
+    dth = two_pi / float(n_theta)
+    m = yaw - wp.floor(yaw / two_pi) * two_pi  # yaw mod 2pi in [0, 2pi)
+    ft = m / dth
+    t0 = int(wp.floor(ft)) % n_theta
+    t1 = (t0 + 1) % n_theta
+    fth = ft - wp.floor(ft)
+    fx = c.frac_x
+    fy = c.frac_y
+    xi = c.x_idx
+    yi = c.y_idx
+    va = ((1.0 - fx) * (1.0 - fy) * field[yi, xi, t0]
+          + fx * (1.0 - fy) * field[yi, xi + 1, t0]
+          + (1.0 - fx) * fy * field[yi + 1, xi, t0]
+          + fx * fy * field[yi + 1, xi + 1, t0])
+    vb = ((1.0 - fx) * (1.0 - fy) * field[yi, xi, t1]
+          + fx * (1.0 - fy) * field[yi, xi + 1, t1]
+          + (1.0 - fx) * fy * field[yi + 1, xi, t1]
+          + fx * fy * field[yi + 1, xi + 1, t1])
+    return (1.0 - fth) * va + fth * vb
 
 
 @wp.func
@@ -97,6 +127,7 @@ class CostWeights:
     tilt: float
     head: float
     ctg: float  # >0 -> goal term is the cost-to-go field V(x,y), else Euclidean distance^2
+    lattice: float  # >0 -> goal term is the orientation-aware cost-to-go V(x,y,theta)
     oob: float  # >0 -> penalize leaving the world (soft wall at the grid edge)
     term_v: float  # >0 -> penalize speed at the horizon end (plan should END stopped at the goal)
     eff: float
@@ -116,7 +147,9 @@ def _cost_kernel(
     omega: wp.array2d(dtype=wp.vec3),  # Ub in components [0], [1]
     goal: wp.array(dtype=float),  # [2] world goal (device -> graph-safe, changes per replan)
     ctg_field: wp.array2d(dtype=float),  # [ny, nx] cost-to-go V (only read when cw.ctg > 0)
-    grid: Grid,  # geometry for sampling ctg_field at the rollout pose
+    grid: Grid,  # geometry for sampling ctg_field / lattice_field at the rollout pose
+    lattice_field: wp.array3d(dtype=float),  # [ny, nx, n_theta] V(x,y,theta) (only read when cw.lattice > 0)
+    n_theta: int,
     cw: CostWeights,
     T: int,
     Jout: wp.array(dtype=float),
@@ -144,7 +177,10 @@ def _cost_kernel(
             oob_sum += wp.max(y_lo - pose[1], 0.0) + wp.max(pose[1] - y_hi, 0.0)
         # goal term: obstacle-aware cost-to-go V(x,y)^2 (routes around the wall) when enabled,
         # else straight-line distance^2. cw is uniform across rollouts -> warp-coherent branch.
-        if cw.ctg > 0.0:
+        if cw.lattice > 0.0:
+            vl = sample_lattice(lattice_field, grid, n_theta, pose[0], pose[1], pose[2])
+            goal_cost = vl * vl  # orientation-aware: misaligned poses read high -> penalized
+        elif cw.ctg > 0.0:
             v = sample_field(ctg_field, grid, pose[0], pose[1])
             goal_cost = v * v
         else:
@@ -352,6 +388,7 @@ class MppiGpu:
         n_scenarios=1,
         cvar_beta=0.5,
         slip_lo=0.6,
+        n_theta=16,
     ):
         self.sim = sim
         self.dev = sim.device
@@ -374,6 +411,7 @@ class MppiGpu:
         cw.tilt = float(w.get("tilt", 0.0))
         cw.head = float(w.get("head", 0.0))
         cw.ctg = float(w.get("ctg", 0.0))
+        cw.lattice = float(w.get("lattice", 0.0))
         cw.oob = float(w.get("oob", 0.0))
         cw.term_v = float(w.get("term_v", 0.0))
         cw.eff = float(w.get("eff", 0.0))
@@ -404,6 +442,8 @@ class MppiGpu:
         # zeros + cw.ctg == 0 means it's ignored. set_costtogo() copies V in (graph-safe).
         ny, nx = sim.elevation.shape
         self.ctg_field = wp.zeros((ny, nx), dtype=float, device=d)
+        self.n_theta = int(n_theta)
+        self.lattice_field = wp.zeros((ny, nx, self.n_theta), dtype=float, device=d)  # V(x,y,theta)
         self._graph = None
 
     def reset_nominal(self, value=1.5):
@@ -421,6 +461,11 @@ class MppiGpu:
         (so a captured graph picks up new contents). Call before the first replan to enable
         the cost-to-go goal term -- requires the planner to have been built with ctg weight > 0."""
         wp.copy(self.ctg_field, V)
+
+    def set_lattice(self, V):
+        """Copy the orientation-aware cost-to-go V[ny, nx, n_theta] into the stable buffer the cost
+        kernel reads. Call before the first replan; requires the planner built with lattice weight > 0."""
+        wp.copy(self.lattice_field, V)
 
     def _refine(self):
         """One MPPI iteration: sample -> rollout -> cost -> CEM reweight, all on device."""
@@ -457,6 +502,8 @@ class MppiGpu:
                 self.goal,
                 self.ctg_field,
                 s.grid,
+                self.lattice_field,
+                self.n_theta,
                 self.cw,
                 self.T,
             ],
@@ -521,8 +568,8 @@ class MppiGpu:
         self.sim.start_pose.assign(
             np.ascontiguousarray(np.tile(np.asarray(state, np.float32), (self.B, 1)), np.float32)
         )
-        if self.cw.ctg == 0.0:  # the turn-seed (Euclidean "facing away") misfires mid-detour when
-            self._seed_turn_if_facing_away(state, goal_xy)  # cost-to-go is on -- V supplies the dir
+        if self.cw.ctg == 0.0 and self.cw.lattice == 0.0:  # the Euclidean turn-seed misfires when a
+            self._seed_turn_if_facing_away(state, goal_xy)  # cost-to-go field already supplies the dir
         if self.dev.is_cuda:
             if self._graph is None:
                 with wp.ScopedCapture(device=self.dev) as cap:
