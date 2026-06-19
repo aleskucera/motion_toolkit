@@ -68,11 +68,6 @@ class Planner:
 def _draw_plan(plan_xy, scene, goal):
     """Draw the planned path (green) and goal (red pole) in world coords."""
     from OpenGL import GL as gl
-    # truncate the drawn line at its closest approach to the goal: the 6 s prediction
-    # overshoots/loops past a near goal (the robot itself stops there), which just clutters
-    # the view. When the goal is still far, the closest point is the line's end -> no change.
-    d = np.hypot(plan_xy[:, 0] - goal[0], plan_xy[:, 1] - goal[1])
-    plan_xy = plan_xy[:int(d.argmin()) + 1]
     gl.glDisable(gl.GL_LIGHTING)
     z = np.minimum(scene.sample(plan_xy[:, 0], plan_xy[:, 1]), 0.55) + 0.06  # clamp so it doesn't ride up the wall
     gl.glColor3f(1.0, 0.0, 1.0); gl.glLineWidth(5.0)  # magenta (contrasts the green terrain)
