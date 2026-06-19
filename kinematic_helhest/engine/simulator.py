@@ -120,7 +120,7 @@ class Simulator:
         wp.launch(
             rollout_kernel,
             self.B,
-            inputs=[self.T, self.envelope, self.elevation, self.grid, self.friction, self.grid,
+            inputs=[self.T, self.envelope, self.elevation, self.friction, self.grid, self.grid,
                     self.robot, self.solver, self.start_pose, self.omega],
             outputs=[self.controlled, self.derived, self.loads, self.turning,
                      self.clearance, self.residual],
