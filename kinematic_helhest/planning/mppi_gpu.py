@@ -129,6 +129,8 @@ class CostWeights:
     ctg: float  # >0 -> goal term is the cost-to-go field V(x,y), else Euclidean distance^2
     lattice: float  # >0 -> goal term is the orientation-aware cost-to-go V(x,y,theta)
     oob: float  # >0 -> penalize leaving the world (soft wall at the grid edge)
+    endgame: float  # extra terminal weight when the plan ENDS within sqrt(endgame_r2) of the goal
+    endgame_r2: float  # (so the robot commits to the final approach without over-pulling while routing)
     term_v: float  # >0 -> penalize speed at the horizon end (plan should END stopped at the goal)
     eff: float
     smooth: float
@@ -240,10 +242,16 @@ def _cost_kernel(
         resid_viol = wp.max(residual[t, r] - cw.resid_tol, 0.0)
         early = float(T - t) / float(T)  # earlier violations hurt more (imminent)
         penalty_sum += early * (clear_viol + resid_viol)
+    # endgame commit: boost the terminal weight only when the plan ENDS near the goal, so the robot
+    # commits to the final approach (a weak pull lets it drift past) WITHOUT over-pulling while still
+    # routing (a strong global term cuts narrow gaps too tight).
+    term_weight = cw.term
+    if terminal_cost < cw.endgame_r2:
+        term_weight = cw.term + cw.endgame
     # run/tilt/heading are means over the horizon; effort/smooth are raw sums (so they scale with
     # T) -- the weights are tuned to that, mind it if T changes.
     Jout[r] = (
-        cw.term * terminal_cost
+        term_weight * terminal_cost
         + cw.run * (run_sum / float(T + 1))
         + cw.tilt * (tilt_sum / float(T + 1))
         + cw.head * (heading_sum / float(T + 1))
@@ -413,6 +421,8 @@ class MppiGpu:
         cw.ctg = float(w.get("ctg", 0.0))
         cw.lattice = float(w.get("lattice", 0.0))
         cw.oob = float(w.get("oob", 0.0))
+        cw.endgame = float(w.get("endgame", 0.0))
+        cw.endgame_r2 = float(w.get("endgame_r2", 0.0))
         cw.term_v = float(w.get("term_v", 0.0))
         cw.eff = float(w.get("eff", 0.0))
         cw.smooth = float(w.get("smooth", 0.0))

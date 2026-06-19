@@ -53,6 +53,7 @@ def selftest_cost_parity(device="cuda", B=2048, T=70):
     cw.ctg = 0.0  # Euclidean goal term
     cw.lattice = 0.0  # no orientation-aware cost-to-go in parity
     cw.oob = 0.0  # no out-of-bounds penalty in parity
+    cw.endgame = 0.0; cw.endgame_r2 = 0.0  # no endgame boost in parity
     cw.term_v = 0.0  # no terminal-speed penalty in parity (the cost-to-go path is verified e2e, not here)
     cw.eff, cw.smooth, cw.invalid = _W["eff"], _W["smooth"], _W["invalid"]
     cw.tilt_free, cw.clear_margin, cw.resid_tol = _W["tilt_free"], _CM, _RT

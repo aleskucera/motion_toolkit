@@ -89,6 +89,7 @@ def plan(scene, mu, start, goal, T=60, B=8192, n_refine=3, max_steps=260, dt=0.1
             w["head"] = 0.0    # V(x,y,theta) already encodes the desired heading
             w["oob"] = 50.0
             w["term_v"] = 1.0
+            w["endgame"] = 12.0; w["endgame_r2"] = 2.25  # commit terminal pull within 1.5 m of goal
     elif costtogo:  # option E: score by obstacle-aware cost-to-go instead of straight-line distance
         w = {**w, "ctg": 1.0}
         if weights is None:
