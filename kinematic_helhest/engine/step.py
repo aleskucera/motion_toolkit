@@ -359,21 +359,21 @@ def step_kernel(
     R = euler_zyx(yaw, tc[1], tc[2])
     p = wp.vec3(x, y, tc[0])
 
-    # --- turning params from the CURRENT pose (loads + friction at contacts) ---
-    N = normal_loads(envelope, grid, robot, R, p)
-    sw = float(0.0)        # total grip Sum_i mu_i N_i
-    xicr_num = float(0.0)  # Sum_i mu_i N_i wheel_x  (x_icr = xicr_num / sw)
+    # --- turning params from the CURRENT pose: the grip-weighted ICR + turn resistance ---
+    loads = normal_loads(envelope, grid, robot, R, p)  # per-wheel normal load N_i
+    total_grip = float(0.0)  # Sum_i grip_i
+    grip_x = float(0.0)      # Sum_i grip_i * wheel_x  (x_icr = grip_x / total_grip)
     for i in range(wp.static(3)):
         st_i = wp.static(i)
         wheel_pos = robot.wheel_pos[st_i]
         wheel_center = p + R * wheel_pos
         n = sample_normal(envelope, grid, wheel_center[0], wheel_center[1])
         ct = wheel_center - robot.wheel_radius * n  # contact point
-        mw = sample_field(friction, grid, ct[0], ct[1]) * N[st_i]  # grip = mu * load
-        sw += mw
-        xicr_num += mw * wheel_pos[0]
-    x_icr = xicr_num / sw
-    alpha = 1.0 + solver.k_turn * sw / (robot.gravity * robot.mass)
+        grip = sample_field(friction, grid, ct[0], ct[1]) * loads[st_i]  # grip_i = mu_i * N_i
+        total_grip += grip
+        grip_x += grip * wheel_pos[0]
+    x_icr = grip_x / total_grip  # grip-weighted ICR offset
+    alpha = 1.0 + solver.k_turn * total_grip / (robot.gravity * robot.mass)  # turn resistance
 
     # --- predict: twist through the CURRENT orientation, Euler integrate ---
     om = omega[tid]
@@ -443,20 +443,20 @@ def rollout_kernel(
         R = euler_zyx(yaw, tc[1], tc[2])
         p = wp.vec3(x, y, tc[0])
 
-        N = normal_loads(envelope, grid, robot, R, p)
-        sw = float(0.0)
-        xicr_num = float(0.0)
+        loads = normal_loads(envelope, grid, robot, R, p)  # per-wheel normal load N_i
+        total_grip = float(0.0)  # Sum_i grip_i
+        grip_x = float(0.0)      # Sum_i grip_i * wheel_x  (x_icr = grip_x / total_grip)
         for i in range(wp.static(3)):
             st_i = wp.static(i)
             wheel_pos = robot.wheel_pos[st_i]
             wheel_center = p + R * wheel_pos
             n = sample_normal(envelope, grid, wheel_center[0], wheel_center[1])
-            ct = wheel_center - robot.wheel_radius * n
-            mw = sample_field(friction, grid, ct[0], ct[1]) * N[st_i]
-            sw += mw
-            xicr_num += mw * wheel_pos[0]
-        x_icr = xicr_num / sw
-        alpha = 1.0 + solver.k_turn * sw / (robot.gravity * robot.mass)
+            ct = wheel_center - robot.wheel_radius * n  # contact point
+            grip = sample_field(friction, grid, ct[0], ct[1]) * loads[st_i]  # grip_i = mu_i * N_i
+            total_grip += grip
+            grip_x += grip * wheel_pos[0]
+        x_icr = grip_x / total_grip  # grip-weighted ICR offset
+        alpha = 1.0 + solver.k_turn * total_grip / (robot.gravity * robot.mass)  # turn resistance
 
         om = omega[t, b]
         vx = robot.wheel_radius * (om[0] + om[1]) / 2.0
