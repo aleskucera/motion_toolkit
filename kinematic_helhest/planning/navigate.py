@@ -41,7 +41,8 @@ class NavConfig:
     dt: float = 0.1            # 10 Hz control; kinematic Euler is accurate here (~3 cm/4 s)
     n_refine: int = 3
     sigma: float = 0.5         # per-step jitter std (local variation)
-    sigma_bias: float = 1.0    # sustained per-rollout bias std (broad spatial fan)
+    sigma_knot: float = 1.0    # spline-knot std (broad correlated maneuvers)
+    n_knots: int = 4           # control knots interpolated over the horizon (option A)
     lam: float = 0.5
     wmax: float = 4.0
     clear_margin: float = 0.05
@@ -89,7 +90,8 @@ class Navigator:
             self.sim = Simulator(self.rp, self.params, grid, cfg.B, cfg.T, self.dev)
             w = dict(_W, tilt=cfg.tilt_w, tilt_free=np.radians(cfg.tilt_free_deg))
             self.drv = MppiGpu(self.sim, cfg.sigma, cfg.lam, cfg.wmax, w,
-                               cfg.clear_margin, cfg.resid_tol, self.seed, sigma_bias=cfg.sigma_bias)
+                               cfg.clear_margin, cfg.resid_tol, self.seed,
+                               sigma_knot=cfg.sigma_knot, n_knots=cfg.n_knots)
         self.sim.set_terrain(raw_H)            # borrow + dilate, no alloc
         self.sim.set_uniform_friction(cfg.mu_value)
 

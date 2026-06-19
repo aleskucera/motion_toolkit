@@ -16,20 +16,31 @@ import warp as wp
 
 
 @wp.kernel
-def _sample_omega_kernel(U: wp.array2d(dtype=float), sigma: float, sigma_bias: float, wmax: float,
-                  seed: wp.array(dtype=int), omega: wp.array2d(dtype=wp.vec3)):
+def _sample_omega_kernel(U: wp.array2d(dtype=float), sigma: float, sigma_knot: float, wmax: float,
+                  n_knots: int, seed: wp.array(dtype=int), omega: wp.array2d(dtype=wp.vec3)):
     t, b = wp.tid()
     B = omega.shape[1]
+    T = omega.shape[0]
     el = U[t, 0]
     er = U[t, 1]
     if b > 0:  # b == 0 keeps the nominal (eps = 0)
-        # Sustained per-rollout bias: keyed on b ALONE, so it is identical across all t
-        # of this rollout -> the sample commits to an arc. This correlated (low-frequency)
-        # noise is what gives a broad SPATIAL fan; white per-step noise averages out and
-        # only ever jitters around straight-ahead. This is a planner, so we want coverage.
-        bias = wp.rand_init(seed[0], b)
-        el += sigma_bias * wp.randn(bias)
-        er += sigma_bias * wp.randn(bias)
+        # SPLINE bias (option A): sample n_knots correlated knots per rollout and linearly
+        # interpolate them over the horizon. Each knot is keyed on (b, knot) so it is shared
+        # by all t in its span -> the rollout commits to a smooth, low-frequency maneuver. Unlike
+        # a single constant bias (which can only arc), multiple knots express turn-then-straight,
+        # and the control is smooth by construction. Recompute the two bracketing knots on the
+        # fly (rand_init is deterministic) -- no shared knot storage.
+        interval = float(T - 1) / float(n_knots - 1)
+        pos = float(t) / interval
+        j0 = int(pos)
+        j1 = wp.min(j0 + 1, n_knots - 1)
+        frac = pos - float(j0)
+        be0 = wp.randn(wp.rand_init(seed[0], (b * n_knots + j0) * 2))
+        be1 = wp.randn(wp.rand_init(seed[0], (b * n_knots + j1) * 2))
+        br0 = wp.randn(wp.rand_init(seed[0], (b * n_knots + j0) * 2 + 1))
+        br1 = wp.randn(wp.rand_init(seed[0], (b * n_knots + j1) * 2 + 1))
+        el += sigma_knot * ((1.0 - frac) * be0 + frac * be1)
+        er += sigma_knot * ((1.0 - frac) * br0 + frac * br1)
         # Light per-step jitter on top (distinct stream) for local variation/refinement.
         jit = wp.rand_init(seed[0] + 9176, t * B + b)
         el += sigma * wp.randn(jit)
@@ -124,12 +135,13 @@ class MppiGpu:
     `goal` and `start_pose` are device arrays set per replan, so the captured graph picks
     up new values; the weights/sigma/lam/wmax are baked at capture (fixed per planner)."""
 
-    def __init__(self, sim, sigma, lam, wmax, weights, clear_margin, resid_tol, seed=0, sigma_bias=0.0):
+    def __init__(self, sim, sigma, lam, wmax, weights, clear_margin, resid_tol, seed=0,
+                 sigma_knot=0.0, n_knots=4):
         self.sim = sim
         self.dev = sim.device
         self.B, self.T = sim.B, sim.T
         self.sigma, self.lam, self.wmax = float(sigma), float(lam), float(wmax)
-        self.sigma_bias = float(sigma_bias)
+        self.sigma_knot, self.n_knots = float(sigma_knot), int(n_knots)
         self.clear_margin, self.resid_tol = float(clear_margin), float(resid_tol)
         w = weights
         self.w_term = float(w.get("term", 0.0))
@@ -163,7 +175,7 @@ class MppiGpu:
         s, d = self.sim, self.dev
         wp.launch(_bump_seed_kernel, 1, inputs=[self.seed], device=d)
         wp.launch(_sample_omega_kernel, (self.T, self.B),
-                  inputs=[self.U, self.sigma, self.sigma_bias, self.wmax, self.seed],
+                  inputs=[self.U, self.sigma, self.sigma_knot, self.wmax, self.n_knots, self.seed],
                   outputs=[s.omega], device=d)
         s.rollout_launch()
         wp.launch(_cost_kernel, self.B, inputs=[s.controlled, s.derived, s.clearance, s.residual, s.omega,
