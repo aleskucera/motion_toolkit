@@ -85,8 +85,10 @@ def plan(scene, mu, start, goal, T=60, B=8192, n_refine=3, max_steps=260, dt=0.1
     w = weights or dict(term=3.0, run=0.3, head=2.0, invalid=1e5, eff=2e-3, smooth=2e-3)
     if costtogo:  # option E: score by obstacle-aware cost-to-go instead of straight-line distance
         w = {**w, "ctg": 1.0}
-        if weights is None:  # the -grad V heading is a softer signal than Euclidean -> commit harder
-            w["head"] = 4.0
+        if weights is None:
+            w["head"] = 4.0   # the -grad V heading is a softer signal than Euclidean -> commit harder
+            w["oob"] = 50.0   # soft wall at the grid edge: V is clamped off-grid, so the goal term
+            w["term_v"] = 1.0  # alone lets it drive off the map; and end the plan stopped at the goal
     goal = np.asarray(goal[:2], np.float64)
     drv = MppiGpu(sim, sigma, wmax, w, clear_margin, resid_tol, seed,
                   sigma_knot=sigma_knot, n_knots=n_knots, wmin=wmin, elite_frac=elite_frac,

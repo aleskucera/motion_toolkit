@@ -97,6 +97,8 @@ class CostWeights:
     tilt: float
     head: float
     ctg: float  # >0 -> goal term is the cost-to-go field V(x,y), else Euclidean distance^2
+    oob: float  # >0 -> penalize leaving the world (soft wall at the grid edge)
+    term_v: float  # >0 -> penalize speed at the horizon end (plan should END stopped at the goal)
     eff: float
     smooth: float
     invalid: float
@@ -123,12 +125,23 @@ def _cost_kernel(
     run_sum = float(0.0)
     tilt_sum = float(0.0)
     heading_sum = float(0.0)
+    oob_sum = float(0.0)
     terminal_cost = float(0.0)
+    edge = float(0.4)  # soft-wall margin inside the grid border
+    x_lo = grid.origin_x + edge
+    x_hi = grid.origin_x + float(grid.cells_x) * grid.cell_size - edge
+    y_lo = grid.origin_y + edge
+    y_hi = grid.origin_y + float(grid.cells_y) * grid.cell_size - edge
     for t in range(T + 1):
         pose = controlled[t, r]  # (x, y, yaw)
         dx = pose[0] - goal[0]
         dy = pose[1] - goal[1]
         goal_d2 = dx * dx + dy * dy  # Euclidean; still drives the heading term below
+        if cw.oob > 0.0:
+            # soft wall at the world edge: depth past the margin (V is clamped off-grid, so the
+            # goal term alone doesn't stop the robot driving off the map -- this does).
+            oob_sum += wp.max(x_lo - pose[0], 0.0) + wp.max(pose[0] - x_hi, 0.0)
+            oob_sum += wp.max(y_lo - pose[1], 0.0) + wp.max(pose[1] - y_hi, 0.0)
         # goal term: obstacle-aware cost-to-go V(x,y)^2 (routes around the wall) when enabled,
         # else straight-line distance^2. cw is uniform across rollouts -> warp-coherent branch.
         if cw.ctg > 0.0:
@@ -169,11 +182,15 @@ def _cost_kernel(
     effort_sum = float(0.0)
     smooth_sum = float(0.0)
     penalty_sum = float(0.0)
+    term_speed = float(0.0)
     prev_l = float(0.0)
     prev_r = float(0.0)
     for t in range(T):
         wheels = omega[t, r]  # (wL, wR)
-        effort_sum += wheels[0] * wheels[0] + wheels[1] * wheels[1]
+        sp2 = wheels[0] * wheels[0] + wheels[1] * wheels[1]
+        effort_sum += sp2
+        if t == T - 1:
+            term_speed = sp2  # speed at the horizon end -> 0 means the plan stops (at the goal)
         if t > 0:
             dl = wheels[0] - prev_l
             dr = wheels[1] - prev_r
@@ -194,6 +211,8 @@ def _cost_kernel(
         + cw.run * (run_sum / float(T + 1))
         + cw.tilt * (tilt_sum / float(T + 1))
         + cw.head * (heading_sum / float(T + 1))
+        + cw.oob * oob_sum
+        + cw.term_v * term_speed
         + cw.eff * effort_sum
         + cw.smooth * smooth_sum
         + penalty_sum * cw.invalid
@@ -355,6 +374,8 @@ class MppiGpu:
         cw.tilt = float(w.get("tilt", 0.0))
         cw.head = float(w.get("head", 0.0))
         cw.ctg = float(w.get("ctg", 0.0))
+        cw.oob = float(w.get("oob", 0.0))
+        cw.term_v = float(w.get("term_v", 0.0))
         cw.eff = float(w.get("eff", 0.0))
         cw.smooth = float(w.get("smooth", 0.0))
         cw.invalid = float(w.get("invalid", 0.0))
