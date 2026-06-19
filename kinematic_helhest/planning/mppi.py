@@ -60,7 +60,7 @@ def _cost(controlled, derived, clear, resid, Ub, goal, clear_margin, resid_tol, 
 def plan(scene, mu, start, goal, T=120, B=2048, n_refine=3, max_steps=260, dt=0.05,
          sigma=0.5, sigma_bias=1.0, lam=0.5, wmax=4.0, goal_tol=0.3, resid_tol=1e-2, clear_margin=0.05,
          device="cuda", seed=0, weights=None, record=False, n_show=60):
-    params = SolverParams(dt=dt, k_turn=2.0, newton_iters=12)
+    params = SolverParams(dt=dt, k_turn=2.0, newton_iters=12, atol=1e-4)  # forward-only: loose settle
     sim = Simulator(
         RobotParams(), params,
         GridParams(scene.nx, scene.ny, scene.cell, scene.x0, scene.y0),

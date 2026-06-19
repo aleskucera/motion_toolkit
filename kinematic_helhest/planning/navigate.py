@@ -63,7 +63,7 @@ class Navigator:
         self.cfg = cfg
         self.dev = device
         self.rp = robot_params or RobotParams()
-        self.params = SolverParams(dt=cfg.dt, k_turn=2.0, newton_iters=12)
+        self.params = SolverParams(dt=cfg.dt, k_turn=2.0, newton_iters=12, atol=1e-4)  # forward-only: loose settle
         self.seed = seed
         self.sim = None  # built lazily on the first map (grid sizes from it)
         self.drv = None  # MppiGpu, built with the sim
