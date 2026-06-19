@@ -14,6 +14,9 @@ Kernels (all suffixed _kernel):
 import numpy as np
 import warp as wp
 
+from ..engine.terrain import Grid
+from ..engine.terrain import sample_field
+
 _N_BISECT = 14  # device-side bisection iterations for the CEM top-k threshold
 
 
@@ -85,6 +88,7 @@ class CostWeights:
     run: float
     tilt: float
     head: float
+    ctg: float  # >0 -> goal term is the cost-to-go field V(x,y), else Euclidean distance^2
     eff: float
     smooth: float
     invalid: float
@@ -101,6 +105,8 @@ def _cost_kernel(
     residual: wp.array2d(dtype=float),
     omega: wp.array2d(dtype=wp.vec3),  # Ub in components [0], [1]
     goal: wp.array(dtype=float),  # [2] world goal (device -> graph-safe, changes per replan)
+    ctg_field: wp.array2d(dtype=float),  # [ny, nx] cost-to-go V (only read when cw.ctg > 0)
+    grid: Grid,  # geometry for sampling ctg_field at the rollout pose
     cw: CostWeights,
     T: int,
     Jout: wp.array(dtype=float),
@@ -109,14 +115,21 @@ def _cost_kernel(
     run_sum = float(0.0)
     tilt_sum = float(0.0)
     heading_sum = float(0.0)
-    terminal_d2 = float(0.0)
+    terminal_cost = float(0.0)
     for t in range(T + 1):
         pose = controlled[t, r]  # (x, y, yaw)
         dx = pose[0] - goal[0]
         dy = pose[1] - goal[1]
-        goal_d2 = dx * dx + dy * dy
-        run_sum += goal_d2
-        terminal_d2 = goal_d2  # last iter (t = T) sticks -> terminal goal distance^2
+        goal_d2 = dx * dx + dy * dy  # Euclidean; still drives the heading term below
+        # goal term: obstacle-aware cost-to-go V(x,y)^2 (routes around the wall) when enabled,
+        # else straight-line distance^2. cw is uniform across rollouts -> warp-coherent branch.
+        if cw.ctg > 0.0:
+            v = sample_field(ctg_field, grid, pose[0], pose[1])
+            goal_cost = v * v
+        else:
+            goal_cost = goal_d2
+        run_sum += goal_cost
+        terminal_cost = goal_cost  # last iter (t = T) sticks -> terminal goal cost
         # tilt + heading are optional; cw is uniform across rollouts, so these guards are
         # warp-coherent (no divergence) and skip the trig (and the derived read) when off.
         if cw.tilt > 0.0:
@@ -157,7 +170,7 @@ def _cost_kernel(
     # run/tilt/heading are means over the horizon; effort/smooth are raw sums (so they scale with
     # T) -- the weights are tuned to that, mind it if T changes.
     Jout[r] = (
-        cw.term * terminal_d2
+        cw.term * terminal_cost
         + cw.run * (run_sum / float(T + 1))
         + cw.tilt * (tilt_sum / float(T + 1))
         + cw.head * (heading_sum / float(T + 1))
@@ -289,6 +302,7 @@ class MppiGpu:
         cw.run = float(w.get("run", 0.0))
         cw.tilt = float(w.get("tilt", 0.0))
         cw.head = float(w.get("head", 0.0))
+        cw.ctg = float(w.get("ctg", 0.0))
         cw.eff = float(w.get("eff", 0.0))
         cw.smooth = float(w.get("smooth", 0.0))
         cw.invalid = float(w.get("invalid", 0.0))
@@ -307,6 +321,10 @@ class MppiGpu:
         self.count = wp.zeros(1, dtype=float, device=d)
         self.seed = wp.array([int(seed)], dtype=int, device=d)
         self.goal = wp.zeros(2, dtype=float, device=d)
+        # cost-to-go field V[ny, nx] (option E): a stable buffer the cost kernel samples;
+        # zeros + cw.ctg == 0 means it's ignored. set_costtogo() copies V in (graph-safe).
+        ny, nx = sim.elevation.shape
+        self.ctg_field = wp.zeros((ny, nx), dtype=float, device=d)
         self._graph = None
 
     def reset_nominal(self, value=1.5):
@@ -318,6 +336,12 @@ class MppiGpu:
 
     def set_nominal(self, U_host):
         self.U.assign(np.ascontiguousarray(U_host, np.float32))
+
+    def set_costtogo(self, V):
+        """Copy the cost-to-go field V[ny, nx] into the stable buffer the cost kernel reads
+        (so a captured graph picks up new contents). Call before the first replan to enable
+        the cost-to-go goal term -- requires the planner to have been built with ctg weight > 0."""
+        wp.copy(self.ctg_field, V)
 
     def _refine(self):
         """One MPPI iteration: sample -> rollout -> cost -> CEM reweight, all on device."""
@@ -350,6 +374,8 @@ class MppiGpu:
                 s.residual,
                 s.omega,
                 self.goal,
+                self.ctg_field,
+                s.grid,
                 self.cw,
                 self.T,
             ],
