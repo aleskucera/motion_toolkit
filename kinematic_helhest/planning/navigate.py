@@ -34,11 +34,11 @@ _W = dict(term=3.0, run=0.3, invalid=1e5, eff=2e-3, smooth=2e-3)
 
 @dataclass
 class NavConfig:
-    half_extent: float = 8.0   # local window half-size [m] (must cover the T=100 horizon reach)
+    half_extent: float = 8.0   # local window half-size [m] (covers the reach wheel_radius*wmax*T*dt = 7 m)
     res: float = 0.06          # local window cell size [m]
-    T: int = 100               # MPPI horizon (5 s lookahead; under the 50 ms control budget)
+    T: int = 50                # MPPI horizon (50 steps x dt = 5 s lookahead)
     B: int = 2048              # MPPI samples
-    dt: float = 0.05
+    dt: float = 0.1            # 10 Hz control; kinematic Euler is accurate here (~3 cm/4 s)
     n_refine: int = 3
     sigma: float = 0.5         # per-step jitter std (local variation)
     sigma_bias: float = 1.0    # sustained per-rollout bias std (broad spatial fan)
