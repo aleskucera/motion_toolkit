@@ -263,19 +263,21 @@ def normal_loads(
     `envelope` is the wheel-envelope grid (same surface the contacts sit on).
     """
     com_world = p + R * robot.com
-    wheel_center0 = p + R * robot.wheel_pos[0]
-    wheel_center1 = p + R * robot.wheel_pos[1]
-    wheel_center2 = p + R * robot.wheel_pos[2]
-    n0 = sample_normal(envelope, grid, wheel_center0[0], wheel_center0[1])
-    n1 = sample_normal(envelope, grid, wheel_center1[0], wheel_center1[1])
-    n2 = sample_normal(envelope, grid, wheel_center2[0], wheel_center2[1])
-    r0 = (wheel_center0 - robot.wheel_radius * n0) - com_world
-    r1 = (wheel_center1 - robot.wheel_radius * n1) - com_world
-    r2 = (wheel_center2 - robot.wheel_radius * n2) - com_world
-    m0 = wp.cross(r0, n0)
-    m1 = wp.cross(r1, n1)
-    m2 = wp.cross(r2, n2)
-    A = wp.mat33(n0[2], n1[2], n2[2], m0[0], m1[0], m2[0], m0[1], m1[1], m2[1])
+
+    fz = wp.vec3()  # row 0: n_i[2]      (vertical force coefficients)
+    mx = wp.vec3()  # row 1: (r_i x n_i)[0]  (torque-x coefficients)
+    my = wp.vec3()  # row 2: (r_i x n_i)[1]  (torque-y coefficients)
+    for i in range(wp.static(3)):
+        st_i = wp.static(i)
+        wheel_center = p + R * robot.wheel_pos[st_i]
+        n = sample_normal(envelope, grid, wheel_center[0], wheel_center[1])
+        r = (wheel_center - robot.wheel_radius * n) - com_world
+        m = wp.cross(r, n)
+        fz[st_i] = n[2]
+        mx[st_i] = m[0]
+        my[st_i] = m[1]
+
+    A = wp.mat33(fz[0], fz[1], fz[2], mx[0], mx[1], mx[2], my[0], my[1], my[2])
     b = wp.vec3(robot.mass * robot.gravity, 0.0, 0.0)
     return solve3(A, b)
 
