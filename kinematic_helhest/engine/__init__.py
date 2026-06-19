@@ -25,6 +25,6 @@ from .robot import RobotParams
 from .step import Solver
 from .step import SolverParams
 from .terrain import Grid
-from .terrain import sample_height
+from .terrain import sample_field
 from .terrain import sample_height_grad
 from .terrain import sample_normal

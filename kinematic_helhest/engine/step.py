@@ -27,7 +27,7 @@ from .rotations import rot_y
 from .rotations import rot_z
 from .terrain import _locate
 from .terrain import Grid
-from .terrain import sample_height
+from .terrain import sample_field
 from .terrain import sample_height_grad
 from .terrain import sample_normal
 
@@ -99,7 +99,7 @@ def clearances(
     for i in range(wp.static(3)):
         st_i = wp.static(i)
         wheel_center = p + R * robot.wheel_pos[st_i]
-        height = sample_height(envelope, grid, wheel_center[0], wheel_center[1])
+        height = sample_field(envelope, grid, wheel_center[0], wheel_center[1])
         c[st_i] = wheel_center[2] - height - robot.wheel_radius
 
     return c
@@ -175,7 +175,7 @@ def _scatter_h(
 ):
     """Accumulate coef * (bilinear weights of (x,y)) into the envelope adjoint array.
 
-    This is d(sample_height)/dH at (x,y): the same 4-node stencil sample_height
+    This is d(sample_field)/dH at (x,y): the same 4-node stencil sample_field
     reads (via the shared `_locate`), scattered with atomics (many output cells may
     hit the same node).
     """
@@ -299,7 +299,7 @@ def chassis_clearance(
     cmin = float(1.0e9)
     for i in range(robot.n_chassis):
         w = p + R * robot.chassis_pts[i]
-        c = w[2] - sample_height(elevation, grid, w[0], w[1])
+        c = w[2] - sample_field(elevation, grid, w[0], w[1])
         cmin = wp.min(cmin, c)
     return cmin
 
@@ -326,7 +326,7 @@ def init_state_kernel(
     """
     tid = wp.tid()
     pc = start_pose[tid]
-    z0 = sample_height(envelope, grid, pc[0], pc[1]) + robot.wheel_radius
+    z0 = sample_field(envelope, grid, pc[0], pc[1]) + robot.wheel_radius
     settled = settle(envelope, grid, robot, solver, pc, wp.vec3(z0, 0.0, 0.0))
     controlled[0, tid] = pc
     derived[0, tid] = settled
@@ -369,7 +369,7 @@ def step_kernel(
         wheel_center = p + R * wheel_pos
         n = sample_normal(envelope, grid, wheel_center[0], wheel_center[1])
         ct = wheel_center - robot.wheel_radius * n  # contact point
-        mw = sample_height(friction, grid, ct[0], ct[1]) * N[st_i]  # grip = mu * load
+        mw = sample_field(friction, grid, ct[0], ct[1]) * N[st_i]  # grip = mu * load
         sw += mw
         xicr_num += mw * wheel_pos[0]
     x_icr = xicr_num / sw
@@ -431,7 +431,7 @@ def rollout_kernel(
     b = wp.tid()
     # init_state: settle the start pose -> row 0
     pc = start_pose[b]
-    z0 = sample_height(envelope, grid, pc[0], pc[1]) + robot.wheel_radius
+    z0 = sample_field(envelope, grid, pc[0], pc[1]) + robot.wheel_radius
     tc = settle(envelope, grid, robot, solver, pc, wp.vec3(z0, 0.0, 0.0))
     controlled[0, b] = pc
     derived[0, b] = tc
@@ -452,7 +452,7 @@ def rollout_kernel(
             wheel_center = p + R * wheel_pos
             n = sample_normal(envelope, grid, wheel_center[0], wheel_center[1])
             ct = wheel_center - robot.wheel_radius * n
-            mw = sample_height(friction, grid, ct[0], ct[1]) * N[st_i]
+            mw = sample_field(friction, grid, ct[0], ct[1]) * N[st_i]
             sw += mw
             xicr_num += mw * wheel_pos[0]
         x_icr = xicr_num / sw

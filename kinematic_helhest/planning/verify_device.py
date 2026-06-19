@@ -21,7 +21,7 @@ from .. import heightmap as hmmod
 from ..engine import Grid
 from ..engine import GridParams
 from ..engine import RobotParams
-from ..engine import sample_height
+from ..engine import sample_field
 from ..engine import Simulator
 from ..engine import SolverParams
 from ..engine.envelope import _contact_kernel
@@ -54,7 +54,7 @@ def _probe_h(elevation: wp.array2d(dtype=wp.float32), g: Grid,
              out_h: wp.array(dtype=wp.float32)):
     """Verification-only: launch the engine height sampler from host code."""
     i = wp.tid()
-    out_h[i] = sample_height(elevation, g, xs[i], ys[i])
+    out_h[i] = sample_field(elevation, g, xs[i], ys[i])
 
 
 def _sample(elevation, g, xs, ys, device):

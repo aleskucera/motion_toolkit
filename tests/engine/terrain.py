@@ -8,7 +8,7 @@ import warp as wp
 from kinematic_helhest import heightmap as hmmod
 from kinematic_helhest.engine import Grid
 from kinematic_helhest.engine import GridParams
-from kinematic_helhest.engine import sample_height
+from kinematic_helhest.engine import sample_field
 from kinematic_helhest.engine import sample_normal
 
 
@@ -18,7 +18,7 @@ def _probe(elevation: wp.array2d(dtype=wp.float32), g: Grid,
            out_h: wp.array(dtype=wp.float32), out_n: wp.array(dtype=wp.vec3)):
     """Verification-only: launch the engine samplers from host code."""
     i = wp.tid()
-    out_h[i] = sample_height(elevation, g, xs[i], ys[i])
+    out_h[i] = sample_field(elevation, g, xs[i], ys[i])
     out_n[i] = sample_normal(elevation, g, xs[i], ys[i])
 
 

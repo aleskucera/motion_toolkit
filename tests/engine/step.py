@@ -13,7 +13,7 @@ from kinematic_helhest.engine import GridParams
 from kinematic_helhest.engine import init_state_kernel
 from kinematic_helhest.engine import Robot
 from kinematic_helhest.engine import RobotParams
-from kinematic_helhest.engine import sample_height
+from kinematic_helhest.engine import sample_field
 from kinematic_helhest.engine import sample_normal
 from kinematic_helhest.engine import settle
 from kinematic_helhest.engine import Solver
@@ -84,7 +84,7 @@ def _settle_probe(H: wp.array2d(dtype=wp.float32), g: Grid, robot: Robot, sp: So
     x = pose[tid][0]
     y = pose[tid][1]
     yaw = pose[tid][2]
-    z0 = sample_height(H, g, x, y) + robot.wheel_radius
+    z0 = sample_field(H, g, x, y) + robot.wheel_radius
     u = settle(H, g, robot, sp, wp.vec3(x, y, yaw), wp.vec3(z0, 0.0, 0.0))
     u_out[tid] = u
     R = euler_zyx(yaw, u[1], u[2])
@@ -106,7 +106,7 @@ def _loads_probe(Henv: wp.array2d(dtype=wp.float32), Hraw: wp.array2d(dtype=wp.f
     x = pose[tid][0]
     y = pose[tid][1]
     yaw = pose[tid][2]
-    z0 = sample_height(Henv, g, x, y) + robot.wheel_radius
+    z0 = sample_field(Henv, g, x, y) + robot.wheel_radius
     u = settle(Henv, g, robot, sp, wp.vec3(x, y, yaw), wp.vec3(z0, 0.0, 0.0))
     R = euler_zyx(yaw, u[1], u[2])
     p = wp.vec3(x, y, u[0])

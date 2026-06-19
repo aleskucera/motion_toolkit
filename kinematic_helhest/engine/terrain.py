@@ -41,7 +41,7 @@ class _Cell:
 @wp.func
 def _locate(grid: Grid, x: wp.float32, y: wp.float32):
     """World (x, y) -> bilinear stencil. The ONE place the cell-center mapping
-    `(x - origin)/cell_size - 0.5` lives -- shared by sample_height, its analytic
+    `(x - origin)/cell_size - 0.5` lives -- shared by sample_field, its analytic
     gradient, and the d/dH adjoint scatter so the convention can never drift."""
     fx = (x - grid.origin_x) / grid.cell_size - 0.5
     fy = (y - grid.origin_y) / grid.cell_size - 0.5
@@ -54,24 +54,25 @@ def _locate(grid: Grid, x: wp.float32, y: wp.float32):
 
 
 @wp.func
-def sample_height(
-    elevation: wp.array2d(dtype=wp.float32),
+def sample_field(
+    field: wp.array2d(dtype=wp.float32),
     grid: Grid,
     x: wp.float32,
     y: wp.float32,
 ):
+    """Bilinear-interpolate a 2D grid field (elevation, envelope, friction, ...) at world (x, y)."""
     c = _locate(grid, x, y)
 
-    h00 = elevation[c.y_idx, c.x_idx]
-    h10 = elevation[c.y_idx, c.x_idx + 1]
-    h01 = elevation[c.y_idx + 1, c.x_idx]
-    h11 = elevation[c.y_idx + 1, c.x_idx + 1]
+    v00 = field[c.y_idx, c.x_idx]
+    v10 = field[c.y_idx, c.x_idx + 1]
+    v01 = field[c.y_idx + 1, c.x_idx]
+    v11 = field[c.y_idx + 1, c.x_idx + 1]
 
     return (
-        (1.0 - c.frac_x) * (1.0 - c.frac_y) * h00
-        + c.frac_x * (1.0 - c.frac_y) * h10
-        + (1.0 - c.frac_x) * c.frac_y * h01
-        + c.frac_x * c.frac_y * h11
+        (1.0 - c.frac_x) * (1.0 - c.frac_y) * v00
+        + c.frac_x * (1.0 - c.frac_y) * v10
+        + (1.0 - c.frac_x) * c.frac_y * v01
+        + c.frac_x * c.frac_y * v11
     )
 
 
@@ -108,10 +109,10 @@ def sample_normal(
     y: float,
 ):
     e = grid.cell_size
-    dhdx = (sample_height(elevation, grid, x + e, y) - sample_height(elevation, grid, x - e, y)) / (
+    dhdx = (sample_field(elevation, grid, x + e, y) - sample_field(elevation, grid, x - e, y)) / (
         2.0 * e
     )
-    dhdy = (sample_height(elevation, grid, x, y + e) - sample_height(elevation, grid, x, y - e)) / (
+    dhdy = (sample_field(elevation, grid, x, y + e) - sample_field(elevation, grid, x, y - e)) / (
         2.0 * e
     )
     return wp.normalize(wp.vec3(-dhdx, -dhdy, 1.0))

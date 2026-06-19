@@ -19,7 +19,7 @@ from kinematic_helhest.engine import settle
 from kinematic_helhest.engine import Robot
 from kinematic_helhest.engine import Solver
 from kinematic_helhest.engine import Grid
-from kinematic_helhest.engine import sample_height
+from kinematic_helhest.engine import sample_field
 from kinematic_helhest.engine.envelope import _contact_kernel
 from kinematic_helhest.engine.envelope import _gather_kernel
 
@@ -51,7 +51,7 @@ def _settle_only(Henv: wp.array2d(dtype=wp.float32), g: Grid, robot: Robot, sp: 
     x = pose[tid][0]
     y = pose[tid][1]
     yaw = pose[tid][2]
-    z0 = sample_height(Henv, g, x, y) + robot.wheel_radius
+    z0 = sample_field(Henv, g, x, y) + robot.wheel_radius
     u_out[tid] = settle(Henv, g, robot, sp, wp.vec3(x, y, yaw), wp.vec3(z0, 0.0, 0.0))
 
 
