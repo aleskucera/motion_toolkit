@@ -22,7 +22,7 @@ from kinematic_helhest.planning.mppi import _to_omega
 
 _W = dict(term=3.0, run=0.3, invalid=1e5, eff=2e-3, smooth=2e-3,
           tilt=300.0, tilt_free=np.radians(12.0))
-_CM, _RT, _LAM, _WMAX = 0.05, 1e-2, 0.5, 4.0
+_CM, _RT, _WMAX = 0.05, 1e-2, 4.0
 
 
 def _build_sim(device, B, T):

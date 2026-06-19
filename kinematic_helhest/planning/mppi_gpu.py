@@ -167,14 +167,14 @@ class MppiGpu:
     in-graph, so each replay draws fresh noise); on CPU it runs eager. Wraps a Simulator.
 
     `goal` and `start_pose` are device arrays set per replan, so the captured graph picks
-    up new values; the weights/sigma/lam/wmax are baked at capture (fixed per planner)."""
+    up new values; the weights/sigma/wmax/elite_frac are baked at capture (fixed per planner)."""
 
-    def __init__(self, sim, sigma, lam, wmax, weights, clear_margin, resid_tol, seed=0,
+    def __init__(self, sim, sigma, wmax, weights, clear_margin, resid_tol, seed=0,
                  sigma_knot=0.0, n_knots=4, elite_frac=0.1):
         self.sim = sim
         self.dev = sim.device
         self.B, self.T = sim.B, sim.T
-        self.sigma, self.lam, self.wmax = float(sigma), float(lam), float(wmax)  # lam unused (CEM)
+        self.sigma, self.wmax = float(sigma), float(wmax)
         self.sigma_knot, self.n_knots = float(sigma_knot), int(n_knots)
         self.target_k = float(int(float(elite_frac) * self.B))  # CEM elite count (top-k by cost)
         self.clear_margin, self.resid_tol = float(clear_margin), float(resid_tol)

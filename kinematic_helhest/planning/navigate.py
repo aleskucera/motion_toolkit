@@ -43,7 +43,6 @@ class NavConfig:
     sigma: float = 0.5         # per-step jitter std (local variation)
     sigma_knot: float = 1.0    # spline-knot std (broad correlated maneuvers)
     n_knots: int = 4           # control knots interpolated over the horizon (option A)
-    lam: float = 0.5
     wmax: float = 4.0
     clear_margin: float = 0.05
     resid_tol: float = 1e-2
@@ -89,7 +88,7 @@ class Navigator:
             grid = GridParams(nx, ny, cell, x0, y0)
             self.sim = Simulator(self.rp, self.params, grid, cfg.B, cfg.T, self.dev)
             w = dict(_W, tilt=cfg.tilt_w, tilt_free=np.radians(cfg.tilt_free_deg))
-            self.drv = MppiGpu(self.sim, cfg.sigma, cfg.lam, cfg.wmax, w,
+            self.drv = MppiGpu(self.sim, cfg.sigma, cfg.wmax, w,
                                cfg.clear_margin, cfg.resid_tol, self.seed,
                                sigma_knot=cfg.sigma_knot, n_knots=cfg.n_knots)
         self.sim.set_terrain(raw_H)            # borrow + dilate, no alloc

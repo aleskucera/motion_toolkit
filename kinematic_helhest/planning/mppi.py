@@ -63,7 +63,7 @@ def _cost(controlled, derived, clear, resid, Ub, goal, clear_margin, resid_tol, 
 
 
 def plan(scene, mu, start, goal, T=60, B=2048, n_refine=3, max_steps=260, dt=0.1,
-         sigma=0.5, sigma_knot=1.0, n_knots=4, lam=0.5, wmax=4.0, goal_tol=0.3, resid_tol=1e-2, clear_margin=0.05,
+         sigma=0.5, sigma_knot=1.0, n_knots=4, wmax=4.0, goal_tol=0.3, resid_tol=1e-2, clear_margin=0.05,
          device="cuda", seed=0, weights=None, record=False, n_show=60):
     params = SolverParams(dt=dt, k_turn=2.0, newton_iters=6, atol=1e-4)  # forward-only: shallow+loose settle
     sim = Simulator(
@@ -76,7 +76,7 @@ def plan(scene, mu, start, goal, T=60, B=2048, n_refine=3, max_steps=260, dt=0.1
     sim.set_friction(mu)
     w = weights or dict(term=3.0, run=0.3, invalid=1e5, eff=2e-3, smooth=2e-3)
     goal = np.asarray(goal[:2], np.float64)
-    drv = MppiGpu(sim, sigma, lam, wmax, w, clear_margin, resid_tol, seed,
+    drv = MppiGpu(sim, sigma, wmax, w, clear_margin, resid_tol, seed,
                   sigma_knot=sigma_knot, n_knots=n_knots)
     drv.reset_nominal(1.5)  # nominal wheel speeds, gentle forward
 
