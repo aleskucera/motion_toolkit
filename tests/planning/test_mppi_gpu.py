@@ -48,10 +48,12 @@ def selftest_cost_parity(device="cuda", B=2048, T=70):
 
     goal_d = wp.array(goal.astype(np.float32), dtype=float, device=device)
     Jg = wp.zeros(B, dtype=float, device=device)
+    cw = mg.CostWeights()
+    cw.term, cw.run, cw.tilt = _W["term"], _W["run"], _W["tilt"]
+    cw.eff, cw.smooth, cw.invalid = _W["eff"], _W["smooth"], _W["invalid"]
+    cw.tilt_free, cw.clear_margin, cw.resid_tol = _W["tilt_free"], _CM, _RT
     wp.launch(mg._cost_kernel, B,
-              inputs=[sim.controlled, sim.derived, sim.clearance, sim.residual, sim.omega, goal_d,
-                      _CM, _RT, _W["tilt_free"], _W["term"], _W["run"], _W["tilt"], _W["eff"],
-                      _W["smooth"], _W["invalid"], T],
+              inputs=[sim.controlled, sim.derived, sim.clearance, sim.residual, sim.omega, goal_d, cw, T],
               outputs=[Jg], device=device)
     J_gpu = Jg.numpy()
 

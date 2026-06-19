@@ -52,14 +52,26 @@ def _sample_omega_kernel(U: wp.array2d(dtype=float), sigma: float, sigma_knot: f
     omega[t, b] = wp.vec3(wp.clamp(el, wmin, wmax), wp.clamp(er, wmin, wmax), 0.0)
 
 
+@wp.struct
+class CostWeights:
+    """Per-rollout cost weights + thresholds, baked once (fixed per planner)."""
+    term: float
+    run: float
+    tilt: float
+    eff: float
+    smooth: float
+    invalid: float
+    tilt_free: float
+    clear_margin: float
+    resid_tol: float
+
+
 @wp.kernel
 def _cost_kernel(controlled: wp.array2d(dtype=wp.vec3), derived: wp.array2d(dtype=wp.vec3),
           clearance: wp.array2d(dtype=float), residual: wp.array2d(dtype=float),
           omega: wp.array2d(dtype=wp.vec3),  # Ub in components [0], [1]
           goal: wp.array(dtype=float),  # [2] world goal (device -> graph-safe, changes per replan)
-          clear_margin: float, resid_tol: float, tilt_free: float,
-          w_term: float, w_run: float, w_tilt: float, w_eff: float, w_smooth: float,
-          w_invalid: float, T: int, Jout: wp.array(dtype=float)):
+          cw: CostWeights, T: int, Jout: wp.array(dtype=float)):
     b = wp.tid()
     run_sum = float(0.0)
     tilt_sum = float(0.0)
@@ -73,7 +85,7 @@ def _cost_kernel(controlled: wp.array2d(dtype=wp.vec3), derived: wp.array2d(dtyp
         term = d2  # last iter (t = T) sticks
         dv = derived[t, b]
         ang = wp.acos(wp.clamp(wp.cos(dv[1]) * wp.cos(dv[2]), -1.0, 1.0))
-        over = wp.max(ang - tilt_free, 0.0)
+        over = wp.max(ang - cw.tilt_free, 0.0)
         tilt_sum += over * over
     eff = float(0.0)
     smooth = float(0.0)
@@ -92,12 +104,12 @@ def _cost_kernel(controlled: wp.array2d(dtype=wp.vec3), derived: wp.array2d(dtyp
         # GRADED validity (option C): penalize HOW FAR past the margin/tol and HOW EARLY, not a
         # binary flag. De-saturates the cost (it still ranks when every sample violates), and
         # eating into the safety margin costs little while a real penetration costs a lot.
-        clear_viol = wp.max(clear_margin - clearance[t, b], 0.0)
-        resid_viol = wp.max(residual[t, b] - resid_tol, 0.0)
+        clear_viol = wp.max(cw.clear_margin - clearance[t, b], 0.0)
+        resid_viol = wp.max(residual[t, b] - cw.resid_tol, 0.0)
         early = float(T - t) / float(T)  # earlier violations hurt more (imminent)
         inv += early * (clear_viol + resid_viol)
-    Jout[b] = (w_term * term + w_run * (run_sum / float(T + 1)) + w_tilt * (tilt_sum / float(T + 1))
-               + w_eff * eff + w_smooth * smooth + inv * w_invalid)
+    Jout[b] = (cw.term * term + cw.run * (run_sum / float(T + 1)) + cw.tilt * (tilt_sum / float(T + 1))
+               + cw.eff * eff + cw.smooth * smooth + inv * cw.invalid)
 
 
 # --- CEM reweight (option B): elite = top-k lowest-cost samples; U = their mean. Rank-based,
@@ -180,15 +192,18 @@ class MppiGpu:
         self.sigma, self.wmax, self.wmin = float(sigma), float(wmax), float(wmin)
         self.sigma_knot, self.n_knots = float(sigma_knot), int(n_knots)
         self.target_k = float(int(float(elite_frac) * self.B))  # CEM elite count (top-k by cost)
-        self.clear_margin, self.resid_tol = float(clear_margin), float(resid_tol)
         w = weights
-        self.w_term = float(w.get("term", 0.0))
-        self.w_run = float(w.get("run", 0.0))
-        self.w_tilt = float(w.get("tilt", 0.0))
-        self.w_eff = float(w.get("eff", 0.0))
-        self.w_smooth = float(w.get("smooth", 0.0))
-        self.w_invalid = float(w.get("invalid", 0.0))
-        self.tilt_free = float(w.get("tilt_free", 0.0))
+        cw = CostWeights()
+        cw.term = float(w.get("term", 0.0))
+        cw.run = float(w.get("run", 0.0))
+        cw.tilt = float(w.get("tilt", 0.0))
+        cw.eff = float(w.get("eff", 0.0))
+        cw.smooth = float(w.get("smooth", 0.0))
+        cw.invalid = float(w.get("invalid", 0.0))
+        cw.tilt_free = float(w.get("tilt_free", 0.0))
+        cw.clear_margin = float(clear_margin)
+        cw.resid_tol = float(resid_tol)
+        self.cw = cw
         d = self.dev
         self.U = wp.zeros((self.T, 2), dtype=float, device=d)
         self.J = wp.zeros(self.B, dtype=float, device=d)
@@ -219,9 +234,8 @@ class MppiGpu:
                   inputs=[self.U, self.sigma, self.sigma_knot, self.wmin, self.wmax, self.n_knots, self.seed],
                   outputs=[s.omega], device=d)
         s.rollout_launch()
-        wp.launch(_cost_kernel, self.B, inputs=[s.controlled, s.derived, s.clearance, s.residual, s.omega,
-                  self.goal, self.clear_margin, self.resid_tol, self.tilt_free, self.w_term, self.w_run,
-                  self.w_tilt, self.w_eff, self.w_smooth, self.w_invalid, self.T],
+        wp.launch(_cost_kernel, self.B,
+                  inputs=[s.controlled, s.derived, s.clearance, s.residual, s.omega, self.goal, self.cw, self.T],
                   outputs=[self.J], device=d)
         # CEM reweight: bisection for the top-k cost threshold tau, then elite mean -> U.
         wp.launch(_reset_minmax_kernel, 1, inputs=[self.jmin, self.jmax, self.count], device=d)
