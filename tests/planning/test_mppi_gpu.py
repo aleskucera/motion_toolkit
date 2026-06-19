@@ -48,7 +48,7 @@ def selftest_cost_parity(device="cuda", B=2048, T=70):
 
     goal_d = wp.array(goal.astype(np.float32), dtype=float, device=device)
     Jg = wp.zeros(B, dtype=float, device=device)
-    wp.launch(mg._cost, B,
+    wp.launch(mg._cost_kernel, B,
               inputs=[sim.controlled, sim.derived, sim.clearance, sim.residual, sim.omega, goal_d,
                       _CM, _RT, _W["tilt_free"], _W["term"], _W["run"], _W["tilt"], _W["eff"],
                       _W["smooth"], _W["invalid"], T],
@@ -78,10 +78,10 @@ def selftest_reweight_parity(device="cuda", B=2048, T=70):
     betasum = wp.zeros(1, dtype=float, device=device)
     betad = wp.zeros(B, dtype=float, device=device)
     Ud = wp.zeros((T, 2), dtype=float, device=device)
-    wp.launch(mg._reset_red, 1, inputs=[jmin, betasum], device=device)
-    wp.launch(mg._jmin, B, inputs=[Jd, jmin], device=device)
-    wp.launch(mg._softmax, B, inputs=[Jd, jmin, _LAM, betad, betasum], device=device)
-    wp.launch(mg._weighted_u, (T, 2), inputs=[betad, betasum, omega, _WMAX, B, Ud], device=device)
+    wp.launch(mg._reset_red_kernel, 1, inputs=[jmin, betasum], device=device)
+    wp.launch(mg._jmin_kernel, B, inputs=[Jd, jmin], device=device)
+    wp.launch(mg._softmax_kernel, B, inputs=[Jd, jmin, _LAM, betad, betasum], device=device)
+    wp.launch(mg._weighted_u_kernel, (T, 2), inputs=[betad, betasum, omega, _WMAX, B, Ud], device=device)
     U_gpu = Ud.numpy()
 
     err = np.abs(U_gpu - U_np).max()

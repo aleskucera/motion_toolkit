@@ -5,7 +5,7 @@ vs ~2.7 ms of GPU work. These Warp kernels move the whole refine onto the device
 nothing but the executed pose ever comes back, and the refine is captured as a CUDA
 graph and replayed. `mppi._cost` stays the numpy oracle for the parity test.
 
-Kernels:
+Kernels (all suffixed _kernel):
   _sample_omega  noise -> Ub -> writes the rollout's omega buffer (rear unused -> 0)
   _cost          per-rollout scalar cost J[B] (goal/tilt/invalid + eff/smooth)
   _jmin/_softmax/_weighted_u   softmax reweight of the nominal U, on device
@@ -16,7 +16,7 @@ import warp as wp
 
 
 @wp.kernel
-def _sample_omega(U: wp.array2d(dtype=float), sigma: float, sigma_bias: float, wmax: float,
+def _sample_omega_kernel(U: wp.array2d(dtype=float), sigma: float, sigma_bias: float, wmax: float,
                   seed: wp.array(dtype=int), omega: wp.array2d(dtype=wp.vec3)):
     t, b = wp.tid()
     B = omega.shape[1]
@@ -38,7 +38,7 @@ def _sample_omega(U: wp.array2d(dtype=float), sigma: float, sigma_bias: float, w
 
 
 @wp.kernel
-def _cost(controlled: wp.array2d(dtype=wp.vec3), derived: wp.array2d(dtype=wp.vec3),
+def _cost_kernel(controlled: wp.array2d(dtype=wp.vec3), derived: wp.array2d(dtype=wp.vec3),
           clearance: wp.array2d(dtype=float), residual: wp.array2d(dtype=float),
           omega: wp.array2d(dtype=wp.vec3),  # Ub in components [0], [1]
           goal: wp.array(dtype=float),  # [2] world goal (device -> graph-safe, changes per replan)
@@ -81,18 +81,18 @@ def _cost(controlled: wp.array2d(dtype=wp.vec3), derived: wp.array2d(dtype=wp.ve
 
 
 @wp.kernel
-def _reset_red(jmin: wp.array(dtype=float), betasum: wp.array(dtype=float)):
+def _reset_red_kernel(jmin: wp.array(dtype=float), betasum: wp.array(dtype=float)):
     jmin[0] = 1.0e30
     betasum[0] = 0.0
 
 
 @wp.kernel
-def _jmin(J: wp.array(dtype=float), jmin: wp.array(dtype=float)):
+def _jmin_kernel(J: wp.array(dtype=float), jmin: wp.array(dtype=float)):
     wp.atomic_min(jmin, 0, J[wp.tid()])
 
 
 @wp.kernel
-def _softmax(J: wp.array(dtype=float), jmin: wp.array(dtype=float), lam: float,
+def _softmax_kernel(J: wp.array(dtype=float), jmin: wp.array(dtype=float), lam: float,
              beta: wp.array(dtype=float), betasum: wp.array(dtype=float)):
     b = wp.tid()
     bb = wp.exp(-(J[b] - jmin[0]) / lam)
@@ -101,7 +101,7 @@ def _softmax(J: wp.array(dtype=float), jmin: wp.array(dtype=float), lam: float,
 
 
 @wp.kernel
-def _weighted_u(beta: wp.array(dtype=float), betasum: wp.array(dtype=float),
+def _weighted_u_kernel(beta: wp.array(dtype=float), betasum: wp.array(dtype=float),
                 omega: wp.array2d(dtype=wp.vec3), wmax: float, B: int, U: wp.array2d(dtype=float)):
     t, c = wp.tid()
     acc = float(0.0)
@@ -111,7 +111,7 @@ def _weighted_u(beta: wp.array(dtype=float), betasum: wp.array(dtype=float),
 
 
 @wp.kernel
-def _bump_seed(seed: wp.array(dtype=int)):
+def _bump_seed_kernel(seed: wp.array(dtype=int)):
     seed[0] = seed[0] + 1
 
 
@@ -161,19 +161,19 @@ class MppiGpu:
 
     def _refine(self):
         s, d = self.sim, self.dev
-        wp.launch(_bump_seed, 1, inputs=[self.seed], device=d)
-        wp.launch(_sample_omega, (self.T, self.B),
+        wp.launch(_bump_seed_kernel, 1, inputs=[self.seed], device=d)
+        wp.launch(_sample_omega_kernel, (self.T, self.B),
                   inputs=[self.U, self.sigma, self.sigma_bias, self.wmax, self.seed],
                   outputs=[s.omega], device=d)
         s.rollout_launch()
-        wp.launch(_cost, self.B, inputs=[s.controlled, s.derived, s.clearance, s.residual, s.omega,
+        wp.launch(_cost_kernel, self.B, inputs=[s.controlled, s.derived, s.clearance, s.residual, s.omega,
                   self.goal, self.clear_margin, self.resid_tol, self.tilt_free, self.w_term, self.w_run,
                   self.w_tilt, self.w_eff, self.w_smooth, self.w_invalid, self.T],
                   outputs=[self.J], device=d)
-        wp.launch(_reset_red, 1, inputs=[self.jmin, self.betasum], device=d)
-        wp.launch(_jmin, self.B, inputs=[self.J, self.jmin], device=d)
-        wp.launch(_softmax, self.B, inputs=[self.J, self.jmin, self.lam, self.beta, self.betasum], device=d)
-        wp.launch(_weighted_u, (self.T, 2), inputs=[self.beta, self.betasum, s.omega, self.wmax, self.B, self.U],
+        wp.launch(_reset_red_kernel, 1, inputs=[self.jmin, self.betasum], device=d)
+        wp.launch(_jmin_kernel, self.B, inputs=[self.J, self.jmin], device=d)
+        wp.launch(_softmax_kernel, self.B, inputs=[self.J, self.jmin, self.lam, self.beta, self.betasum], device=d)
+        wp.launch(_weighted_u_kernel, (self.T, 2), inputs=[self.beta, self.betasum, s.omega, self.wmax, self.B, self.U],
                   device=d)
 
     def replan(self, state, goal_xy, n_refine):
