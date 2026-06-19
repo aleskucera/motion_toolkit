@@ -59,13 +59,14 @@ class Solver:
 
 @dataclass
 class SolverParams:  # settle/integration numerics — tuning, separate from the robot
-    dt: float = 0.05
-    newton_iters: int = 8
+    dt: float = 0.1  # integration / control timestep [s]
+    newton_iters: int = 12  # settle Newton cap; DEEP by default (the IFT adjoint needs a
+    # converged root); forward-only planning caps at 6 (warm-started settle needs ~2).
     atol: float = 1e-6  # settle early-exit tol; TIGHT by default because the IFT settle
     # adjoint assumes residual~=0 at the root. Forward-only planning loosens it to ~1e-4
     # (0.1mm, 100x under the resid_tol=1e-2 validity gate) to save ~1 Newton iter/settle.
     max_step: tuple = (0.1, 0.2, 0.2)  # per-iter Newton cap (z[m], pitch[rad], roll[rad])
-    tilt_clamp: float = 1.2
+    tilt_clamp: float = 1.05  # clamp |pitch|, |roll| to ~60 deg
     k_turn: float = 2.0
 
     def build(self) -> Solver:
