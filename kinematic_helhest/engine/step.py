@@ -346,8 +346,8 @@ def step(
     loads_out: wp.array2d(dtype=wp.vec3),  # [T, B] N_i of the NEW state
     turn_out: wp.array2d(dtype=wp.vec2),  # [T, B] (alpha, x_icr) used this step
     clear_out: wp.array2d(dtype=float),  # [T, B] belly clearance of the NEW state
-    resid_out: wp.array2d(dtype=float),
-):  # [T, B] settle residual (max|c|) of NEW state
+    resid_out: wp.array2d(dtype=float),  # [T, B] settle residual (max|c|) of NEW state
+):
     tid = wp.tid()
     pc = controlled[t, tid]
     tc = derived[t, tid]
@@ -359,20 +359,18 @@ def step(
 
     # --- turning params from the CURRENT pose (loads + friction at contacts) ---
     N = normal_loads(envelope, grid, robot, R, p)
-    w0v = robot.wheel_pos[0]
-    w1v = robot.wheel_pos[1]
-    w2v = robot.wheel_pos[2]
-    wheel_center0 = p + R * w0v
-    wheel_center1 = p + R * w1v
-    wheel_center2 = p + R * w2v
-    ct0 = wheel_center0 - robot.wheel_radius * sample_normal(envelope, grid, wheel_center0[0], wheel_center0[1])
-    ct1 = wheel_center1 - robot.wheel_radius * sample_normal(envelope, grid, wheel_center1[0], wheel_center1[1])
-    ct2 = wheel_center2 - robot.wheel_radius * sample_normal(envelope, grid, wheel_center2[0], wheel_center2[1])
-    mw0 = sample_height(friction, grid_mu, ct0[0], ct0[1]) * N[0]
-    mw1 = sample_height(friction, grid_mu, ct1[0], ct1[1]) * N[1]
-    mw2 = sample_height(friction, grid_mu, ct2[0], ct2[1]) * N[2]
-    sw = mw0 + mw1 + mw2
-    x_icr = (mw0 * w0v[0] + mw1 * w1v[0] + mw2 * w2v[0]) / sw
+    sw = float(0.0)        # total grip Sum_i mu_i N_i
+    xicr_num = float(0.0)  # Sum_i mu_i N_i wheel_x  (x_icr = xicr_num / sw)
+    for i in range(wp.static(3)):
+        st_i = wp.static(i)
+        wheel_pos = robot.wheel_pos[st_i]
+        wheel_center = p + R * wheel_pos
+        n = sample_normal(envelope, grid, wheel_center[0], wheel_center[1])
+        ct = wheel_center - robot.wheel_radius * n  # contact point
+        mw = sample_height(friction, grid_mu, ct[0], ct[1]) * N[st_i]  # grip = mu * load
+        sw += mw
+        xicr_num += mw * wheel_pos[0]
+    x_icr = xicr_num / sw
     alpha = 1.0 + solver.k_turn * sw / (robot.gravity * robot.mass)
 
     # --- predict: twist through the CURRENT orientation, Euler integrate ---
