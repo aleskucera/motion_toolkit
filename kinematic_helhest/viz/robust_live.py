@@ -104,7 +104,7 @@ def run(shot=None, device="cuda", K=8, slip_lo=0.5, beta=0.4, goal=(4.0, 1.15), 
     glfw.set_cursor_pos_callback(win, on_cursor)
     glfw.set_scroll_callback(win, on_scroll)
 
-    trail, frame, controlled, bad = [], 0, None, None
+    frame, controlled, bad = 0, None, None
     while not glfw.window_should_close(win):
         glfw.poll_events()
         if glfw.get_key(win, glfw.KEY_ESCAPE) == glfw.PRESS or glfw.get_key(win, glfw.KEY_Q) == glfw.PRESS:
@@ -119,9 +119,8 @@ def run(shot=None, device="cuda", K=8, slip_lo=0.5, beta=0.4, goal=(4.0, 1.15), 
             U = planner.nominal()
             controlled, _, clearance, residual = fan_sim.rollout(_fan_omega(U, slips), state)
             bad = (clearance < 0.05) | (residual > 1e-2)  # [T, K]
-        trail.append([st.x, st.y, st.place["z"] + 0.02]); trail = trail[-3000:]
 
-        _render(st, cam, terrain, robot, trail)
+        _render(st, cam, terrain, robot, [])  # no path-trail
         gl.glDisable(gl.GL_LIGHTING)
         if controlled is not None:  # the slip fan: each scenario red if it high-centers, plan yellow
             for k in range(1, K):
