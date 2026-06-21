@@ -73,7 +73,7 @@ def plan(scene, mu, start, goal, T=60, B=8192, n_refine=3, max_steps=260, dt=0.1
          device="cuda", seed=0, weights=None, record=False, n_show=60, costtogo=False, lattice=False,
          n_scenarios=1, cvar_beta=0.5, slip_lo=0.6, n_theta=16, lat_turn_radius=0.5, lat_robot_radius=0.3,
          trav_config=None, obstacle_threshold=0.8, tilt=0.0, tilt_free_deg=0.0, lat_trav_weight=0.0,
-         lat_feasibility="traversability", lat_tilt_max_deg=40.0):
+         lat_feasibility="traversability", lat_tilt_max_deg=40.0, dock_radius=0.0):
     sim = Simulator(
         dynamics.robot_params(), dynamics.planning_solver(dt=dt),
         GridParams(scene.nx, scene.ny, scene.cell, scene.x0, scene.y0),
@@ -124,6 +124,14 @@ def plan(scene, mu, start, goal, T=60, B=8192, n_refine=3, max_steps=260, dt=0.1
                        obstacle_threshold=obstacle_threshold, config=trav_config)
         drv.set_costtogo(ctg.compute(np.ascontiguousarray(scene.H, np.float32), goal))
 
+    dock_sim = None
+    if dock_radius > 0.0:  # terminal stage: a B=1 sim to execute the dock control near the goal
+        from .terminal import dock_control
+        dock_sim = Simulator(dynamics.robot_params(), dynamics.planning_solver(dt=dt),
+                             GridParams(scene.nx, scene.ny, scene.cell, scene.x0, scene.y0), 1, 1, device)
+        dock_sim.set_terrain(wp.array(np.ascontiguousarray(scene.H, np.float32), dtype=wp.float32, device=device))
+        dock_sim.set_friction(mu)
+
     state = np.asarray(start, np.float32)        # (x, y, yaw)
     path = [state.copy()]
     idx = np.linspace(0, B - 1, n_show).astype(int)  # sampled rollouts to display
@@ -133,6 +141,13 @@ def plan(scene, mu, start, goal, T=60, B=8192, n_refine=3, max_steps=260, dt=0.1
         if np.linalg.norm(state[:2] - goal) < goal_tol:
             reached = True
             break
+        if dock_sim is not None and np.linalg.norm(state[:2] - goal) < dock_radius:
+            # hand off from MPPI routing to the terminal dock: decelerate + align to a precise stop
+            omega = dock_control(state, goal, wmax=wmax)
+            cc, _, _, _ = dock_sim.rollout(omega.reshape(1, 1, 3), state)
+            state = cc[1, 0].astype(np.float32).copy()
+            path.append(state.copy())
+            continue
         drv.replan(state, goal, n_refine)   # the whole MPPI refine, on GPU
         U = drv.nominal()
         # the nominal's trajectory is already column b=0 of the last refine's rollout (which

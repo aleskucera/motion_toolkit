@@ -18,6 +18,7 @@ from .. import worlds as W
 from ..engine import GridParams
 from ..engine import Simulator
 from ..planning.mppi_gpu import MppiGpu
+from ..planning.terminal import dock_control
 from .drive import WarpDriver
 from .render import WIN_H
 from .render import WIN_W
@@ -41,7 +42,8 @@ def _polyline(scene, xy, color, width, dz):
 
 
 def run(world="pocket", costtogo=False, K=1, drive=False, shot=None, device="cuda", T=70, B=4096,
-        tilt=0.0, tilt_free_deg=0.0, lattice=False, trav_weight=0.0, feasibility="traversability"):
+        tilt=0.0, tilt_free_deg=0.0, lattice=False, trav_weight=0.0, feasibility="traversability",
+        dock_radius=1.5):
     import glfw
 
     builder, start, goal = W.WORLDS[world]
@@ -130,10 +132,15 @@ def run(world="pocket", costtogo=False, K=1, drive=False, shot=None, device="cud
         planner.replan(state, goal, 3)
         U = planner.nominal()
         plan_xy = plan_sim.controlled[:, 0].numpy()[:, :2].copy()  # the nominal's path
+        dist = float(np.hypot(st.x - goal[0], st.y - goal[1]))
         if drive:
             cmd = np.array([1.6, 1.6, 1.6]) if shot else _commands(lambda k: glfw.get_key(win, k))
+        elif reached:
+            cmd = np.zeros(3, np.float32)
+        elif dock_radius > 0.0 and dist < dock_radius:
+            cmd = dock_control(state, goal)  # terminal stage: decelerate + align to a precise stop
         else:
-            cmd = np.array([U[0, 0], U[0, 1], 0.5 * (U[0, 0] + U[0, 1])], np.float32) if not reached else np.zeros(3, np.float32)
+            cmd = np.array([U[0, 0], U[0, 1], 0.5 * (U[0, 0] + U[0, 1])], np.float32)
         drv.step(cmd)
         trail.append([st.x, st.y, st.place["z"] + 0.03]); trail = trail[-4000:]
 
@@ -174,6 +181,8 @@ def main():
                     help="lattice feasibility source: traversability map, or the robot's own settle (residual/tilt)")
     ap.add_argument("--K", type=int, default=8,
                     help="robust CVaR slip scenarios -- margin that absorbs the plan->real gap (1 = off)")
+    ap.add_argument("--dock-radius", type=float, default=1.5,
+                    help="terminal-stage handoff radius: within this the dock controller takes over (0 = off)")
     ap.add_argument("--drive", action="store_true", help="steer yourself instead of the planner")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--shot", default=None)
@@ -182,7 +191,8 @@ def main():
     args = ap.parse_args()
     run(world=args.world, costtogo=args.costtogo, K=args.K, drive=args.drive,
         shot=args.shot, device=args.device, tilt=args.tilt, tilt_free_deg=args.tilt_free_deg,
-        lattice=args.lattice, trav_weight=args.trav_weight, feasibility=args.feasibility)
+        lattice=args.lattice, trav_weight=args.trav_weight, feasibility=args.feasibility,
+        dock_radius=args.dock_radius)
 
 
 if __name__ == "__main__":
