@@ -42,7 +42,7 @@ def evaluate(world, device="cuda", K=8, dock_radius=1.5, feasibility="traversabi
         from .planning.costtogo import CostToGoLatticeSettle
         clat = CostToGoLatticeSettle(scene.nx, scene.ny, scene.cell, scene.x0, scene.y0, device,
                                      n_theta=n_theta, turn_radius=turn_radius)
-        planner.set_lattice(clat.compute(np.ascontiguousarray(scene.H, np.float32), mu, goal))
+        planner.set_lattice(clat.compute(np.ascontiguousarray(scene.H, np.float32), goal))
     else:
         from .planning.costtogo import CostToGoLattice
         clat = CostToGoLattice(scene.nx, scene.ny, scene.cell, scene.x0, scene.y0, device,

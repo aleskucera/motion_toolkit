@@ -108,7 +108,7 @@ def plan(scene, mu, start, goal, T=60, B=8192, n_refine=3, max_steps=260, dt=0.1
                                          n_theta=n_theta, turn_radius=lat_turn_radius, robot_radius=lat_robot_radius,
                                          resid_tol=resid_tol, clear_margin=clear_margin,
                                          tilt_max_deg=lat_tilt_max_deg, tilt_weight=lat_trav_weight)
-            drv.set_lattice(clat.compute(np.ascontiguousarray(scene.H, np.float32), mu, goal))
+            drv.set_lattice(clat.compute(np.ascontiguousarray(scene.H, np.float32), goal))
         else:
             from .costtogo import CostToGoLattice
             clat = CostToGoLattice(scene.nx, scene.ny, scene.cell, scene.x0, scene.y0, sim.device,

@@ -152,6 +152,7 @@ class CostToGoLatticeSettle:
             ) from e
         from .. import dynamics
         from ..engine import GridParams, Simulator
+        from ..heightmap import Heightmap
 
         self.nx, self.ny, self.cell = int(nx), int(ny), float(cell)
         self.x0, self.y0 = float(x0), float(y0)
@@ -170,16 +171,19 @@ class CostToGoLatticeSettle:
         sp = solver_params or dynamics.execution_solver()  # high-fidelity settle (the validated config)
         self.settle_sim = Simulator(rp, sp, GridParams(self.nx, self.ny, self.cell, self.x0, self.y0),
                                     self.nx * self.ny, 1, device)
+        # the zero-control settle is a static resting-pose solve -> friction-independent (verified
+        # bit-identical across mu). The sim just needs SOME friction array set; a dummy uniform does.
+        self._mu = Heightmap(np.full((self.ny, self.nx), 0.8, np.float32), (self.x0, self.y0), self.cell)
         self.solver = LatticeValueSolver(self.cell, self.ny, self.nx, n_theta=self.n_theta,
                                          turn_radius=turn_radius, robot_radius=robot_radius,
                                          step=step, device=device)
         self.V = wp.zeros((self.ny, self.nx, self.n_theta), dtype=wp.float32, device=device)
 
-    def _settle_fields(self, elevation, mu):
+    def _settle_fields(self, elevation):
         """Settle every pose; return blocked[ny,nx,n_theta], tilt[ny,nx,n_theta] (rad) as wp.arrays."""
         sim, B = self.settle_sim, self.nx * self.ny
         sim.set_terrain(wp.array(np.ascontiguousarray(elevation, np.float32), dtype=wp.float32, device=self.device))
-        sim.set_friction(mu)
+        sim.set_friction(self._mu)
         blocked = np.zeros((self.ny, self.nx, self.n_theta), np.float32)
         tilt = np.zeros((self.ny, self.nx, self.n_theta), np.float32)
         two_pi = 2.0 * np.pi
@@ -198,9 +202,10 @@ class CostToGoLatticeSettle:
         return (wp.array(blocked, dtype=wp.float32, device=self.device),
                 wp.array(tilt, dtype=wp.float32, device=self.device))
 
-    def compute(self, elevation, mu, goal_xy):
-        """elevation [ny, nx] + friction Heightmap mu + world goal -> clamped V[ny, nx, n_theta]."""
-        blocked, tilt = self._settle_fields(elevation, mu)
+    def compute(self, elevation, goal_xy):
+        """elevation [ny, nx] + world goal -> clamped V[ny, nx, n_theta]. No friction needed:
+        the static settle is friction-independent, so this matches CostToGoLattice.compute's signature."""
+        blocked, tilt = self._settle_fields(elevation)
         v = self.solver.compute_from_fields(blocked, tilt, goal_xy, self.bounds, tilt_weight=self.tilt_weight)
         wp.launch(_clamp3d_kernel, dim=(self.ny, self.nx, self.n_theta),
                   inputs=[v, self._vcap], outputs=[self.V], device=self.device)
