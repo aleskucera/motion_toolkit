@@ -13,14 +13,12 @@ import argparse
 import numpy as np
 import warp as wp
 
+from .. import dynamics
 from .. import worlds as W
 from ..engine import GridParams
-from ..engine import RobotParams
 from ..engine import Simulator
-from ..engine import SolverParams
 from ..planning.mppi_gpu import MppiGpu
 from .drive import WarpDriver
-from .render import DT
 from .render import WIN_H
 from .render import WIN_W
 from .render import _commands
@@ -51,13 +49,12 @@ def run(world="pocket", costtogo=False, K=1, drive=False, shot=None, device="cud
     mu = W.matching_friction(scene)
     goal = np.asarray(goal, np.float64)
     grid = GridParams(scene.nx, scene.ny, scene.cell, scene.x0, scene.y0)
-    # plan with the SAME step the driver executes (DT) -- the planner must simulate the vehicle it
-    # actually drives, or the plan lags/clips. The residual plan->real gap is absorbed by CVaR (--K).
-    params = SolverParams(dt=DT, k_turn=2.0, newton_iters=6, atol=1e-4)
     terr = wp.array(np.ascontiguousarray(scene.H, np.float32), dtype=wp.float32, device=device)
 
+    # planner and driver pull the SAME vehicle from dynamics (one timestep DT) -- a mismatch makes
+    # the plan lag/clip. The residual plan->real gap is absorbed by CVaR (--K).
     drv = WarpDriver(scene, mu, init_pose=tuple(start), device=device)
-    plan_sim = Simulator(RobotParams(), params, grid, B, T, device)
+    plan_sim = Simulator(dynamics.robot_params(), dynamics.planning_solver(), grid, B, T, device)
     plan_sim.set_terrain(terr); plan_sim.set_friction(mu)
 
     n_theta = 24

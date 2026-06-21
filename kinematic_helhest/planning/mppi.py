@@ -16,12 +16,11 @@ import argparse
 import numpy as np
 import warp as wp
 
+from .. import dynamics
 from .. import friction
 from .. import heightmap as hmmod
 from ..engine import GridParams
-from ..engine import RobotParams
 from ..engine import Simulator
-from ..engine import SolverParams
 from .mppi_gpu import MppiGpu
 
 
@@ -75,9 +74,8 @@ def plan(scene, mu, start, goal, T=60, B=8192, n_refine=3, max_steps=260, dt=0.1
          n_scenarios=1, cvar_beta=0.5, slip_lo=0.6, n_theta=16, lat_turn_radius=0.5, lat_robot_radius=0.3,
          trav_config=None, obstacle_threshold=0.8, tilt=0.0, tilt_free_deg=0.0, lat_trav_weight=0.0,
          lat_feasibility="traversability", lat_tilt_max_deg=40.0):
-    params = SolverParams(dt=dt, k_turn=2.0, newton_iters=6, atol=1e-4)  # forward-only: shallow+loose settle
     sim = Simulator(
-        RobotParams(), params,
+        dynamics.robot_params(), dynamics.planning_solver(dt=dt),
         GridParams(scene.nx, scene.ny, scene.cell, scene.x0, scene.y0),
         B, T, device,
     )

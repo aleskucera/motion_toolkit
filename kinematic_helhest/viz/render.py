@@ -9,13 +9,13 @@ works where open3d's GL viewer fails on Wayland.
 """
 import numpy as np
 
+from ..dynamics import DT  # re-exported here for back-compat (viz used to own DT)
 from ..model import WHEEL_POS
 from ..model import WHEEL_RADIUS
 
 WHEEL_WIDTH = 0.10
 CHASSIS_BOXES = [(-0.13, 0.0, 0.0, 0.48, 0.56, 0.20),
                  (-0.61, 0.0, 0.0, 0.48, 0.24, 0.20)]
-DT = 0.05
 BASE_SPEED = 3.0
 TURN_SPEED = 2.0
 WIN_W, WIN_H = 1280, 800

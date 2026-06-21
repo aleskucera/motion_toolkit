@@ -150,7 +150,8 @@ class CostToGoLatticeSettle:
                 "orientation-aware cost-to-go needs terrain_toolkit; install it, e.g. "
                 "`uv pip install -e ../terrain_toolkit --no-deps`"
             ) from e
-        from ..engine import GridParams, RobotParams, Simulator, SolverParams
+        from .. import dynamics
+        from ..engine import GridParams, Simulator
 
         self.nx, self.ny, self.cell = int(nx), int(ny), float(cell)
         self.x0, self.y0 = float(x0), float(y0)
@@ -165,8 +166,8 @@ class CostToGoLatticeSettle:
         cols, rows = np.meshgrid(np.arange(self.nx), np.arange(self.ny))
         self._X = (self.x0 + cols * self.cell).ravel().astype(np.float32)
         self._Y = (self.y0 + rows * self.cell).ravel().astype(np.float32)
-        rp = robot_params or RobotParams()
-        sp = solver_params or SolverParams(dt=0.1, k_turn=2.0, newton_iters=12, atol=1e-4)
+        rp = robot_params or dynamics.robot_params()
+        sp = solver_params or dynamics.execution_solver()  # high-fidelity settle (the validated config)
         self.settle_sim = Simulator(rp, sp, GridParams(self.nx, self.ny, self.cell, self.x0, self.y0),
                                     self.nx * self.ny, 1, device)
         self.solver = LatticeValueSolver(self.cell, self.ny, self.nx, n_theta=self.n_theta,

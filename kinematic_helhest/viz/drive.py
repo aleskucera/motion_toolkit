@@ -16,14 +16,13 @@ from types import SimpleNamespace
 import numpy as np
 import warp as wp
 
+from .. import dynamics
 from .. import friction
 from .. import heightmap as hmmod
 from ..engine import GridParams
-from ..engine import RobotParams
 from ..engine import Simulator
 from ..engine import SolverParams
 from ..model import euler_zyx
-from .render import DT
 from .render import WIN_H
 from .render import WIN_W
 from .render import _commands
@@ -36,12 +35,12 @@ from .render import build_terrain
 class WarpDriver:
     """Wraps a B=1, T=1 `Simulator` and the current pose; steps one frame per call."""
 
-    def __init__(self, hm, mu, init_pose=(0.0, 0.0, 0.0), device="cpu", dt=DT, k_turn=2.0,
-                 resid_tol=1e-2, clear_margin=0.0, tilt_clamp=1.2):
+    def __init__(self, hm, mu, init_pose=(0.0, 0.0, 0.0), device="cpu", dt=dynamics.DT,
+                 k_turn=dynamics.K_TURN, resid_tol=1e-2, clear_margin=0.0, tilt_clamp=1.2):
         wp.init()
         self.resid_tol, self.clear_margin = resid_tol, clear_margin
         sp = SolverParams(dt=dt, k_turn=k_turn, newton_iters=12, tilt_clamp=tilt_clamp)
-        self.sim = Simulator(RobotParams(), sp,
+        self.sim = Simulator(dynamics.robot_params(), sp,
                              GridParams(hm.nx, hm.ny, hm.cell, hm.x0, hm.y0), 1, 1, device)
         self.sim.set_terrain(wp.array(np.ascontiguousarray(hm.H, np.float32),
                                       dtype=wp.float32, device=device))
@@ -145,7 +144,7 @@ def run(shot=None, device="cpu", resid_tol=1e-2, clear_margin=0.0, tilt_clamp=1.
                   f"roll={np.rad2deg(st.place['roll']):+5.1f}  a={st.alpha:.2f} "
                   f"valid={st.valid}   ", end="", flush=True)
             last_status = now
-        time.sleep(max(0.0, DT - (time.perf_counter() - now)))
+        time.sleep(max(0.0, dynamics.DT - (time.perf_counter() - now)))
 
     glfw.terminate()
     print()
