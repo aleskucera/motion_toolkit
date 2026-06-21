@@ -20,6 +20,7 @@ from ..engine import Simulator
 from ..engine import SolverParams
 from ..planning.mppi_gpu import MppiGpu
 from .drive import WarpDriver
+from .render import DT
 from .render import WIN_H
 from .render import WIN_W
 from .render import _commands
@@ -41,7 +42,8 @@ def _polyline(scene, xy, color, width, dz):
     gl.glEnd()
 
 
-def run(world="pocket", costtogo=False, K=1, drive=False, shot=None, device="cuda", T=70, B=4096):
+def run(world="pocket", costtogo=False, K=1, drive=False, shot=None, device="cuda", T=70, B=4096,
+        tilt=0.0, tilt_free_deg=0.0, lattice=False, trav_weight=0.0, feasibility="traversability"):
     import glfw
 
     builder, start, goal = W.WORLDS[world]
@@ -49,19 +51,39 @@ def run(world="pocket", costtogo=False, K=1, drive=False, shot=None, device="cud
     mu = W.matching_friction(scene)
     goal = np.asarray(goal, np.float64)
     grid = GridParams(scene.nx, scene.ny, scene.cell, scene.x0, scene.y0)
-    params = SolverParams(dt=0.1, k_turn=2.0, newton_iters=6, atol=1e-4)
+    # plan with the SAME step the driver executes (DT) -- the planner must simulate the vehicle it
+    # actually drives, or the plan lags/clips. The residual plan->real gap is absorbed by CVaR (--K).
+    params = SolverParams(dt=DT, k_turn=2.0, newton_iters=6, atol=1e-4)
     terr = wp.array(np.ascontiguousarray(scene.H, np.float32), dtype=wp.float32, device=device)
 
     drv = WarpDriver(scene, mu, init_pose=tuple(start), device=device)
     plan_sim = Simulator(RobotParams(), params, grid, B, T, device)
     plan_sim.set_terrain(terr); plan_sim.set_friction(mu)
 
+    n_theta = 24
     w = dict(term=3.0, run=0.3, head=2.0, invalid=1e5, eff=2e-3, smooth=2e-3)
-    if costtogo:
+    if lattice:  # orientation-aware cost-to-go V(x,y,theta); trav_weight makes routing prefer flat
+        w = {**w, "lattice": 1.0, "head": 0.0, "oob": 50.0, "term_v": 1.0,
+             "endgame": 12.0, "endgame_r2": 2.25}
+    elif costtogo:
         w = {**w, "ctg": 1.0, "head": 4.0}  # cost-to-go heading (-grad V) wants more weight
-    planner = MppiGpu(plan_sim, 0.5, 4.0, w, 0.05, 1e-2, 0, sigma_knot=1.0, n_knots=4, n_scenarios=K)
+    if tilt > 0.0:  # penalize body tilt past tilt_free_deg along each rollout (steer onto flat ground)
+        w = {**w, "tilt": float(tilt), "tilt_free": float(np.radians(tilt_free_deg))}
+    planner = MppiGpu(plan_sim, 0.5, 4.0, w, 0.05, 1e-2, 0, sigma_knot=1.0, n_knots=4,
+                      n_scenarios=K, n_theta=n_theta)
     planner.reset_nominal(1.5)
-    if costtogo:
+    if lattice:
+        if feasibility == "settle":
+            from ..planning.costtogo import CostToGoLatticeSettle
+            clat = CostToGoLatticeSettle(scene.nx, scene.ny, scene.cell, scene.x0, scene.y0, drv.sim.device,
+                                         n_theta=n_theta, turn_radius=0.5, tilt_weight=trav_weight)
+            planner.set_lattice(clat.compute(np.ascontiguousarray(scene.H, np.float32), mu, goal))
+        else:
+            from ..planning.costtogo import CostToGoLattice
+            clat = CostToGoLattice(scene.nx, scene.ny, scene.cell, scene.x0, scene.y0, drv.sim.device,
+                                   n_theta=n_theta, turn_radius=0.5, trav_weight=trav_weight)
+            planner.set_lattice(clat.compute(np.ascontiguousarray(scene.H, np.float32), goal))
+    elif costtogo:
         from ..planning.costtogo import CostToGo
         ctg = CostToGo(scene.nx, scene.ny, scene.cell, scene.x0, scene.y0, drv.sim.device)
         planner.set_costtogo(ctg.compute(np.ascontiguousarray(scene.H, np.float32), goal))
@@ -70,7 +92,10 @@ def run(world="pocket", costtogo=False, K=1, drive=False, shot=None, device="cud
         raise RuntimeError("glfw init failed")
     if shot:
         glfw.window_hint(glfw.VISIBLE, glfw.FALSE)
-    title = f"Helhest — {world} ({'drive' if drive else 'auto'}{', cost-to-go' if costtogo else ''})"
+    mode = ", lattice" if lattice else (", cost-to-go" if costtogo else "")
+    if lattice and trav_weight > 0.0:
+        mode += f" (trav_w={trav_weight:g})"
+    title = f"Helhest — {world} ({'drive' if drive else 'auto'}{mode})"
     win = glfw.create_window(WIN_W, WIN_H, title, None, None)
     glfw.make_context_current(win)
     _init_gl()
@@ -143,14 +168,24 @@ def run(world="pocket", costtogo=False, K=1, drive=False, shot=None, device="cud
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--world", default="pocket", choices=list(W.WORLDS))
-    ap.add_argument("--costtogo", action="store_true")
-    ap.add_argument("--K", type=int, default=1, help="robust slip scenarios (1 = off)")
+    ap.add_argument("--costtogo", action="store_true", help="2D cost-to-go routing (avoids hard obstacles)")
+    ap.add_argument("--lattice", action="store_true",
+                    help="orientation-aware cost-to-go V(x,y,theta); pair with --trav-weight for flat-preferring routing")
+    ap.add_argument("--trav-weight", type=float, default=0.0,
+                    help="lattice arc-cost weight on terrain traversability (0 = pure distance; try 3) -> routes around bumps")
+    ap.add_argument("--feasibility", default="traversability", choices=["traversability", "settle"],
+                    help="lattice feasibility source: traversability map, or the robot's own settle (residual/tilt)")
+    ap.add_argument("--K", type=int, default=8,
+                    help="robust CVaR slip scenarios -- margin that absorbs the plan->real gap (1 = off)")
     ap.add_argument("--drive", action="store_true", help="steer yourself instead of the planner")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--shot", default=None)
+    ap.add_argument("--tilt", type=float, default=0.0, help="tilt-penalty weight (0 = off; try 300)")
+    ap.add_argument("--tilt-free-deg", type=float, default=8.0, help="tilt below this (deg) is free")
     args = ap.parse_args()
     run(world=args.world, costtogo=args.costtogo, K=args.K, drive=args.drive,
-        shot=args.shot, device=args.device)
+        shot=args.shot, device=args.device, tilt=args.tilt, tilt_free_deg=args.tilt_free_deg,
+        lattice=args.lattice, trav_weight=args.trav_weight, feasibility=args.feasibility)
 
 
 if __name__ == "__main__":
