@@ -28,72 +28,76 @@ def _box(H, XX, YY, cx, cy, hx, hy, h=_WALL):
 
 
 def gap_world(cell=0.06):
-    xlim, ylim = (-1.0, 8.0), (-3.5, 3.5)
+    xlim, ylim = (-2.0, 14.0), (-5.0, 5.0)
     XX, YY = _grid(xlim, ylim, cell)
     H = np.zeros_like(XX)
-    H[(np.abs(XX - 3.5) <= 0.15) & (np.abs(YY) >= 0.55)] = _WALL  # wall, gap |y| < 0.55 (1.1 m)
+    H[(np.abs(XX - 6.0) <= 0.2) & (np.abs(YY) >= 0.9)] = _WALL  # wall, 1.8 m gap at |y| < 0.9
     return Heightmap(H, (xlim[0], ylim[0]), cell)
 
 
 def slalom_world(cell=0.06):
-    xlim, ylim = (-1.0, 9.0), (-3.0, 3.0)
+    xlim, ylim = (-2.0, 19.0), (-5.0, 5.0)
     XX, YY = _grid(xlim, ylim, cell)
     H = np.zeros_like(XX)
-    H[(np.abs(XX - 2.0) <= 0.15) & (YY <= 0.8)] = _WALL    # gap on top
-    H[(np.abs(XX - 4.5) <= 0.15) & (YY >= -0.8)] = _WALL   # gap on bottom
-    H[(np.abs(XX - 7.0) <= 0.15) & (YY <= 0.8)] = _WALL    # gap on top
+    H[(np.abs(XX - 4.0) <= 0.2) & (YY <= 1.2)] = _WALL      # open top (lane y > 1.2)
+    H[(np.abs(XX - 9.0) <= 0.2) & (YY >= -1.2)] = _WALL     # open bottom
+    H[(np.abs(XX - 14.0) <= 0.2) & (np.abs(YY) >= 1.2)] = _WALL  # open CENTER -> exit aligned to goal
     return Heightmap(H, (xlim[0], ylim[0]), cell)
 
 
 def pillars_world(cell=0.06):
-    xlim, ylim = (-1.0, 9.0), (-3.0, 3.0)
+    xlim, ylim = (-2.0, 16.0), (-5.0, 5.0)
     XX, YY = _grid(xlim, ylim, cell)
     H = np.zeros_like(XX)
-    for cx, cy in [(2.0, 0.8), (2.1, -1.6), (3.4, -0.2), (3.6, 1.9), (5.0, -1.1),
-                   (5.1, 1.0), (6.6, 0.1), (6.7, -1.9), (6.8, 2.0)]:
-        _box(H, XX, YY, cx, cy, 0.3, 0.3)
+    # 0.9 m pillars on a staggered ~3 m grid -> ~2 m clear corridors; last row flanks the center
+    # so the robot exits aligned with the goal (a straight run-up, like gap)
+    for cx, cy in [(4.0, -2.0), (4.0, 2.0), (7.0, 0.0), (7.0, -4.0), (7.0, 4.0),
+                   (10.0, -2.0), (10.0, 2.0), (13.0, -2.5), (13.0, 2.5)]:
+        _box(H, XX, YY, cx, cy, 0.45, 0.45)
     return Heightmap(H, (xlim[0], ylim[0]), cell)
 
 
 def pocket_world(cell=0.06):
-    xlim, ylim = (-1.0, 9.0), (-3.5, 3.5)
+    xlim, ylim = (-2.0, 16.0), (-5.0, 5.0)
     XX, YY = _grid(xlim, ylim, cell)
     H = np.zeros_like(XX)
-    H[(np.abs(XX - 4.0) <= 0.15) & (np.abs(YY) <= 1.6)] = _WALL         # closed side (faces the start)
-    H[(np.abs(YY - 1.6) <= 0.15) & (XX >= 4.0) & (XX <= 6.2)] = _WALL    # top
-    H[(np.abs(YY + 1.6) <= 0.15) & (XX >= 4.0) & (XX <= 6.2)] = _WALL    # bottom; opening at x > 6.2
+    H[(np.abs(XX - 7.0) <= 0.2) & (np.abs(YY) <= 2.5)] = _WALL           # closed side (faces start)
+    H[(np.abs(YY - 2.5) <= 0.2) & (XX >= 7.0) & (XX <= 11.0)] = _WALL     # top
+    H[(np.abs(YY + 2.5) <= 0.2) & (XX >= 7.0) & (XX <= 11.0)] = _WALL     # bottom; opening at x > 11
     return Heightmap(H, (xlim[0], ylim[0]), cell)
 
 
 def ridge_world(cell=0.06):
-    xlim, ylim = (-1.0, 9.0), (-3.5, 3.5)
+    xlim, ylim = (-2.0, 14.0), (-5.0, 5.0)
     XX, YY = _grid(xlim, ylim, cell)
     H = np.zeros_like(XX)
-    line = YY - 0.55 * (XX - 2.0)                  # diagonal ridge along y = 0.55 (x - 2)
-    H[np.abs(line) <= 0.25] = _WALL
-    H[(np.abs(line) <= 0.25) & (np.abs(XX - 4.0) <= 0.6)] = 0.0   # notch
+    line = YY - 0.3 * (XX - 6.0)                    # gentle diagonal ridge across the middle
+    H[np.abs(line) <= 0.3] = _WALL
+    H[(np.abs(line) <= 0.3) & (np.abs(XX - 6.0) <= 1.0)] = 0.0   # notch near x = 6
     return Heightmap(H, (xlim[0], ylim[0]), cell)
 
 
 def bumpy_world(cell=0.06, seed=0):
-    xlim, ylim = (-1.0, 9.0), (-3.0, 3.0)
+    xlim, ylim = (-2.0, 16.0), (-5.0, 5.0)
     XX, YY = _grid(xlim, ylim, cell)
     H = np.zeros_like(XX)
     rng = np.random.default_rng(seed)
-    for _ in range(40):
-        cx, cy = rng.uniform(0.5, 8.0), rng.uniform(-2.5, 2.5)
-        amp, wid = rng.uniform(0.1, 0.9), rng.uniform(0.25, 0.6)
+    # mounds of mixed height -- a few tall enough to be real obstacles to route AROUND, many gentle
+    # -- with flat ground still left between them, so the flat path is harder to find but exists
+    for _ in range(22):
+        cx, cy = rng.uniform(1.5, 12.5), rng.uniform(-4.0, 4.0)
+        amp, wid = rng.uniform(0.25, 0.8), rng.uniform(0.35, 0.7)
         H += amp * np.exp(-((XX - cx) ** 2 + (YY - cy) ** 2) / (2 * wid ** 2))
     return Heightmap(H, (xlim[0], ylim[0]), cell)
 
 
 WORLDS = {
-    "gap":     (gap_world,     (0.0, 0.0, 0.0),  (6.0, 0.0)),
-    "slalom":  (slalom_world,  (0.0, 0.0, 0.0),  (8.5, 0.0)),
-    "pillars": (pillars_world, (0.0, 0.0, 0.0),  (8.0, 0.0)),
-    "pocket":  (pocket_world,  (0.0, 0.0, 0.0),  (5.0, 0.0)),
-    "ridge":   (ridge_world,   (0.0, -2.5, 0.0), (7.0, 2.8)),
-    "bumpy":   (bumpy_world,   (0.0, 0.0, 0.0),  (8.0, 0.0)),
+    "gap":     (gap_world,     (0.0, 0.0, 0.0),  (11.0, 0.0)),
+    "slalom":  (slalom_world,  (0.0, 0.0, 0.0),  (17.0, 0.0)),
+    "pillars": (pillars_world, (0.0, 0.0, 0.0),  (15.0, 0.0)),
+    "pocket":  (pocket_world,  (0.0, 0.0, 0.0),  (9.0, 0.0)),
+    "ridge":   (ridge_world,   (0.0, -4.0, 0.0), (9.0, 2.5)),
+    "bumpy":   (bumpy_world,   (0.0, 0.0, 0.0),  (14.0, 0.0)),
 }
 
 
@@ -121,7 +125,7 @@ def _plot_all(out):
     print(f"saved {out}")
 
 
-def _stress(device="cuda", max_steps=250):
+def _stress(device="cuda", max_steps=500):
     """Run the planner (baseline vs cost-to-go) on every world; print reach/steps/final dist."""
     from .planning import mppi
 
