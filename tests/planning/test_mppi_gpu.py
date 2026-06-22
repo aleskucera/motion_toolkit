@@ -21,7 +21,8 @@ from kinematic_helhest.planning.mppi import _cost as cost_np
 from kinematic_helhest.planning.mppi import _to_omega
 
 _W = dict(term=3.0, run=0.3, head=2.0, invalid=1e5, eff=2e-3, smooth=2e-3,
-          tilt=300.0, tilt_free=np.radians(12.0))
+          tilt=300.0, tilt_free=np.radians(12.0),
+          max_roll=np.radians(30.0), max_pitch_up=np.radians(45.0), max_pitch_down=np.radians(30.0))
 _CM, _RT, _WMAX = 0.05, 1e-2, 4.0
 
 
@@ -57,6 +58,7 @@ def selftest_cost_parity(device="cuda", B=2048, T=70):
     cw.term_v = 0.0  # no terminal-speed penalty in parity (the cost-to-go path is verified e2e, not here)
     cw.eff, cw.smooth, cw.invalid = _W["eff"], _W["smooth"], _W["invalid"]
     cw.tilt_free, cw.clear_margin, cw.resid_tol = _W["tilt_free"], _CM, _RT
+    cw.max_roll, cw.max_pitch_up, cw.max_pitch_down = _W["max_roll"], _W["max_pitch_up"], _W["max_pitch_down"]
     ctg_field = wp.zeros((sim.grid.cells_y, sim.grid.cells_x), dtype=float, device=device)  # unused at ctg=0
     lat_field = wp.zeros((sim.grid.cells_y, sim.grid.cells_x, 16), dtype=float, device=device)  # unused at lattice=0
     wp.launch(mg._cost_kernel, B,

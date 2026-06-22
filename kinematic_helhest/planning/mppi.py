@@ -46,7 +46,13 @@ def _cost(controlled, derived, clear, resid, Ub, goal, clear_margin, resid_tol, 
     early = ((T - np.arange(T)) / T)[:, None]              # [T, 1]
     clear_viol = np.maximum(clear_margin - clear, 0.0)     # [T, B]
     resid_viol = np.maximum(resid - resid_tol, 0.0)        # [T, B]
-    inv = (early * (clear_viol + resid_viol)).sum(0)       # [B]
+    # robot stability envelope (same limits as the cost-to-go): tipping is invalid. climbing is
+    # nose-up = NEGATIVE pitch, so the climb limit is on -pitch. Large default = inactive.
+    pitch, roll = derived[:T, :, 1], derived[:T, :, 2]     # [T, B]
+    roll_viol = np.maximum(np.abs(roll) - w.get("max_roll", 1e3), 0.0)
+    climb_viol = np.maximum(-pitch - w.get("max_pitch_up", 1e3), 0.0)
+    descend_viol = np.maximum(pitch - w.get("max_pitch_down", 1e3), 0.0)
+    inv = (early * (clear_viol + resid_viol + roll_viol + climb_viol + descend_viol)).sum(0)  # [B]
     eff = (Ub ** 2).sum((1, 2))
     smooth = (np.diff(Ub, axis=1) ** 2).sum((1, 2))
     J = w["term"] * d[-1] ** 2 + w["run"] * (d ** 2).mean(0) + w["eff"] * eff + w["smooth"] * smooth
@@ -88,6 +94,10 @@ def plan(scene, mu, start, goal, T=60, B=8192, n_refine=3, max_steps=260, dt=0.1
         if weights is None:
             w["head"] = 0.0    # V(x,y,theta) already encodes the desired heading
             w["oob"] = 50.0    # soft wall at the grid edge (routing safety, not endgame)
+            rp = dynamics.robot_params()  # rollouts share the robot's tip-over envelope with the cost-to-go
+            w["max_roll"] = np.radians(rp.max_roll_deg)
+            w["max_pitch_up"] = np.radians(rp.max_pitch_up_deg)
+            w["max_pitch_down"] = np.radians(rp.max_pitch_down_deg)
     elif costtogo:  # option E: score by obstacle-aware cost-to-go instead of straight-line distance
         w = {**w, "ctg": 1.0}
         if weights is None:

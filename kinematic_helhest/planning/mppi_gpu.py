@@ -138,6 +138,11 @@ class CostWeights:
     tilt_free: float
     clear_margin: float
     resid_tol: float
+    # robot stability envelope (rad): a rollout pose past these is invalid, same as the cost-to-go
+    # blocks it -- so the field and the rollouts agree about tip-over. Large default = inactive.
+    max_roll: float
+    max_pitch_up: float  # climbing limit (nose up = NEGATIVE pitch)
+    max_pitch_down: float  # descending limit (nose down = positive pitch)
 
 
 @wp.kernel
@@ -240,8 +245,15 @@ def _cost_kernel(
         # eating into the safety margin costs little while a real penetration costs a lot.
         clear_viol = wp.max(cw.clear_margin - clearance[t, r], 0.0)
         resid_viol = wp.max(residual[t, r] - cw.resid_tol, 0.0)
+        # roll/pitch stability envelope (same limits as the cost-to-go feasibility): tipping is
+        # invalid. climbing is nose-up = NEGATIVE pitch, so the climb limit is on -pitch.
+        pitch = derived[t, r][1]
+        roll = derived[t, r][2]
+        roll_viol = wp.max(wp.abs(roll) - cw.max_roll, 0.0)
+        climb_viol = wp.max(-pitch - cw.max_pitch_up, 0.0)
+        descend_viol = wp.max(pitch - cw.max_pitch_down, 0.0)
         early = float(T - t) / float(T)  # earlier violations hurt more (imminent)
-        penalty_sum += early * (clear_viol + resid_viol)
+        penalty_sum += early * (clear_viol + resid_viol + roll_viol + climb_viol + descend_viol)
     # endgame commit: boost the terminal weight only when the plan ENDS near the goal, so the robot
     # commits to the final approach (a weak pull lets it drift past) WITHOUT over-pulling while still
     # routing (a strong global term cuts narrow gaps too tight).
@@ -430,6 +442,9 @@ class MppiGpu:
         cw.tilt_free = float(w.get("tilt_free", 0.0))
         cw.clear_margin = float(clear_margin)
         cw.resid_tol = float(resid_tol)
+        cw.max_roll = float(w.get("max_roll", 1e3))  # 1e3 rad = effectively off unless set
+        cw.max_pitch_up = float(w.get("max_pitch_up", 1e3))
+        cw.max_pitch_down = float(w.get("max_pitch_down", 1e3))
         self.cw = cw
         d = self.dev
         slip = np.ones((self.K, 2), np.float32)  # scenario 0 = no slip; rest sample the disturbance
