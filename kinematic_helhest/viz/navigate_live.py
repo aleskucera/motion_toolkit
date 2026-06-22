@@ -79,8 +79,8 @@ def run(world="pocket", costtogo=False, K=1, drive=False, shot=None, device="cud
             planner.set_lattice(clat.compute(np.ascontiguousarray(scene.H, np.float32), goal))
         else:
             from ..planning.costtogo import CostToGoLattice
-            clat = CostToGoLattice(grid, drv.sim.device,
-                                   n_theta=n_theta, turn_radius=0.5, trav_weight=trav_weight)
+            clat = CostToGoLattice(grid, drv.sim.device, n_theta=n_theta,
+                                   turn_radius=dynamics.robot_params().min_turn_radius, trav_weight=trav_weight)
             planner.set_lattice(clat.compute(np.ascontiguousarray(scene.H, np.float32), goal))
     elif costtogo:
         from ..planning.costtogo import CostToGo

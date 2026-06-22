@@ -58,6 +58,10 @@ class RobotParams:  # host-side robot knobs — what you nudge
     max_roll_deg: float = 30.0      # lateral tip-over limit (symmetric; narrow track -> strict)
     max_pitch_up_deg: float = 45.0  # climbing limit (nose UP, pitch < 0)
     max_pitch_down_deg: float = 30.0  # descending limit (nose DOWN, pitch > 0; front-heavy -> stricter)
+    # graded cost-to-go penalty per radian of tilt -- roll weighted MORE than pitch (roll is the
+    # dangerous axis), so among feasible poses the router prefers low-roll lines (attack slopes head-on).
+    roll_cost_weight: float = 1.0
+    pitch_cost_weight: float = 0.5
 
     def build(self, device="cuda") -> Robot:
         b, l = self.half_track, self.rear_offset

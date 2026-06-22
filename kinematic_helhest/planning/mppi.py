@@ -77,9 +77,9 @@ def _cost(controlled, derived, clear, resid, Ub, goal, clear_margin, resid_tol, 
 def plan(scene, mu, start, goal, T=60, B=8192, n_refine=3, max_steps=260, dt=0.1,
          sigma=0.5, sigma_knot=1.0, n_knots=4, wmax=4.0, wmin=0.0, elite_frac=0.02, goal_tol=0.3, resid_tol=1e-2, clear_margin=0.05,
          device="cuda", seed=0, weights=None, record=False, n_show=60, costtogo=False, lattice=False,
-         n_scenarios=1, cvar_beta=0.5, slip_lo=0.6, n_theta=16, lat_turn_radius=0.5, lat_robot_radius=0.3,
+         n_scenarios=1, cvar_beta=0.5, slip_lo=0.6, n_theta=16, lat_robot_radius=0.3,
          trav_config=None, obstacle_threshold=0.8, tilt=0.0, tilt_free_deg=0.0, lat_trav_weight=0.0,
-         lat_feasibility="traversability", lat_tilt_max_deg=40.0, dock_radius=None, lat_coarsen=1):
+         lat_feasibility="traversability", dock_radius=None, lat_coarsen=1):
     sim = Simulator(
         dynamics.robot_params(), dynamics.planning_solver(dt=dt),
         GridParams(scene.nx, scene.ny, scene.cell, scene.x0, scene.y0),
@@ -130,7 +130,8 @@ def plan(scene, mu, start, goal, T=60, B=8192, n_refine=3, max_steps=260, dt=0.1
         else:
             from .costtogo import CostToGoLattice
             clat = CostToGoLattice(cgrid, sim.device,
-                                   n_theta=n_theta, turn_radius=lat_turn_radius, robot_radius=lat_robot_radius,
+                                   n_theta=n_theta, turn_radius=dynamics.robot_params().min_turn_radius,
+                                   robot_radius=lat_robot_radius,
                                    obstacle_threshold=obstacle_threshold, trav_weight=lat_trav_weight,
                                    config=trav_config)
         drv.set_lattice(clat.compute(Hc, goal), cgrid.build())

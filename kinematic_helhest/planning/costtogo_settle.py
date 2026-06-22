@@ -81,6 +81,8 @@ class CostToGoLatticeSettle:
         self.max_roll = np.radians(robot_params.max_roll_deg)
         self.max_pitch_up = np.radians(robot_params.max_pitch_up_deg)
         self.max_pitch_down = np.radians(robot_params.max_pitch_down_deg)
+        self.roll_cost_weight = robot_params.roll_cost_weight    # graded cost: roll weighted more
+        self.pitch_cost_weight = robot_params.pitch_cost_weight  # than pitch (prefer low-roll lines)
         self.bounds = (x0, x0 + nx * cell, y0, y0 + ny * cell)
         self._vcap = 1.5 * (nx + ny) * cell * (1.0 + tilt_weight)
 
@@ -115,11 +117,11 @@ class CostToGoLatticeSettle:
             res = sim.residual.numpy()[0]
             clr = sim.clearance.numpy()[0]
             pitch, roll = der[:, 1], der[:, 2]
-            pose_tilt = np.arccos(np.clip(np.cos(pitch) * np.cos(roll), -1.0, 1.0))  # total tilt -> graded cost
+            graded = self.roll_cost_weight * np.abs(roll) + self.pitch_cost_weight * np.abs(pitch)  # roll>pitch
             over_envelope = (np.abs(roll) > self.max_roll) | (pitch < -self.max_pitch_up) | (pitch > self.max_pitch_down)
             infeasible = (res > self.resid_tol) | (clr < self.clear_margin) | over_envelope
             blocked[:, :, t] = infeasible.reshape(ny, nx)
-            tilt[:, :, t] = pose_tilt.reshape(ny, nx)
+            tilt[:, :, t] = graded.reshape(ny, nx)
         return (wp.array(blocked, dtype=wp.float32, device=self.device),
                 wp.array(tilt, dtype=wp.float32, device=self.device))
 

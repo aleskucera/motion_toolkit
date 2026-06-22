@@ -32,7 +32,7 @@ _LATTICE_W = dict(term=3.0, run=0.3, head=0.0, invalid=1e5, eff=2e-3, smooth=2e-
 
 
 def evaluate(world, device="cuda", K=8, dock_radius=1.5, feasibility="traversability",
-             n_theta=24, turn_radius=0.5, lat_coarsen=1, max_frames=1500, B=4096, T=70):
+             n_theta=24, lat_coarsen=1, max_frames=1500, B=4096, T=70):
     import time
     builder, start, goal = W.WORLDS[world]
     scene = builder(); mu = W.matching_friction(scene); goal = np.asarray(goal, np.float64)
@@ -55,7 +55,7 @@ def evaluate(world, device="cuda", K=8, dock_radius=1.5, feasibility="traversabi
                                      n_theta=n_theta)
     else:
         from .planning.costtogo import CostToGoLattice
-        clat = CostToGoLattice(cgrid, device, n_theta=n_theta, turn_radius=turn_radius)
+        clat = CostToGoLattice(cgrid, device, n_theta=n_theta, turn_radius=dynamics.robot_params().min_turn_radius)
     t0 = time.perf_counter()
     V = clat.compute(Hc, goal); wp.synchronize()
     ctg_ms = (time.perf_counter() - t0) * 1000.0
