@@ -83,15 +83,10 @@ class CostToGoLatticeSettle:
 
         self.device = wp.get_device(device)  # resolve None -> default once, reuse everywhere
         self.resid_tol = resid_tol
-        self.clear_margin = robot_params.clear_margin  # belly-clearance safety: a robot property
         self.flatness_weight = flatness_weight  # the single global gain on the graded tilt cost
-        # the robot's stability envelope (radians); climbing is nose-UP = negative pitch
-        self.max_roll = np.radians(robot_params.max_roll_deg)
-        self.max_pitch_up = np.radians(robot_params.max_pitch_up_deg)
-        self.max_pitch_down = np.radians(robot_params.max_pitch_down_deg)
-        # per-axis SHAPE only (roll : pitch susceptibility ratio); flatness_weight carries the strength
-        self.roll_cost_weight = robot_params.roll_cost_weight
-        self.pitch_cost_weight = robot_params.pitch_cost_weight
+        # one robot object: build the dataclass once and read every robot property off it (the
+        # built struct carries the planning fields: envelope / clearance / turn radius / cost shape).
+        self.robot = robot_params.build(self.device)
         self.bounds = (x0, x0 + nx * cell, y0, y0 + ny * cell)
         self._vcap = 1.5 * (nx + ny) * cell * (1.0 + flatness_weight)
 
@@ -111,7 +106,7 @@ class CostToGoLatticeSettle:
             ny,
             nx,
             n_theta=n_theta,
-            turn_radius=robot_params.min_turn_radius,
+            turn_radius=self.robot.min_turn_radius,
             step=step,
             device=self.device,
         )
@@ -121,6 +116,10 @@ class CostToGoLatticeSettle:
         """Settle every pose; return blocked[ny,nx,n_theta], tilt[ny,nx,n_theta] (rad) as wp.arrays."""
         ny, nx, n_theta = self.V.shape
         n_poses = nx * ny
+        rob = self.robot  # read the robot's limits/weights off the one built struct
+        max_roll = np.radians(rob.max_roll_deg)        # envelope -> radians (climb = nose-up = -pitch)
+        max_pitch_up = np.radians(rob.max_pitch_up_deg)
+        max_pitch_down = np.radians(rob.max_pitch_down_deg)
         sim = self.settle_sim
         sim.set_terrain(
             wp.array(
@@ -141,15 +140,11 @@ class CostToGoLatticeSettle:
             res = sim.residual.numpy()[0]
             clr = sim.clearance.numpy()[0]
             pitch, roll = der[:, 1], der[:, 2]
-            graded = self.roll_cost_weight * np.abs(roll) + self.pitch_cost_weight * np.abs(
-                pitch
-            )  # roll>pitch
+            graded = rob.roll_cost_weight * np.abs(roll) + rob.pitch_cost_weight * np.abs(pitch)  # roll>pitch
             over_envelope = (
-                (np.abs(roll) > self.max_roll)
-                | (pitch < -self.max_pitch_up)
-                | (pitch > self.max_pitch_down)
+                (np.abs(roll) > max_roll) | (pitch < -max_pitch_up) | (pitch > max_pitch_down)
             )
-            infeasible = (res > self.resid_tol) | (clr < self.clear_margin) | over_envelope
+            infeasible = (res > self.resid_tol) | (clr < rob.clear_margin) | over_envelope
             blocked[:, :, t] = infeasible.reshape(ny, nx)
             tilt[:, :, t] = graded.reshape(ny, nx)
         return (

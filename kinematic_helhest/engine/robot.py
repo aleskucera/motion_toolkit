@@ -40,6 +40,15 @@ class Robot:
     com: wp.vec3
     mass: wp.float32
     gravity: wp.float32
+    # --- planning capabilities (mirror of the RobotParams fields; the dynamics kernels don't read
+    # these, but carrying them on the built struct lets the planner read one object). ---
+    min_turn_radius: wp.float32
+    max_roll_deg: wp.float32
+    max_pitch_up_deg: wp.float32
+    max_pitch_down_deg: wp.float32
+    clear_margin: wp.float32
+    roll_cost_weight: wp.float32
+    pitch_cost_weight: wp.float32
 
 
 @dataclass(frozen=True)
@@ -77,6 +86,13 @@ class RobotParams:  # host-side robot knobs — what you nudge
         r.com = wp.vec3(*self.com)
         r.mass = self.mass
         r.gravity = self.gravity
+        r.min_turn_radius = self.min_turn_radius
+        r.max_roll_deg = self.max_roll_deg
+        r.max_pitch_up_deg = self.max_pitch_up_deg
+        r.max_pitch_down_deg = self.max_pitch_down_deg
+        r.clear_margin = self.clear_margin
+        r.roll_cost_weight = self.roll_cost_weight
+        r.pitch_cost_weight = self.pitch_cost_weight
         return r
 
     def _chassis_pts(self):
