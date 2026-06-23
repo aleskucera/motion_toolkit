@@ -47,6 +47,7 @@ class Robot:
     max_pitch_up: wp.float32
     max_pitch_down: wp.float32
     clear_margin: wp.float32
+    resid_tol: wp.float32
     roll_cost_weight: wp.float32
     pitch_cost_weight: wp.float32
 
@@ -68,6 +69,7 @@ class RobotParams:  # host-side robot knobs — what you nudge
     max_pitch_up: float = np.radians(45.0)  # [rad] climbing limit (nose UP, pitch < 0)
     max_pitch_down: float = np.radians(30.0)  # [rad] descending limit (nose DOWN, pitch > 0; front-heavy)
     clear_margin: float = 0.05      # min belly-terrain gap [m]; below it the pose is infeasible (high-centers)
+    resid_tol: float = 1e-2         # settle residual above which the pose is infeasible (can't find a resting pose)
     # graded cost-to-go penalty per radian of tilt -- roll weighted MORE than pitch (roll is the
     # dangerous axis), so among feasible poses the router prefers low-roll lines (attack slopes head-on).
     roll_cost_weight: float = 1.0
@@ -91,6 +93,7 @@ class RobotParams:  # host-side robot knobs — what you nudge
         r.max_pitch_up = self.max_pitch_up
         r.max_pitch_down = self.max_pitch_down
         r.clear_margin = self.clear_margin
+        r.resid_tol = self.resid_tol
         r.roll_cost_weight = self.roll_cost_weight
         r.pitch_cost_weight = self.pitch_cost_weight
         return r

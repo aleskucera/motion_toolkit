@@ -62,7 +62,6 @@ class CostToGoLatticeSettle:
         device: wp.context.Device | str | None = None,
         n_theta: int = 24,
         step: float = 0.3,
-        resid_tol: float = 1e-2,
         flatness_weight: float = 2.0,  # planner strength: how much detour to trade for flat ground
     ) -> None:
         # robot_params / solver_params are MANDATORY (like grid): the caller passes the same vehicle
@@ -82,7 +81,6 @@ class CostToGoLatticeSettle:
         x0, y0 = grid_params.origin_x, grid_params.origin_y
 
         self.device = wp.get_device(device)  # resolve None -> default once, reuse everywhere
-        self.resid_tol = resid_tol
         self.flatness_weight = flatness_weight  # the single global gain on the graded tilt cost
         # one robot object: build the dataclass once and read every robot property off it (the
         # built struct carries the planning fields: envelope / clearance / turn radius / cost shape).
@@ -143,7 +141,7 @@ class CostToGoLatticeSettle:
                 | (pitch < -rob.max_pitch_up)
                 | (pitch > rob.max_pitch_down)
             )
-            infeasible = (res > self.resid_tol) | (clr < rob.clear_margin) | over_envelope
+            infeasible = (res > rob.resid_tol) | (clr < rob.clear_margin) | over_envelope
             blocked[:, :, t] = infeasible.reshape(ny, nx)
             tilt[:, :, t] = graded.reshape(ny, nx)
         return (
