@@ -6,6 +6,8 @@ from typing import Literal
 import numpy as np
 import warp as wp
 
+from .heightmap import FlatGroundFootprint
+from .heightmap import FootprintConfig
 from .heightmap import HeightMapBuilder
 from .heightmap import gaussian_smooth
 from .heightmap import multigrid_inpaint
@@ -16,6 +18,8 @@ from .outlier import StatisticalOutlierFilter
 from .traversability import FilterConfig
 from .traversability import GeometricTraversabilityAnalyzer
 from .traversability import ObstacleInflator
+from .traversability import OcclusionConfig
+from .traversability import OcclusionMask
 from .traversability import SupportRatioMask
 from .traversability import TemporalGate
 from .traversability import TraversabilityConfig
@@ -75,6 +79,30 @@ class TerrainMap:
         return d
 
 
+@dataclass
+class TerrainMapGPU:
+    """Device-resident output of `TerrainPipeline.process(return_device=True)`.
+
+    Each field is a live `wp.array` handle into the pipeline's internal buffers —
+    NOT a copy. The handles are BORROWED: they stay valid only until the next
+    `process()` call on the same pipeline (buffers are reused frame-to-frame). A
+    consumer that needs to retain a layer across frames must `wp.clone()` it.
+
+    Lets a downstream Warp library consume the elevation grid on-device with no
+    GPU→CPU→GPU round-trip. Grid layout matches `TerrainMap`: shape
+    (height, width) = (ny, nx), row=y, col=x; cell-center world coords
+    x = xmin + (j+0.5)*resolution, y = ymin + (i+0.5)*resolution.
+    """
+
+    resolution: float
+    bounds: tuple[float, float, float, float]
+    elevation: wp.array | None = None
+    traversability: wp.array | None = None
+    slope_cost: wp.array | None = None
+    step_cost: wp.array | None = None
+    roughness_cost: wp.array | None = None
+
+
 class TerrainPipeline:
     """Points → (max, mean, min, count) → inpaint → smooth → cost → filter.
 
@@ -101,6 +129,8 @@ class TerrainPipeline:
         outlier: OutlierFilterConfig | RadiusOutlierFilterConfig | None = None,
         traversability: TraversabilityConfig | None = None,
         filter: FilterConfig | None = None,
+        occlusion: OcclusionConfig | None = None,
+        footprint: FootprintConfig | None = None,
         layers: tuple[str, ...] | None = None,
         device: str | wp.context.Device | None = None,
     ):
@@ -112,6 +142,8 @@ class TerrainPipeline:
             )
         if filter is not None and traversability is None:
             raise ValueError("filter is only meaningful when traversability is enabled")
+        if occlusion is not None and traversability is None:
+            raise ValueError("occlusion masks the cost map and requires traversability=...")
 
         # Resolve the Warp device once. Accepts "cpu", "cuda:0", a wp.Device, or
         # None (use Warp's current default). Outlier filtering uses wp.HashGrid
@@ -165,6 +197,17 @@ class TerrainPipeline:
         elif isinstance(outlier, OutlierFilterConfig):
             self.outlier_filter = StatisticalOutlierFilter(config=outlier, device=self.device)
 
+        self.footprint_stamp: FlatGroundFootprint | None = None
+        if footprint is not None:
+            self.footprint_stamp = FlatGroundFootprint(
+                resolution=resolution,
+                bounds=bounds,
+                height=self.height,
+                width=self.width,
+                config=footprint,
+                device=self.device,
+            )
+
         self.analyzer: GeometricTraversabilityAnalyzer | None = None
         if traversability is not None:
             self.analyzer = GeometricTraversabilityAnalyzer(
@@ -195,7 +238,31 @@ class TerrainPipeline:
                 device=self.device,
             )
 
-    def process(self, points: np.ndarray) -> TerrainMap:
+        self.occlusion_mask: OcclusionMask | None = None
+        if occlusion is not None:
+            self.occlusion_mask = OcclusionMask(
+                resolution=resolution,
+                bounds=bounds,
+                height=self.height,
+                width=self.width,
+                config=occlusion,
+                device=self.device,
+            )
+
+    def process(
+        self,
+        points: np.ndarray,
+        *,
+        footprint_plane: tuple[float, float, float] | None = None,
+        return_device: bool = False,
+    ) -> TerrainMap | TerrainMapGPU:
+        """Run the pipeline on a point cloud.
+
+        Default: download the selected layers to a numpy-backed `TerrainMap`.
+        `return_device=True`: skip the host copy and return a `TerrainMapGPU` of
+        live device `wp.array` handles (valid only until the next `process()` —
+        `wp.clone()` to retain) for a zero-copy handoff to another Warp library.
+        """
         if self.z_max is not None:
             points = points[points[:, 2] <= self.z_max]
 
@@ -204,9 +271,16 @@ class TerrainPipeline:
         # without an explicit device= argument would land on Warp's global
         # default, which can differ from self.device.
         with wp.ScopedDevice(self.device):
-            return self._process(points)
+            dev = self._compute(points, footprint_plane)
+            wp.synchronize()
+            return self._wrap_device(dev) if return_device else self._download(dev)
 
-    def _process(self, points: np.ndarray) -> TerrainMap:
+    def _compute(
+        self,
+        points: np.ndarray,
+        footprint_plane: tuple[float, float, float] | None = None,
+    ) -> dict[str, object]:
+        """Run all GPU stages and return the device buffers (no download)."""
         # Single upload to the active device — every stage below consumes wp.array.
         pts_wp = wp.array(
             np.ascontiguousarray(points, dtype=np.float32), dtype=wp.vec3,
@@ -216,6 +290,13 @@ class TerrainPipeline:
 
         layers = self.builder.build(pts_wp)
         primary_layer = layers[self.primary]  # wp.array
+
+        # Force a flat ground patch under the robot, in-place on the primary
+        # reduction. Done BEFORE the raw_primary snapshot so the footprint reads
+        # as "measured" to the support mask, and before inpaint so the patch acts
+        # as a known boundary.
+        if self.footprint_stamp is not None:
+            self.footprint_stamp.apply(primary_layer, footprint_plane)
 
         # multigrid_inpaint mutates its input buffer. The support mask needs the
         # ORIGINAL NaN-bearing primary to know which cells were really measured,
@@ -246,12 +327,27 @@ class TerrainPipeline:
                     total = self.support_mask.apply(raw_primary, inflated)
                 else:
                     total = self.support_mask.rejected_frame()
+            if self.occlusion_mask is not None:
+                # Drop inpainted cost in the line-of-sight shadow of obstacles, so
+                # the planner can't route through occluded space behind walls.
+                total = self.occlusion_mask.apply(raw_primary, elevation, total)
             traversability_wp = total
             costs_wp = {"slope": costs.slope, "step": costs.step, "roughness": costs.roughness}
 
-        # Single download barrier: sync once, then copy only the selected layers.
-        wp.synchronize()
+        return {
+            "layers": layers,
+            "elevation": elevation,
+            "traversability": traversability_wp,
+            "costs": costs_wp,
+        }
+
+    def _download(self, dev: dict[str, object]) -> TerrainMap:
+        """Copy the selected device layers into a numpy-backed `TerrainMap`."""
         sel = self._layers
+        layers = dev["layers"]
+        elevation = dev["elevation"]
+        traversability_wp = dev["traversability"]
+        costs_wp = dev["costs"]
         tm = TerrainMap(resolution=self.resolution, bounds=self.bounds)
         if "max" in sel:
             tm.max = layers.max.numpy().copy()
@@ -273,3 +369,18 @@ class TerrainPipeline:
         if traversability_wp is not None and "traversability" in sel:
             tm.traversability = traversability_wp.numpy().copy()
         return tm
+
+    def _wrap_device(self, dev: dict[str, object]) -> TerrainMapGPU:
+        """Wrap the selected device layers as borrowed handles (no copy)."""
+        sel = self._layers
+        costs = dev["costs"]
+        trav = dev["traversability"]
+        return TerrainMapGPU(
+            resolution=self.resolution,
+            bounds=self.bounds,
+            elevation=dev["elevation"] if "elevation" in sel else None,
+            traversability=trav if (trav is not None and "traversability" in sel) else None,
+            slope_cost=costs["slope"] if (costs is not None and "slope_cost" in sel) else None,
+            step_cost=costs["step"] if (costs is not None and "step_cost" in sel) else None,
+            roughness_cost=costs["roughness"] if (costs is not None and "roughness_cost" in sel) else None,
+        )

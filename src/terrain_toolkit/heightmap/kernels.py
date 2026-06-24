@@ -52,6 +52,36 @@ def finalize_kernel(
 
 
 @wp.kernel
+def stamp_footprint_kernel(
+    primary: wp.array2d(dtype=wp.float32),
+    i0: int,
+    j0: int,
+    xmin: float,
+    ymin: float,
+    res: float,
+    a: float,
+    b: float,
+    c: float,
+    fill_only: int,  # 1 = only write cells currently NaN (no real measurement)
+):
+    """Force a flat ground plane z = a*x + b*y + c over the footprint rectangle.
+
+    Launched over a (di, dj) block anchored at (i0, j0). The plane is constant in
+    the robot body frame (the robot's footprint is flat there); expressed in the
+    gravity-aligned grid frame it tilts with the robot's roll/pitch, so a/b are
+    generally non-zero. x/y are cell-center coordinates in the grid frame.
+    """
+    di, dj = wp.tid()
+    i = i0 + di
+    j = j0 + dj
+    if fill_only == 1 and not wp.isnan(primary[i, j]):
+        return
+    x = xmin + (float(j) + 0.5) * res
+    y = ymin + (float(i) + 0.5) * res
+    primary[i, j] = a * x + b * y + c
+
+
+@wp.kernel
 def blur_axis_kernel(
     src: wp.array2d(dtype=wp.float32),
     weights: wp.array(dtype=wp.float32),

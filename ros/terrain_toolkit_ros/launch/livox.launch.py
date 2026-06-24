@@ -18,7 +18,15 @@ def generate_launch_description() -> LaunchDescription:
             "map_frame", default_value="map", description="Map TF frame (unused)"
         ),
         DeclareLaunchArgument(
-            "robot_frame", default_value="base_link", description="Robot TF frame"
+            "robot_frame_ga",
+            default_value="base_link",
+            description="Gravity-aligned robot TF frame the heightmap is built in "
+            "(use a real gravity-aligned frame on non-flat terrain)",
+        ),
+        DeclareLaunchArgument(
+            "robot_frame",
+            default_value="base_link",
+            description="Normal (un-leveled) robot body TF frame; used for the flat-footprint plane",
         ),
         DeclareLaunchArgument(
             "square_half_size", default_value="10.0", description="Half-side of square ROI (m)"
@@ -158,6 +166,59 @@ def generate_launch_description() -> LaunchDescription:
             default_value="10",
             description="Skip hysteresis until this many obstacles seen",
         ),
+        # Occlusion (line-of-sight) masking (on by default for the demo)
+        DeclareLaunchArgument(
+            "occlusion_enable", default_value="true",
+            description="NaN-out cost in the line-of-sight shadow of obstacles",
+        ),
+        DeclareLaunchArgument(
+            "occlusion_sensor_x", default_value="0.0",
+            description="Sensor x in the gravity-aligned grid frame (m)",
+        ),
+        DeclareLaunchArgument(
+            "occlusion_sensor_y", default_value="0.0",
+            description="Sensor y in the gravity-aligned grid frame (m)",
+        ),
+        DeclareLaunchArgument(
+            "occlusion_sensor_z", default_value="0.5",
+            description="Sensor height above the grid origin (m)",
+        ),
+        DeclareLaunchArgument(
+            "occlusion_angle_eps_deg", default_value="0.6",
+            description="View-angle margin guarding flat-ground noise (deg)",
+        ),
+        # Flat ground footprint (on by default for the demo)
+        DeclareLaunchArgument(
+            "footprint_enable",
+            default_value="true",
+            description="Force a flat ground patch under the robot",
+        ),
+        DeclareLaunchArgument(
+            "footprint_robot_height",
+            default_value="0.4",
+            description="Vertical distance robot frame → ground (m)",
+        ),
+        DeclareLaunchArgument(
+            "footprint_half_x", default_value="0.5", description="Footprint half-extent along x (m)"
+        ),
+        DeclareLaunchArgument(
+            "footprint_half_y", default_value="0.5", description="Footprint half-extent along y (m)"
+        ),
+        DeclareLaunchArgument(
+            "footprint_center_x",
+            default_value="0.0",
+            description="Footprint center offset along x (m)",
+        ),
+        DeclareLaunchArgument(
+            "footprint_center_y",
+            default_value="0.0",
+            description="Footprint center offset along y (m)",
+        ),
+        DeclareLaunchArgument(
+            "footprint_mode",
+            default_value="overwrite",
+            description="Footprint fill mode: overwrite | fill",
+        ),
     ]
 
     lc = LaunchConfiguration
@@ -172,6 +233,7 @@ def generate_launch_description() -> LaunchDescription:
                 # ROS / sensor
                 "lidar_topic": lc("lidar_topic"),
                 "map_frame": lc("map_frame"),
+                "robot_frame_ga": lc("robot_frame_ga"),
                 "robot_frame": lc("robot_frame"),
                 "square_half_size": lc("square_half_size"),
                 # Grid
@@ -211,6 +273,20 @@ def generate_launch_description() -> LaunchDescription:
                 "filter_obstacle_growth_threshold": lc("filter_obstacle_growth_threshold"),
                 "filter_rejection_limit_frames": lc("filter_rejection_limit_frames"),
                 "filter_min_obstacle_baseline": lc("filter_min_obstacle_baseline"),
+                # Occlusion masking
+                "occlusion_enable": lc("occlusion_enable"),
+                "occlusion_sensor_x": lc("occlusion_sensor_x"),
+                "occlusion_sensor_y": lc("occlusion_sensor_y"),
+                "occlusion_sensor_z": lc("occlusion_sensor_z"),
+                "occlusion_angle_eps_deg": lc("occlusion_angle_eps_deg"),
+                # Flat ground footprint
+                "footprint_enable": lc("footprint_enable"),
+                "footprint_robot_height": lc("footprint_robot_height"),
+                "footprint_half_x": lc("footprint_half_x"),
+                "footprint_half_y": lc("footprint_half_y"),
+                "footprint_center_x": lc("footprint_center_x"),
+                "footprint_center_y": lc("footprint_center_y"),
+                "footprint_mode": lc("footprint_mode"),
             }
         ],
     )

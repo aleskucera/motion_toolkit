@@ -29,6 +29,8 @@ from std_msgs.msg import Header
 
 from terrain_toolkit import (
     FilterConfig,
+    FootprintConfig,
+    OcclusionConfig,
     OutlierFilterConfig,
     RadiusOutlierFilterConfig,
     TerrainMap,
@@ -66,6 +68,11 @@ _PIPELINE_PARAMS = frozenset({
     "filter_support_radius_m", "filter_support_ratio", "filter_inflation_sigma_m",
     "filter_obstacle_threshold", "filter_obstacle_growth_threshold",
     "filter_rejection_limit_frames", "filter_min_obstacle_baseline",
+    "occlusion_enable", "occlusion_sensor_x", "occlusion_sensor_y", "occlusion_sensor_z",
+    "occlusion_angle_eps_deg",
+    "footprint_enable", "footprint_robot_height",
+    "footprint_half_x", "footprint_half_y",
+    "footprint_center_x", "footprint_center_y", "footprint_mode",
 })
 
 
@@ -80,6 +87,11 @@ class TerrainToolkitNode(Node):
 
         self.lidar_topic: str = p["lidar_topic"]
         self.map_frame: str = p["map_frame"]
+        # Gravity-aligned frame the heightmap is built in (cloud is transformed
+        # here; slope/step are only meaningful on a level grid).
+        self.robot_frame_ga: str = p["robot_frame_ga"]
+        # Normal (un-leveled) robot body frame, used to derive the tilted ground
+        # plane under the robot for the flat-footprint feature.
         self.robot_frame: str = p["robot_frame"]
         self.resolution: float = p["resolution"]
         self.x_range: float = p["x_range"]
@@ -123,7 +135,15 @@ class TerrainToolkitNode(Node):
         # ROS / sensor
         self.declare_parameter("lidar_topic", "/lidar/points", sp("PointCloud2 input topic"))
         self.declare_parameter("map_frame", "map", sp("Map TF frame (unused)"))
-        self.declare_parameter("robot_frame", "base_link", sp("Robot TF frame"))
+        self.declare_parameter(
+            "robot_frame_ga", "base_link",
+            sp("Gravity-aligned robot TF frame the heightmap is built in "
+               "(use a real gravity-aligned frame on non-flat terrain)"),
+        )
+        self.declare_parameter(
+            "robot_frame", "base_link",
+            sp("Normal (un-leveled) robot body TF frame; used for the flat-footprint plane"),
+        )
         self.declare_parameter("square_half_size", 10.0, fp("Half-side of square ROI (m)", 0.5, 200.0))
         self.declare_parameter(
             "device", "auto",
@@ -173,9 +193,25 @@ class TerrainToolkitNode(Node):
         self.declare_parameter("filter_rejection_limit_frames", 5, ip("Force-accept after this many consecutive rejections", 1, 1000))
         self.declare_parameter("filter_min_obstacle_baseline", 10, ip("Skip hysteresis until this many obstacles seen", 0, 100_000))
 
+        # Occlusion (line-of-sight) masking
+        self.declare_parameter("occlusion_enable", False, sp("NaN-out cost in the line-of-sight shadow of obstacles"))
+        self.declare_parameter("occlusion_sensor_x", 0.0, fp("Sensor x in the gravity-aligned grid frame (m)", -10.0, 10.0))
+        self.declare_parameter("occlusion_sensor_y", 0.0, fp("Sensor y in the gravity-aligned grid frame (m)", -10.0, 10.0))
+        self.declare_parameter("occlusion_sensor_z", 0.5, fp("Sensor height above the grid origin (m)", 0.0, 10.0))
+        self.declare_parameter("occlusion_angle_eps_deg", 0.6, fp("View-angle margin guarding flat-ground noise (deg)", 0.0, 30.0))
+
+        # Flat ground footprint
+        self.declare_parameter("footprint_enable", False, sp("Force a flat ground patch under the robot"))
+        self.declare_parameter("footprint_robot_height", 0.4, fp("Vertical distance robot frame → ground (m)", -5.0, 5.0))
+        self.declare_parameter("footprint_half_x", 0.5, fp("Footprint half-extent along x (m)", 0.01, 10.0))
+        self.declare_parameter("footprint_half_y", 0.5, fp("Footprint half-extent along y (m)", 0.01, 10.0))
+        self.declare_parameter("footprint_center_x", 0.0, fp("Footprint center offset along x (m)", -10.0, 10.0))
+        self.declare_parameter("footprint_center_y", 0.0, fp("Footprint center offset along y (m)", -10.0, 10.0))
+        self.declare_parameter("footprint_mode", "overwrite", sp("Footprint fill mode: 'overwrite' | 'fill'"))
+
     def _read_parameters(self) -> dict:
         keys = [
-            "lidar_topic", "map_frame", "robot_frame", "square_half_size", "device",
+            "lidar_topic", "map_frame", "robot_frame_ga", "robot_frame", "square_half_size", "device",
             "resolution", "x_range", "y_range",
             "z_max", "primary", "inpaint", "inpaint_coarse_iters", "inpaint_iters_per_level", "smooth_sigma",
             "outlier_enable", "outlier_type",
@@ -188,12 +224,17 @@ class TerrainToolkitNode(Node):
             "filter_support_radius_m", "filter_support_ratio", "filter_inflation_sigma_m",
             "filter_obstacle_threshold", "filter_obstacle_growth_threshold",
             "filter_rejection_limit_frames", "filter_min_obstacle_baseline",
+            "occlusion_enable", "occlusion_sensor_x", "occlusion_sensor_y", "occlusion_sensor_z",
+            "occlusion_angle_eps_deg",
+            "footprint_enable", "footprint_robot_height",
+            "footprint_half_x", "footprint_half_y",
+            "footprint_center_x", "footprint_center_y", "footprint_mode",
         ]
         return {k: self.get_parameter(k).value for k in keys}
 
     def _log_config(self, p: dict) -> None:
         groups: list[tuple[str, list[str]]] = [
-            ("ROS / sensor",   ["lidar_topic", "map_frame", "robot_frame", "square_half_size", "device"]),
+            ("ROS / sensor",   ["lidar_topic", "map_frame", "robot_frame_ga", "robot_frame", "square_half_size", "device"]),
             ("Grid",           ["resolution", "x_range", "y_range"]),
             ("Pipeline",       ["z_max", "primary", "inpaint", "inpaint_coarse_iters",
                                 "inpaint_iters_per_level", "smooth_sigma"]),
@@ -207,6 +248,11 @@ class TerrainToolkitNode(Node):
                                 "filter_inflation_sigma_m", "filter_obstacle_threshold",
                                 "filter_obstacle_growth_threshold", "filter_rejection_limit_frames",
                                 "filter_min_obstacle_baseline"]),
+            ("Occlusion",      ["occlusion_enable", "occlusion_sensor_x", "occlusion_sensor_y",
+                                "occlusion_sensor_z", "occlusion_angle_eps_deg"]),
+            ("Footprint",      ["footprint_enable", "footprint_robot_height",
+                                "footprint_half_x", "footprint_half_y",
+                                "footprint_center_x", "footprint_center_y", "footprint_mode"]),
         ]
         lines = ["TerrainToolkitNode configuration:"]
         for title, keys in groups:
@@ -264,6 +310,27 @@ class TerrainToolkitNode(Node):
                 min_obstacle_baseline=p["filter_min_obstacle_baseline"],
             )
 
+        occlusion_cfg: OcclusionConfig | None = None
+        if p["occlusion_enable"] and traversability_cfg is not None:
+            occlusion_cfg = OcclusionConfig(
+                sensor_xy=(p["occlusion_sensor_x"], p["occlusion_sensor_y"]),
+                sensor_z=p["occlusion_sensor_z"],
+                angle_eps_rad=float(np.deg2rad(p["occlusion_angle_eps_deg"])),
+            )
+
+        footprint_cfg: FootprintConfig | None = None
+        if p["footprint_enable"]:
+            footprint_cfg = FootprintConfig(
+                half_x=p["footprint_half_x"],
+                half_y=p["footprint_half_y"],
+                center=(p["footprint_center_x"], p["footprint_center_y"]),
+                ground_z=-p["footprint_robot_height"],  # level fallback if no plane
+                mode=p["footprint_mode"],
+            )
+        # Cached for the per-frame plane computation in the callback.
+        self.footprint_enable: bool = bool(p["footprint_enable"])
+        self.footprint_robot_height: float = float(p["footprint_robot_height"])
+
         # 'auto' picks CUDA if available, else CPU. Explicit "cpu" / "cuda:N"
         # passes straight to Warp.
         device_param = p["device"]
@@ -285,6 +352,8 @@ class TerrainToolkitNode(Node):
             outlier=outlier_cfg,
             traversability=traversability_cfg,
             filter=filter_cfg,
+            occlusion=occlusion_cfg,
+            footprint=footprint_cfg,
             device=device_arg,
         )
 
@@ -297,7 +366,7 @@ class TerrainToolkitNode(Node):
         merged = self._read_parameters()
         merged.update(new_values)
 
-        for attr in ("map_frame", "robot_frame", "resolution", "x_range", "y_range", "square_half_size"):
+        for attr in ("map_frame", "robot_frame_ga", "robot_frame", "resolution", "x_range", "y_range", "square_half_size"):
             if attr in new_values:
                 setattr(self, attr, new_values[attr])
 
@@ -328,20 +397,24 @@ class TerrainToolkitNode(Node):
 
         try:
             self.tf_buffer.lookup_transform(
-                self.robot_frame, source_frame, stamp,
+                self.robot_frame_ga, source_frame, stamp,
                 timeout=rclpy.duration.Duration(seconds=0.1),
             )
         except TransformException as exc:
             self.get_logger().warn(f"TF lookup failed: {exc}")
             return
 
-        points_xyz = self._transform_pointcloud_xyz(msg, self.robot_frame, self.tf_buffer)
+        points_xyz = self._transform_pointcloud_xyz(msg, self.robot_frame_ga, self.tf_buffer)
         if points_xyz is None or points_xyz.shape[0] == 0:
             self.get_logger().warn("Received empty / invalid point cloud — skipping.")
             return
 
+        footprint_plane = self._footprint_plane(stamp)
+
         try:
-            terrain_map: TerrainMap = self.pipe.process(points_xyz)
+            terrain_map: TerrainMap = self.pipe.process(
+                points_xyz, footprint_plane=footprint_plane,
+            )
         except Exception as exc:
             self.get_logger().error(f"terrain_toolkit error: {exc}")
             return
@@ -355,6 +428,48 @@ class TerrainToolkitNode(Node):
         )
         if out_cloud is not None:
             self.pub.publish(out_cloud)
+
+    # ------------------------------------------------------------------
+    # Flat-footprint ground plane
+    # ------------------------------------------------------------------
+
+    def _footprint_plane(self, stamp) -> tuple[float, float, float] | None:
+        """Ground plane `z = a*x + b*y + c` in the gravity-aligned grid frame.
+
+        The robot footprint is flat (z = -robot_height) in the *normal* robot
+        body frame. Expressed in the gravity-aligned grid frame it tilts with the
+        robot's roll/pitch, so we look up robot_frame_ga ← robot_frame and project
+        that plane. Returns None when the feature is off or TF is unavailable
+        (the pipeline then falls back to its level default).
+        """
+        if not self.footprint_enable:
+            return None
+
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.robot_frame_ga, self.robot_frame, stamp,
+                timeout=rclpy.duration.Duration(seconds=0.1),
+            )
+        except TransformException as exc:
+            self.get_logger().warn(f"footprint TF lookup failed: {exc}")
+            return None
+
+        r = tf.transform.rotation
+        t = tf.transform.translation
+        # Third column of R_{ga←robot}: the robot body z-axis in the grid frame.
+        R = _quaternion_to_matrix(r.x, r.y, r.z, r.w)
+        r3 = R[:3, 2]
+        rz = float(r3[2])
+        if abs(rz) < 1e-6:
+            self.get_logger().warn("footprint plane near-vertical — skipping flat patch.")
+            return None
+
+        h = self.footprint_robot_height
+        r3_dot_t = float(r3[0] * t.x + r3[1] * t.y + r3[2] * t.z)
+        a = -float(r3[0]) / rz
+        b = -float(r3[1]) / rz
+        c = (-h + r3_dot_t) / rz
+        return (a, b, c)
 
     # ------------------------------------------------------------------
     # PointCloud2 → numpy
@@ -427,7 +542,7 @@ class TerrainToolkitNode(Node):
 
         header = Header()
         header.stamp = stamp
-        header.frame_id = self.robot_frame
+        header.frame_id = self.robot_frame_ga
 
         cloud_msg = PointCloud2()
         cloud_msg.header = header

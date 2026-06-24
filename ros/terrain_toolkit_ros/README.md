@@ -36,7 +36,7 @@ source install/setup.bash
 ```bash
 ros2 launch terrain_toolkit_ros terrain_toolkit_node.launch.py \
     lidar_topic:=/points \
-    robot_frame:=base_link \
+    robot_frame_ga:=base_link \
     resolution:=0.15 \
     x_range:=12.0 y_range:=12.0
 ```
@@ -49,7 +49,8 @@ All pipeline parameters can be changed at runtime with `ros2 param set` /
 | Group | Parameter | Default | Description |
 |-------|-----------|---------|-------------|
 | ROS | `lidar_topic` | `/lidar/points` | PointCloud2 input topic |
-| ROS | `robot_frame` | `base_link` | Target TF frame |
+| ROS | `robot_frame_ga` | `base_link` | Gravity-aligned frame the heightmap is built in |
+| ROS | `robot_frame` | `base_link` | Normal robot body frame (flat-footprint plane) |
 | Grid | `resolution` | `0.15` | Cell size (m) |
 | Grid | `x_range` / `y_range` | `12.0` / `12.0` | Half-extent of the ROI (m) |
 | Pipeline | `z_max` | `1.0` | Discard points above this height |
@@ -63,5 +64,12 @@ All pipeline parameters can be changed at runtime with `ros2 param set` /
 | Trav. | `trav_max_step_height_m` | `0.55` | Upward step saturating cost to 1 |
 | Trav. | `trav_max_drop_height_m` | `0.3` | Downward drop saturating cost to 1 |
 | Filter | `filter_enable` | `true` | Obstacle inflation + temporal gate |
+| Occlusion | `occlusion_enable` | `false` | NaN-out cost in the line-of-sight shadow of obstacles |
+| Occlusion | `occlusion_sensor_x/y/z` | `0/0/0.5` | Sensor position in the gravity-aligned grid frame (m) |
+| Occlusion | `occlusion_angle_eps_deg` | `0.6` | View-angle margin guarding flat-ground noise (deg) |
+| Footprint | `footprint_enable` | `false` | Force a flat ground patch under the robot |
+| Footprint | `footprint_robot_height` | `0.4` | Vertical distance robot frame → ground (m) |
+| Footprint | `footprint_half_x` / `footprint_half_y` | `0.5` / `0.5` | Footprint half-extents (m) |
+| Footprint | `footprint_mode` | `overwrite` | `overwrite` real cells or `fill` gaps only |
 
 See `launch/terrain_toolkit_node.launch.py` for the full list.
