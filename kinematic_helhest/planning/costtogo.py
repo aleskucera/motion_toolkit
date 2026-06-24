@@ -1,20 +1,26 @@
-"""Cost-to-go field for MPPI (option E): obstacle-aware geodesic distance to the goal.
+"""Settle-based orientation-aware cost-to-go V(x, y, theta).
 
-A horizon-limited MPPI that scores rollouts by straight-line distance stalls against
-obstacles -- every rollout that shortens the Euclidean gap drives into the wall, and the
-detour that actually pays off looks worse inside the horizon. The fix is to score by the
-TRUE remaining path length instead: V(x, y) = least-cost distance to the goal routing
-AROUND untraversable terrain. Sampling V (not ||x - goal||) in the cost makes the planner
-detour.
+Feasibility comes from the robot's OWN settle, not a thresholded traversability map: for every pose
+(x, y, theta) the robot is placed on the terrain and the engine's residual / clearance / tilt are
+read. A pose is blocked iff residual > resid_tol OR clearance < clear_margin OR the body exceeds the
+robot's stability ENVELOPE -- |roll| > max_roll, or pitch beyond the asymmetric climb/descend limits
+(climbing is nose-up = negative pitch). So feasibility is direction-aware: a side-slope is fine to
+CLIMB head-on (pitch, tolerated) but blocked to traverse sideways (roll, dangerous) -- exactly what
+the orientation-aware lattice can exploit. The envelope + turn radius come from RobotParams, the
+SAME robot the rollouts drive. The static (zero-control) settle is friction-independent, so compute()
+needs only the elevation and the goal.
 
-Pipeline (all on device): terrain_toolkit's GeometricTraversabilityAnalyzer turns the
-elevation into a [0, 1] traversability cost (slope + step + roughness), then its
-GeodesicDistanceSolver (parallel min-relaxation == grid Dijkstra) solves the distance
-field. Unreachable/obstacle cells come back +inf; we clamp them to a large finite value so
-the planner's bilinear sampling stays finite (the rollouts' own graded clearance/residual
-penalty still does the fine obstacle avoidance -- V only supplies the global routing).
+Among FEASIBLE poses the arc cost prefers flatter ground via a graded penalty that splits into two
+non-redundant pieces: the per-axis SHAPE (roll_cost_weight : pitch_cost_weight, the robot's relative
+roll-vs-pitch susceptibility, from RobotParams) and a single STRENGTH gain (flatness_weight, a planner
+knob: how much detour to trade for flatness). The lattice arc cost is
+    arc_len * (1 + flatness_weight * mean(roll_cost_weight*|roll| + pitch_cost_weight*|pitch|)).
+flatness_weight is the only global gain; the per-axis weights only set the shape (keep them a ratio,
+e.g. 1.0 : 0.5, not a second gain).
 
-terrain_toolkit is a lazy dependency: only this module imports it.
+This is the settle-based feasibility PRODUCER: it settles the robot at every pose to make the per-pose
+blocked / graded-tilt fields, then hands them to the LatticeValueSolver (lattice_solver.py) that does
+the forward-arc value iteration. (The solver was vendored from terrain_toolkit.)
 """
 from __future__ import annotations
 
@@ -23,87 +29,24 @@ from typing import TYPE_CHECKING
 import numpy as np
 import warp as wp
 
+from ..engine import Simulator
+from ..engine.robot import Robot  # the built struct, passed straight into the feasibility kernel
+from ..heightmap import Heightmap
+from ..profiling import StageProfiler
+from .lattice_solver import LatticeValueSolver
+
 if TYPE_CHECKING:
-    import warp.context
-
-    from terrain_toolkit import TraversabilityConfig
-
     from ..engine import GridParams
-
-
-@wp.kernel
-def _clamp_kernel(
-    v_in: wp.array2d(dtype=wp.float32), vcap: wp.float32, v_out: wp.array2d(dtype=wp.float32)
-):
-    """Copy V, replacing the solver's +inf (unreachable) with a large finite cap so the
-    cost kernel's bilinear sampling never blends to inf."""
-    r, c = wp.tid()
-    val = v_in[r, c]
-    if val > vcap:
-        v_out[r, c] = vcap
-    else:
-        v_out[r, c] = val
-
-
-class CostToGo:
-    """Owns the terrain_toolkit analyzer + geodesic solver for a fixed grid size, and the
-    clamped V buffer the MPPI cost samples. `compute(elevation, goal_xy)` updates V in place
-    (a stable device buffer -> safe to hand to a CUDA-graph-captured cost kernel)."""
-
-    def __init__(
-        self,
-        grid: GridParams,
-        device: wp.context.Device | str,
-        obstacle_threshold: float = 0.8,
-        config: TraversabilityConfig | None = None,
-    ) -> None:
-        try:
-            from terrain_toolkit import (
-                GeodesicDistanceSolver,
-                GeometricTraversabilityAnalyzer,
-            )
-        except ImportError as e:  # match navigate.py's helpful message
-            raise ImportError(
-                "cost-to-go (MPPI option E) needs terrain_toolkit; install it, e.g. "
-                "`uv pip install -e ../terrain_toolkit --no-deps`"
-            ) from e
-
-        self.nx, self.ny = int(grid.cells_x), int(grid.cells_y)
-        self.cell = float(grid.cell_size)
-        self.x0, self.y0 = float(grid.origin_x), float(grid.origin_y)
-        self.bounds = grid.bounds
-        self.obstacle_threshold = float(obstacle_threshold)
-        self.device = device
-        # unreachable penalty: larger than any reachable path on this grid (the L1 diameter
-        # is an upper bound on the 8-connected geodesic), so unreached cells are always worst.
-        self._vcap = float(1.5 * (self.nx + self.ny) * self.cell)
-
-        self.analyzer = GeometricTraversabilityAnalyzer(
-            self.cell, self.ny, self.nx, config, device=device
-        )
-        self.solver = GeodesicDistanceSolver(self.cell, self.ny, self.nx, device=device)
-        self.V = wp.zeros((self.ny, self.nx), dtype=wp.float32, device=device)
-
-    def compute(self, elevation: np.ndarray | wp.array, goal_xy: np.ndarray) -> wp.array:
-        """elevation [ny, nx] (numpy or wp.array) + world goal -> V (wp.array, clamped meters)."""
-        trav = self.analyzer.compute(elevation).total  # [ny, nx] in [0, 1]
-        v = self.solver.compute(
-            trav, goal_xy, self.bounds, obstacle_threshold=self.obstacle_threshold
-        )
-        wp.launch(
-            _clamp_kernel,
-            dim=(self.ny, self.nx),
-            inputs=[v, self._vcap],
-            outputs=[self.V],
-            device=self.device,
-        )
-        return self.V
+    from ..engine import RobotParams
+    from ..engine import SolverParams
 
 
 @wp.kernel
 def _clamp3d_kernel(
     v_in: wp.array3d(dtype=wp.float32), vcap: wp.float32, v_out: wp.array3d(dtype=wp.float32)
 ):
+    """Copy V, replacing the solver's +inf (unreachable) with a large finite cap so the cost
+    kernel's trilinear sampling never blends to inf."""
     r, c, t = wp.tid()
     val = v_in[r, c, t]
     if val > vcap:
@@ -112,72 +55,204 @@ def _clamp3d_kernel(
         v_out[r, c, t] = val
 
 
-class CostToGoLattice:
-    """Like CostToGo, but the ORIENTATION-AWARE cost-to-go V(x, y, theta) -- so the MPPI cost
-    penalizes misaligned approaches a forward-only robot can't recover from (the pocket/ridge
-    failure that position-only V causes). Runs the same terrain_toolkit traversability + the GPU
-    LatticeValueSolver (forward-arc lattice value iteration), at the sim resolution with a larger
-    arc step so its grid matches the sim grid. compute() updates the clamped V[ny,nx,n_theta] in
-    place (stable buffer -> graph-safe)."""
+@wp.kernel
+def _feasibility_kernel(
+    derived: wp.array2d(dtype=wp.vec3f),  # (z, pitch, roll) per pose; row 0 = the static settle
+    residual: wp.array2d(dtype=wp.float32),
+    clearance: wp.array2d(dtype=wp.float32),
+    robot: Robot,  # limits/weights (radians) -- the same struct the rollouts drive
+    blocked: wp.array3d(dtype=wp.float32),
+    tilt: wp.array3d(dtype=wp.float32),
+):
+    """The per-pose feasibility OR + graded tilt cost, one thread per (y, x, theta), no readback.
+    Direction-aware: climb = nose-up = NEGATIVE pitch, so the climb limit is on -pitch, descend on
+    +pitch. Pose b = (r*nx + c)*n_theta + t is the C-order flatten matching start_pose in __init__.
+    """
+    r, c, t = wp.tid()
+    nx = blocked.shape[1]
+    n_theta = blocked.shape[2]
+    b = (r * nx + c) * n_theta + t
+    der = derived[0, b]
+    pitch = der[1]
+    roll = der[2]
+    over_envelope = (
+        wp.abs(roll) > robot.max_roll or pitch < -robot.max_pitch_up or pitch > robot.max_pitch_down
+    )
+    if over_envelope or residual[0, b] > robot.resid_tol or clearance[0, b] < robot.clear_margin:
+        blocked[r, c, t] = 1.0
+    else:
+        blocked[r, c, t] = 0.0
+    tilt[r, c, t] = robot.roll_cost_weight * wp.abs(roll) + robot.pitch_cost_weight * wp.abs(pitch)
 
+
+@wp.kernel
+def _goal_cell_kernel(
+    goal_xy: wp.array(dtype=wp.float32),  # [2] world (x, y)
+    xmin: wp.float32,
+    ymin: wp.float32,
+    resolution: wp.float32,
+    height: wp.int32,
+    width: wp.int32,
+    goal_rc: wp.array(dtype=wp.int32),  # [2] out (row, col) -- keeps the goal ON DEVICE (graph-safe)
+):
+    """Map the world goal to its grid cell on device, so the whole solve can be captured once as a
+    graph and replayed with a moving goal (no host-side cell index baked into the graph). dim=1."""
+    goal_rc[0] = wp.clamp(int((goal_xy[1] - ymin) / resolution), 0, height - 1)  # row from y
+    goal_rc[1] = wp.clamp(int((goal_xy[0] - xmin) / resolution), 0, width - 1)  # col from x
+
+
+
+
+class CostToGo:
     def __init__(
         self,
-        grid: GridParams,
-        device: wp.context.Device | str,
-        n_theta: int = 16,
-        turn_radius: float = 0.6,
-        robot_radius: float = 0.3,
+        grid_params: GridParams,
+        robot_params: RobotParams,
+        solver_params: SolverParams,
+        n_theta: int = 24,
         step: float = 0.3,
-        obstacle_threshold: float = 0.8,
-        trav_weight: float = 0.0,
-        config: TraversabilityConfig | None = None,
+        flatness_weight: float = 2.0,  # planner strength: how much detour to trade for flat ground
+        profile: bool = False,  # opt-in per-stage CUDA-event timing (tiny event nodes + per-call sync)
+        device: wp.Device | str | None = None,
     ) -> None:
-        try:
-            from terrain_toolkit import (
-                GeometricTraversabilityAnalyzer,
-                LatticeValueSolver,
-            )
-        except ImportError as e:
-            raise ImportError(
-                "orientation-aware cost-to-go needs terrain_toolkit; install it, e.g. "
-                "`uv pip install -e ../terrain_toolkit --no-deps`"
-            ) from e
-        self.nx, self.ny, self.cell = int(grid.cells_x), int(grid.cells_y), float(grid.cell_size)
-        self.x0, self.y0 = float(grid.origin_x), float(grid.origin_y)
-        self.bounds = grid.bounds
-        self.n_theta = int(n_theta)
-        self.obstacle_threshold = float(obstacle_threshold)
-        self.device = device
-        # graded arc cost inflates reachable V by up to (1 + trav_weight); grow the unreachable cap
-        # to stay above any reachable path, else flat-but-long routes get clipped to "unreachable".
-        self._vcap = float(1.5 * (self.nx + self.ny) * self.cell * (1.0 + trav_weight))
-        self.analyzer = GeometricTraversabilityAnalyzer(
-            self.cell, self.ny, self.nx, config, device=device
-        )
-        self.solver = LatticeValueSolver(
-            self.cell,
-            self.ny,
-            self.nx,
-            n_theta=self.n_theta,
-            turn_radius=turn_radius,
-            robot_radius=robot_radius,
-            step=step,
-            trav_weight=trav_weight,
-            device=device,
-        )
-        self.V = wp.zeros((self.ny, self.nx, self.n_theta), dtype=wp.float32, device=device)
 
-    def compute(self, elevation: np.ndarray | wp.array, goal_xy: np.ndarray) -> wp.array:
-        """elevation [ny, nx] + world goal -> V[ny, nx, n_theta] (wp.array, clamped meters)."""
-        trav = self.analyzer.compute(elevation).total
-        v = self.solver.compute(
-            trav, goal_xy, self.bounds, obstacle_threshold=self.obstacle_threshold
+        self.device = wp.get_device(device)
+        self.flatness_weight = flatness_weight
+        self.robot = robot_params.build(self.device)
+        self.grid = grid_params.build()
+        self.bounds = grid_params.bounds  # (xmin, xmax, ymin, ymax) the solver takes
+
+        self._vcap = (
+            1.5
+            * (self.grid.cells_x + self.grid.cells_y)
+            * self.grid.cell_size
+            * (1.0 + self.flatness_weight)
         )
+
+        ny, nx = self.grid.cells_y, self.grid.cells_x
+        self.settle_sim = Simulator(
+            robot_params=robot_params,
+            solver_params=solver_params,
+            grid_params=grid_params,
+            B=nx * ny * n_theta,
+            T=1,
+            device=self.device,
+        )
+        rr, cc, tt = np.meshgrid(np.arange(ny), np.arange(nx), np.arange(n_theta), indexing="ij")
+        px = (self.grid.origin_x + cc * self.grid.cell_size).ravel().astype(np.float32)
+        py = (self.grid.origin_y + rr * self.grid.cell_size).ravel().astype(np.float32)
+        ph = ((tt + 0.5) * 2.0 * np.pi / n_theta).ravel().astype(np.float32)  # bin-center heading
+        self.settle_sim.start_pose.assign(np.stack([px, py, ph], 1))
+        self.settle_sim.omega.zero_()
+        self._mu = Heightmap(
+            np.full((self.grid.cells_y, self.grid.cells_x), 0.8, np.float32),
+            (self.grid.origin_x, self.grid.origin_y),
+            self.grid.cell_size,
+        )
+        self.settle_sim.set_friction(self._mu)
+
+        self.solver = LatticeValueSolver(
+            self.grid.cell_size,
+            self.grid.cells_y,
+            self.grid.cells_x,
+            n_theta=n_theta,
+            turn_radius=self.robot.min_turn_radius,
+            step=step,
+            device=self.device,
+        )
+
+        self.V = wp.zeros(
+            (self.grid.cells_y, self.grid.cells_x, n_theta),
+            dtype=wp.float32,
+            device=self.device,
+        )
+        self.blocked = wp.zeros_like(self.V)
+        self.graded_tilt = wp.zeros_like(self.V)
+        # Tier-2 device capture: stable buffers the captured graph reads (refreshed each call OUTSIDE
+        # the graph), the goal cell computed on device, and the cached graph (one replayable solve).
+        xmin, _, ymin, _ = self.bounds
+        self._xmin, self._ymin = float(xmin), float(ymin)
+        self._elev_in = wp.zeros((ny, nx), dtype=wp.float32, device=self.device)
+        self._goal_xy = wp.zeros(2, dtype=wp.float32, device=self.device)
+        self._goal_rc = wp.zeros(2, dtype=wp.int32, device=self.device)
+        self._graph = None
+        # opt-in per-stage profiling (CUDA-event timing inside the captured graph; off = zero overhead)
+        self._prof = StageProfiler(self.device, ("settle", "feasibility", "route", "clamp"), profile)
+        self._n_compute = 0
+
+    def reset_timing(self) -> None:
+        """Clear the accumulated per-stage timing stats (e.g. after a warmup run)."""
+        self._prof.reset()
+
+    def timing_stats(self) -> dict:
+        """Per-stage timing over profiled compute() calls (CUDA + profile=True), the build/warmup call
+        excluded: {stage: {"mean_ms", "std_ms", "n"}}. Use the means (the profiling run is serialized
+        by the event reads, so its wall-clock runs slower than real throughput)."""
+        return self._prof.stats()
+
+    def _record_compute(self, capture: bool) -> None:
+        """Record the whole pipeline on stable owned buffers: terrain -> settle -> per-pose
+        feasibility -> goal cell (on device) -> value iteration -> clamp into V. Used both to build
+        the captured graph (capture=True) and for the eager CPU fallback (capture=False)."""
+        sim = self.settle_sim
+        self._prof.mark(0)
+        sim.set_terrain(self._elev_in)  # D2D copy + envelope rebuild from the stable terrain buffer
+        sim.rollout_launch()
+        self._prof.mark(1)  # settle done
+        wp.launch(
+            _feasibility_kernel,
+            dim=self.V.shape,
+            inputs=[sim.derived, sim.residual, sim.clearance, self.robot],
+            outputs=[self.blocked, self.graded_tilt],
+            device=self.device,
+        )
+        self._prof.mark(2)  # feasibility done
+        wp.launch(
+            _goal_cell_kernel,
+            dim=1,
+            inputs=[
+                self._goal_xy,
+                self._xmin,
+                self._ymin,
+                self.grid.cell_size,
+                self.grid.cells_y,
+                self.grid.cells_x,
+            ],
+            outputs=[self._goal_rc],
+            device=self.device,
+        )
+        result = self.solver._record_solve(
+            self.blocked, self.graded_tilt, self._goal_rc, self.flatness_weight, capture
+        )
+        self._prof.mark(3)  # value iteration done (goal cell + solve)
         wp.launch(
             _clamp3d_kernel,
-            dim=(self.ny, self.nx, self.n_theta),
-            inputs=[v, self._vcap],
+            dim=self.V.shape,
+            inputs=[result, self._vcap],
             outputs=[self.V],
             device=self.device,
         )
+        self._prof.mark(4)  # clamp done
+
+    def compute(self, elevation: wp.array, goal_xy: tuple[float, float]) -> wp.array:
+        """elevation [ny, nx] device wp.array + goal -> clamped V[ny, nx, n_theta]. The entire solve
+        (settle + value iteration) is captured ONCE as a CUDA graph and replayed each call with the
+        new terrain/goal (copied into stable device buffers first) -- no host syncs in the loop."""
+        assert (
+            elevation.device == self.device
+        ), f"elevation must be a wp.array on {self.device}, got {elevation.device}"
+        # refresh the stable inputs OUTSIDE the graph; the captured graph reads these owned buffers.
+        wp.copy(self._elev_in, elevation)
+        self._goal_xy.assign(np.asarray(goal_xy[:2], np.float32))
+        if self.device.is_cuda:
+            if self._graph is None:
+                with wp.ScopedCapture(device=self.device) as cap:
+                    self._record_compute(capture=True)
+                self._graph = cap.graph
+            wp.capture_launch(self._graph)
+        else:
+            self._record_compute(capture=False)
+        self._n_compute += 1
+        if self._prof.enabled and self._n_compute > 1:  # skip the first (graph-build / warmup) sample
+            self._prof.accumulate()
         return self.V
