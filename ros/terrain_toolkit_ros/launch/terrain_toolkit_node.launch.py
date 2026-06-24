@@ -164,6 +164,27 @@ def generate_launch_description() -> LaunchDescription:
             default_value="10",
             description="Skip hysteresis until this many obstacles seen",
         ),
+        # Occlusion (line-of-sight) masking
+        DeclareLaunchArgument(
+            "occlusion_enable", default_value="false",
+            description="NaN-out cost in the line-of-sight shadow of obstacles",
+        ),
+        DeclareLaunchArgument(
+            "occlusion_sensor_x", default_value="0.0",
+            description="Sensor x in the gravity-aligned grid frame (m)",
+        ),
+        DeclareLaunchArgument(
+            "occlusion_sensor_y", default_value="0.0",
+            description="Sensor y in the gravity-aligned grid frame (m)",
+        ),
+        DeclareLaunchArgument(
+            "occlusion_sensor_z", default_value="0.5",
+            description="Sensor height above the grid origin (m)",
+        ),
+        DeclareLaunchArgument(
+            "occlusion_angle_eps_deg", default_value="0.6",
+            description="View-angle margin guarding flat-ground noise (deg)",
+        ),
         # Flat ground footprint
         DeclareLaunchArgument(
             "footprint_enable",
@@ -250,6 +271,12 @@ def generate_launch_description() -> LaunchDescription:
                 "filter_obstacle_growth_threshold": lc("filter_obstacle_growth_threshold"),
                 "filter_rejection_limit_frames": lc("filter_rejection_limit_frames"),
                 "filter_min_obstacle_baseline": lc("filter_min_obstacle_baseline"),
+                # Occlusion masking
+                "occlusion_enable": lc("occlusion_enable"),
+                "occlusion_sensor_x": lc("occlusion_sensor_x"),
+                "occlusion_sensor_y": lc("occlusion_sensor_y"),
+                "occlusion_sensor_z": lc("occlusion_sensor_z"),
+                "occlusion_angle_eps_deg": lc("occlusion_angle_eps_deg"),
                 # Flat ground footprint
                 "footprint_enable": lc("footprint_enable"),
                 "footprint_robot_height": lc("footprint_robot_height"),

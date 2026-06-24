@@ -64,6 +64,9 @@ All pipeline parameters can be changed at runtime with `ros2 param set` /
 | Trav. | `trav_max_step_height_m` | `0.55` | Upward step saturating cost to 1 |
 | Trav. | `trav_max_drop_height_m` | `0.3` | Downward drop saturating cost to 1 |
 | Filter | `filter_enable` | `true` | Obstacle inflation + temporal gate |
+| Occlusion | `occlusion_enable` | `false` | NaN-out cost in the line-of-sight shadow of obstacles |
+| Occlusion | `occlusion_sensor_x/y/z` | `0/0/0.5` | Sensor position in the gravity-aligned grid frame (m) |
+| Occlusion | `occlusion_angle_eps_deg` | `0.6` | View-angle margin guarding flat-ground noise (deg) |
 | Footprint | `footprint_enable` | `false` | Force a flat ground patch under the robot |
 | Footprint | `footprint_robot_height` | `0.4` | Vertical distance robot frame → ground (m) |
 | Footprint | `footprint_half_x` / `footprint_half_y` | `0.5` / `0.5` | Footprint half-extents (m) |

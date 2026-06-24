@@ -30,6 +30,7 @@ from std_msgs.msg import Header
 from terrain_toolkit import (
     FilterConfig,
     FootprintConfig,
+    OcclusionConfig,
     OutlierFilterConfig,
     RadiusOutlierFilterConfig,
     TerrainMap,
@@ -67,6 +68,8 @@ _PIPELINE_PARAMS = frozenset({
     "filter_support_radius_m", "filter_support_ratio", "filter_inflation_sigma_m",
     "filter_obstacle_threshold", "filter_obstacle_growth_threshold",
     "filter_rejection_limit_frames", "filter_min_obstacle_baseline",
+    "occlusion_enable", "occlusion_sensor_x", "occlusion_sensor_y", "occlusion_sensor_z",
+    "occlusion_angle_eps_deg",
     "footprint_enable", "footprint_robot_height",
     "footprint_half_x", "footprint_half_y",
     "footprint_center_x", "footprint_center_y", "footprint_mode",
@@ -190,6 +193,13 @@ class TerrainToolkitNode(Node):
         self.declare_parameter("filter_rejection_limit_frames", 5, ip("Force-accept after this many consecutive rejections", 1, 1000))
         self.declare_parameter("filter_min_obstacle_baseline", 10, ip("Skip hysteresis until this many obstacles seen", 0, 100_000))
 
+        # Occlusion (line-of-sight) masking
+        self.declare_parameter("occlusion_enable", False, sp("NaN-out cost in the line-of-sight shadow of obstacles"))
+        self.declare_parameter("occlusion_sensor_x", 0.0, fp("Sensor x in the gravity-aligned grid frame (m)", -10.0, 10.0))
+        self.declare_parameter("occlusion_sensor_y", 0.0, fp("Sensor y in the gravity-aligned grid frame (m)", -10.0, 10.0))
+        self.declare_parameter("occlusion_sensor_z", 0.5, fp("Sensor height above the grid origin (m)", 0.0, 10.0))
+        self.declare_parameter("occlusion_angle_eps_deg", 0.6, fp("View-angle margin guarding flat-ground noise (deg)", 0.0, 30.0))
+
         # Flat ground footprint
         self.declare_parameter("footprint_enable", False, sp("Force a flat ground patch under the robot"))
         self.declare_parameter("footprint_robot_height", 0.4, fp("Vertical distance robot frame → ground (m)", -5.0, 5.0))
@@ -214,6 +224,8 @@ class TerrainToolkitNode(Node):
             "filter_support_radius_m", "filter_support_ratio", "filter_inflation_sigma_m",
             "filter_obstacle_threshold", "filter_obstacle_growth_threshold",
             "filter_rejection_limit_frames", "filter_min_obstacle_baseline",
+            "occlusion_enable", "occlusion_sensor_x", "occlusion_sensor_y", "occlusion_sensor_z",
+            "occlusion_angle_eps_deg",
             "footprint_enable", "footprint_robot_height",
             "footprint_half_x", "footprint_half_y",
             "footprint_center_x", "footprint_center_y", "footprint_mode",
@@ -236,6 +248,8 @@ class TerrainToolkitNode(Node):
                                 "filter_inflation_sigma_m", "filter_obstacle_threshold",
                                 "filter_obstacle_growth_threshold", "filter_rejection_limit_frames",
                                 "filter_min_obstacle_baseline"]),
+            ("Occlusion",      ["occlusion_enable", "occlusion_sensor_x", "occlusion_sensor_y",
+                                "occlusion_sensor_z", "occlusion_angle_eps_deg"]),
             ("Footprint",      ["footprint_enable", "footprint_robot_height",
                                 "footprint_half_x", "footprint_half_y",
                                 "footprint_center_x", "footprint_center_y", "footprint_mode"]),
@@ -296,6 +310,14 @@ class TerrainToolkitNode(Node):
                 min_obstacle_baseline=p["filter_min_obstacle_baseline"],
             )
 
+        occlusion_cfg: OcclusionConfig | None = None
+        if p["occlusion_enable"] and traversability_cfg is not None:
+            occlusion_cfg = OcclusionConfig(
+                sensor_xy=(p["occlusion_sensor_x"], p["occlusion_sensor_y"]),
+                sensor_z=p["occlusion_sensor_z"],
+                angle_eps_rad=float(np.deg2rad(p["occlusion_angle_eps_deg"])),
+            )
+
         footprint_cfg: FootprintConfig | None = None
         if p["footprint_enable"]:
             footprint_cfg = FootprintConfig(
@@ -330,6 +352,7 @@ class TerrainToolkitNode(Node):
             outlier=outlier_cfg,
             traversability=traversability_cfg,
             filter=filter_cfg,
+            occlusion=occlusion_cfg,
             footprint=footprint_cfg,
             device=device_arg,
         )

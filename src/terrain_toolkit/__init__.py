@@ -14,11 +14,13 @@ from .outlier import (
     RadiusOutlierFilterConfig,
     StatisticalOutlierFilter,
 )
-from .pipeline import TerrainMap, TerrainPipeline
+from .pipeline import TerrainMap, TerrainMapGPU, TerrainPipeline
 from .traversability import (
     FilterConfig,
     GeometricTraversabilityAnalyzer,
     ObstacleInflator,
+    OcclusionConfig,
+    OcclusionMask,
     SupportRatioMask,
     TemporalGate,
     TraversabilityConfig,
@@ -36,6 +38,8 @@ __all__ = [
     "IcpConfig",
     "IcpResult",
     "ObstacleInflator",
+    "OcclusionConfig",
+    "OcclusionMask",
     "OutlierFilterConfig",
     "RadiusOutlierFilter",
     "RadiusOutlierFilterConfig",
@@ -43,6 +47,7 @@ __all__ = [
     "SupportRatioMask",
     "TemporalGate",
     "TerrainMap",
+    "TerrainMapGPU",
     "TerrainPipeline",
     "TraversabilityConfig",
     "TraversabilityCosts",
