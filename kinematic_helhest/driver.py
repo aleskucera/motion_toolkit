@@ -55,9 +55,9 @@ class WarpDriver:
         self.derived = derived[0, 0].copy()  # (z, pitch, roll)
         self.clear, self.alpha, self.resid = 1.0, 1.0, 0.0
 
-    def step(self, omega3):
-        omega = np.asarray(omega3, np.float32).reshape(1, 1, 3)
-        controlled, derived, clear, resid = self.sim.rollout(omega, self.controlled)
+    def step(self, wheel_omega):
+        wheel_omega = np.asarray(wheel_omega, np.float32).reshape(1, 1, 3)
+        controlled, derived, clear, resid = self.sim.rollout(wheel_omega, self.controlled)
         self.controlled = controlled[1, 0].copy()
         self.derived = derived[1, 0].copy()
         self.clear = float(clear[0, 0])

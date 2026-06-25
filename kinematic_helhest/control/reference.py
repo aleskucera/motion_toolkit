@@ -3,14 +3,14 @@
 `_cost` is the readable, independent ORACLE that the GPU `_cost` kernel is differential-tested
 against (tests/control/test_mppi.py): it defines, in plain numpy, what the per-rollout cost
 MEANS, so a kernel that diverges from intent is caught even when the robot still roughly reaches
-the goal. `_to_omega` packs the [B, T, 2] wheel-speed controls into the engine's [T, B, 3] layout.
+the goal. `_to_wheel_omega` packs the [B, T, 2] wheel-speed controls into the engine's [T, B, 3] layout.
 """
 
 import numpy as np
 
 
-def _to_omega(Ub):
-    """Controls [B, T, 2] (wL, wR) -> omega [T, B, 3] (rear = mean)."""
+def _to_wheel_omega(Ub):
+    """Controls [B, T, 2] (wL, wR) -> wheel_omega [T, B, 3] (rear = mean)."""
     bt = np.transpose(Ub, (1, 0, 2))  # [T, B, 2]
     rear = bt.mean(2, keepdims=True)
     return np.concatenate([bt, rear], axis=2).astype(np.float32)

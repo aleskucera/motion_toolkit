@@ -65,7 +65,7 @@ class Simulator:
             self.turning = wp.zeros((n_steps, batch_size), dtype=wp.vec2f)
             self.clearance = wp.zeros((n_steps, batch_size), dtype=wp.float32)
             self.residual = wp.zeros((n_steps, batch_size), dtype=wp.float32)
-            self.omega = wp.zeros((n_steps, batch_size), dtype=wp.vec3f)
+            self.wheel_omega = wp.zeros((n_steps, batch_size), dtype=wp.vec3f)
             self.start_pose = wp.zeros(batch_size, dtype=wp.vec3f)
 
     def set_terrain(self, elevation: wp.array):
@@ -112,7 +112,7 @@ class Simulator:
     def rollout_launch(self):
         """Launch the whole rollout (init + T steps) in ONE fused kernel; NO host I/O.
 
-        `self.omega` must already hold the controls and `self.start_pose` the init pose
+        `self.wheel_omega` must already hold the controls and `self.start_pose` the init pose
         (e.g. filled on-device by the GPU MPPI sampler). Results stay on device in
         controlled/derived/loads/turning/clearance/residual -- the graph-capturable core.
         Forward-only fusion (~1.2x vs per-step launches); the differentiable path uses
@@ -130,7 +130,7 @@ class Simulator:
                 self.robot,
                 self.solver,
                 self.start_pose,
-                self.omega,
+                self.wheel_omega,
             ],
             outputs=[
                 self.controlled,
@@ -143,10 +143,10 @@ class Simulator:
             device=self.device,
         )
 
-    def rollout(self, omega_np, init_pose):
-        """omega_np [T, B, 3], init_pose (x,y,yaw) shared by all rollouts. Returns
+    def rollout(self, wheel_omega, init_pose):
+        """wheel_omega [T, B, 3], init_pose (x,y,yaw) shared by all rollouts. Returns
         controlled [T+1,B,3] (x,y,yaw), derived [T+1,B,3] (z,pitch,roll), clear/resid [T,B]."""
-        self.omega.assign(np.ascontiguousarray(omega_np, np.float32))
+        self.wheel_omega.assign(np.ascontiguousarray(wheel_omega, np.float32))
         self.start_pose.assign(
             np.ascontiguousarray(
                 np.tile(np.asarray(init_pose, np.float32), (self.batch_size, 1)), np.float32

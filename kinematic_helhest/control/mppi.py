@@ -1,16 +1,17 @@
 """GPU-resident MPPI inner loop (sample -> rollout -> cost -> reweight) + CUDA graph.
 
-The numpy MPPI loop is host-bound: per refine ~15 ms of numpy (cost, noise, omega)
+The numpy MPPI loop is host-bound: per refine ~15 ms of numpy (cost, noise, wheel_omega)
 vs ~2.7 ms of GPU work. These Warp kernels move the whole refine onto the device so
 nothing but the executed pose ever comes back, and the refine is captured as a CUDA
 graph and replayed. `reference._cost` stays the numpy oracle for the parity test.
 
 Kernels (all suffixed _kernel):
-  _sample_omega  spline-knot noise -> Ub -> writes the rollout's omega buffer (rear -> 0)
+  _sample_wheel_omega  spline-knot noise -> Ub -> writes the rollout's wheel_omega buffer (rear -> 0)
   _cost          per-rollout scalar cost J[B] (cost-to-go goal V^2 + graded-infeasible + effort/smooth)
   _minmax/_bisect_*/_count_below/_elite_u   CEM reweight (top-k elite mean) of U, on device
   _bump_seed/_reset_minmax     device-side RNG counter + reduction resets (graph-safe)
 """
+
 from dataclasses import dataclass
 
 import numpy as np
@@ -22,7 +23,14 @@ from ..engine.terrain import _locate
 from ..engine.terrain import Grid
 from ..profiling import StageProfiler
 
-_N_BISECT = 14  # device-side bisection iterations for the CEM top-k threshold
+
+def _n_bisect(n_cand: int) -> int:
+    """Device-side bisection steps for the CEM elite threshold tau. Each step halves the search
+    interval, so n steps resolve tau to (jmax - jmin) / 2^n of the cost range. We want that finer
+    than the spacing between candidate costs (~(jmax - jmin) / n_cand) so #{J_cand <= tau} lands on
+    target_k -> ceil(log2(n_cand)) bits + 5 (~32x margin). A FIXED count (not data-dependent) is what
+    keeps the refine CUDA-graph-capturable -- a host sort/partition would need a readback + sync."""
+    return int(np.ceil(np.log2(max(2, n_cand)))) + 5
 
 
 @dataclass
@@ -144,7 +152,7 @@ def _knot_bracket(t: int, horizon: int, n_knots: int):
 
 
 @wp.kernel
-def _sample_omega_kernel(
+def _sample_wheel_omega_kernel(
     U: wp.array2d(dtype=float),
     sigma: float,
     sigma_knot: float,
@@ -155,16 +163,16 @@ def _sample_omega_kernel(
     n_scen: int,  # slip scenarios per candidate (= n_slip; 1 = non-robust)
     slip: wp.array2d(dtype=float),  # [n_scen, 2] wheel-speed retention; scenario 0 = (1, 1)
     seed: wp.array(dtype=int),
-    omega: wp.array2d(dtype=wp.vec3),
+    wheel_omega: wp.array2d(dtype=wp.vec3),
 ):
     # rollout r = candidate b * n_scen + scenario k: all scenarios of a candidate share the SAME
     # sampled control (noise keyed on b), then scenario k scales the wheels by its slip. So the cost
     # sees how each candidate holds up across the disturbance. n_scen=1 -> b=r, slip=(1,1) (today).
     t, r = wp.tid()
-    n_cand = omega.shape[1] // n_scen
+    n_cand = wheel_omega.shape[1] // n_scen
     b = r // n_scen
     k = r % n_scen
-    horizon = omega.shape[0]
+    horizon = wheel_omega.shape[0]
     knot_lo, knot_hi, frac = _knot_bracket(t, horizon, n_knots)
     wheel_l = U[t, 0]
     wheel_r = U[t, 1]
@@ -200,7 +208,7 @@ def _sample_omega_kernel(
         wheel_l += sigma * wp.randn(jitter)
         wheel_r += sigma * wp.randn(jitter)
     # apply scenario k's wheel slip, then clamp to the forward-arc box (wmin >= 0 -> no reverse)
-    omega[t, r] = wp.vec3(
+    wheel_omega[t, r] = wp.vec3(
         wp.clamp(wheel_l * slip[k, 0], wmin, wmax), wp.clamp(wheel_r * slip[k, 1], wmin, wmax), 0.0
     )
 
@@ -211,7 +219,7 @@ def _cost_kernel(
     derived: wp.array2d(dtype=wp.vec3),
     clearance: wp.array2d(dtype=float),
     residual: wp.array2d(dtype=float),
-    omega: wp.array2d(dtype=wp.vec3),  # Ub in components [0], [1]
+    wheel_omega: wp.array2d(dtype=wp.vec3),  # Ub in components [0], [1]
     goal: wp.array(dtype=float),  # [2] world goal (device -> graph-safe, changes per replan)
     grid: Grid,  # geometry for sampling lattice_field at the rollout pose
     lattice_field: wp.array3d(
@@ -257,7 +265,7 @@ def _cost_kernel(
     prev_l = float(0.0)
     prev_r = float(0.0)
     for t in range(horizon):
-        wheels = omega[t, r]  # (wL, wR)
+        wheels = wheel_omega[t, r]  # (wL, wR)
         sp2 = wheels[0] * wheels[0] + wheels[1] * wheels[1]
         effort_sum += sp2
         if t > 0:
@@ -383,7 +391,7 @@ def _elite_u_kernel(
     J_cand: wp.array(dtype=float),
     tau: wp.array(dtype=float),
     count: wp.array(dtype=float),
-    omega: wp.array2d(dtype=wp.vec3),
+    wheel_omega: wp.array2d(dtype=wp.vec3),
     n_scen: int,
     wmin: float,
     wmax: float,
@@ -394,7 +402,7 @@ def _elite_u_kernel(
     elite_sum = float(0.0)
     for b in range(n_cand):
         if J_cand[b] <= tau[0]:  # elite candidate
-            elite_sum += omega[t, b * n_scen][wheel]  # scenario 0 = the un-slipped control
+            elite_sum += wheel_omega[t, b * n_scen][wheel]  # scenario 0 = the un-slipped control
     U[t, wheel] = wp.clamp(elite_sum / count[0], wmin, wmax)  # unweighted elite mean (forward arcs)
 
 
@@ -438,6 +446,7 @@ class MppiGpu:
                 f"sim.batch_size ({self.n_rollouts}) must be divisible by n_slip_samples ({self.n_slip})"
             )
         self.n_cand = self.n_rollouts // self.n_slip
+        self.n_bisect = _n_bisect(self.n_cand)  # CEM threshold bisection steps (scales with n_cand)
         # CVaR = mean of each candidate's worst m_tail slip scenarios
         self.m_tail = max(1, int(round(robust.cvar_beta * self.n_slip)))
         self.sampling, self.robust = sampling, robust  # keep the configs; read fields through them
@@ -520,7 +529,7 @@ class MppiGpu:
         self._prof.mark(0)
         wp.launch(_bump_seed_kernel, 1, inputs=[self.seed], device=self.device)
         wp.launch(
-            _sample_omega_kernel,
+            _sample_wheel_omega_kernel,
             (self.horizon, self.n_rollouts),
             inputs=[
                 self.U,
@@ -534,7 +543,7 @@ class MppiGpu:
                 self.slip,
                 self.seed,
             ],
-            outputs=[self.sim.omega],
+            outputs=[self.sim.wheel_omega],
             device=self.device,
         )
         self._prof.mark(1)  # sample done
@@ -548,7 +557,7 @@ class MppiGpu:
                 self.sim.derived,
                 self.sim.clearance,
                 self.sim.residual,
-                self.sim.omega,
+                self.sim.wheel_omega,
                 self.goal,
                 self.lattice_grid,
                 self.lattice_field,
@@ -606,7 +615,7 @@ class MppiGpu:
             ],
             device=self.device,
         )
-        for _ in range(_N_BISECT):
+        for _ in range(self.n_bisect):
             wp.launch(
                 _count_below_kernel,
                 self.n_cand,
@@ -633,7 +642,7 @@ class MppiGpu:
                 self.J_cand,
                 self.tau,
                 self.count,
-                self.sim.omega,
+                self.sim.wheel_omega,
                 self.n_slip,
                 self.sampling.wmin,
                 self.sampling.wmax,

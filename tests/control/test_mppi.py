@@ -15,7 +15,7 @@ from kinematic_helhest import friction
 from kinematic_helhest import heightmap as hmmod
 from kinematic_helhest.control import mppi as mg
 from kinematic_helhest.control.reference import _cost as cost_np
-from kinematic_helhest.control.reference import _to_omega
+from kinematic_helhest.control.reference import _to_wheel_omega
 from kinematic_helhest.engine import GridParams
 from kinematic_helhest.engine import RobotParams
 from kinematic_helhest.engine import Simulator
@@ -61,8 +61,8 @@ def selftest_cost_parity(device="cuda", B=2048, T=70):
 
     # arbitrary fan
     Ub = np.clip(rng.normal(1.5, _WMAX, (B, T, 2)), -_WMAX, _WMAX).astype(np.float32)
-    # same rollout feeds both: assign omega (= Ub) + start, launch, read back for the oracle.
-    cc, dd, cl, rs = sim.rollout(_to_omega(Ub), start)
+    # same rollout feeds both: assign wheel_omega (= Ub) + start, launch, read back for the oracle.
+    cc, dd, cl, rs = sim.rollout(_to_wheel_omega(Ub), start)
     J_np, _ = cost_np(cc, dd, cl, rs, Ub, _LAT_CONST, _CM, _RT, _W)
 
     goal_d = wp.array(goal.astype(np.float32), dtype=float, device=device)
@@ -87,7 +87,7 @@ def selftest_cost_parity(device="cuda", B=2048, T=70):
             sim.derived,
             sim.clearance,
             sim.residual,
-            sim.omega,
+            sim.wheel_omega,
             goal_d,
             sim.grid,
             lat_field,
@@ -122,7 +122,7 @@ def selftest_reweight_parity(device="cuda", B=2048, T=70, elite_frac=0.1):
 
     # GPU: bisection top-k threshold -> elite mean
     Jd = wp.array(J, dtype=float, device=device)
-    omega = wp.array(_to_omega(Ub), dtype=wp.vec3, device=device)
+    wheel_omega = wp.array(_to_wheel_omega(Ub), dtype=wp.vec3, device=device)
     jmin = wp.zeros(1, dtype=float, device=device)
     jmax = wp.zeros(1, dtype=float, device=device)
     lo = wp.zeros(1, dtype=float, device=device)
@@ -133,7 +133,7 @@ def selftest_reweight_parity(device="cuda", B=2048, T=70, elite_frac=0.1):
     wp.launch(mg._reset_minmax_kernel, 1, inputs=[jmin, jmax, count], device=device)
     wp.launch(mg._minmax_kernel, B, inputs=[Jd, jmin, jmax], device=device)
     wp.launch(mg._bisect_init_kernel, 1, inputs=[jmin, jmax, lo, hi, tau, count], device=device)
-    for _ in range(mg._N_BISECT):
+    for _ in range(mg._n_bisect(B)):  # n_scen=1 -> n_cand == B
         wp.launch(mg._count_below_kernel, B, inputs=[Jd, tau, count], device=device)
         wp.launch(
             mg._bisect_step_kernel, 1, inputs=[count, float(target_k), lo, hi, tau], device=device
@@ -142,7 +142,7 @@ def selftest_reweight_parity(device="cuda", B=2048, T=70, elite_frac=0.1):
     wp.launch(
         mg._elite_u_kernel,
         (T, 2),
-        inputs=[Jd, tau, count, omega, 1, -_WMAX, _WMAX, B, Ud],
+        inputs=[Jd, tau, count, wheel_omega, 1, -_WMAX, _WMAX, B, Ud],
         device=device,
     )  # n_scen=1
     U_gpu = Ud.numpy()

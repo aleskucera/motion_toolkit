@@ -21,7 +21,7 @@ import warp as wp
 
 from kinematic_helhest import friction
 from kinematic_helhest import heightmap as hmmod
-from kinematic_helhest.control.reference import _to_omega
+from kinematic_helhest.control.reference import _to_wheel_omega
 from kinematic_helhest.engine import GridParams
 from kinematic_helhest.engine import RobotParams
 from kinematic_helhest.engine import Simulator
@@ -49,9 +49,9 @@ def check_forward_parity():
     """CUDA step rollout vs CPU step rollout on the same node grid."""
     scene, mu = hmmod.box_scene(), friction.uniform(0.8)
     B, T, start = 64, 40, (-1.0, 0.0, 0.0)
-    omega = _to_omega(np.full((B, T, 2), 2.0, np.float32))
-    pc, tc, _, _ = _sim(scene, mu, B, T, "cpu").rollout(omega, start)
-    pg, tg, _, _ = _sim(scene, mu, B, T, "cuda").rollout(omega, start)
+    wheel_omega = _to_wheel_omega(np.full((B, T, 2), 2.0, np.float32))
+    pc, tc, _, _ = _sim(scene, mu, B, T, "cpu").rollout(wheel_omega, start)
+    pg, tg, _, _ = _sim(scene, mu, B, T, "cuda").rollout(wheel_omega, start)
     dp = float(np.abs(pc - pg).max())
     dt = float(np.abs(tc - tg).max())
     print(f"  forward CUDA-vs-CPU  dplanar={dp:.2e}  dtilt={dt:.2e}")
@@ -91,13 +91,13 @@ def time_rollout(B=2048, T=70, reps=30):
     scene = hmmod.demo_terrain()
     mu = friction.uniform(0.8, xlim=(-3.0, 10.0), ylim=(-4.0, 4.0), cell=0.06)
     sim = _sim(scene, mu, B, T, "cuda")
-    omega = _to_omega(np.full((B, T, 2), 2.0, np.float32))
+    wheel_omega = _to_wheel_omega(np.full((B, T, 2), 2.0, np.float32))
     start = (0.0, 0.0, 0.0)
-    sim.rollout(omega, start)  # warm up: triggers CUDA codegen + first launch
+    sim.rollout(wheel_omega, start)  # warm up: triggers CUDA codegen + first launch
     wp.synchronize_device("cuda")
     t0 = time.perf_counter()
     for _ in range(reps):
-        sim.rollout(omega, start)
+        sim.rollout(wheel_omega, start)
     wp.synchronize_device("cuda")
     dt = (time.perf_counter() - t0) / reps
     print(

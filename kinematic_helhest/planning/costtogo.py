@@ -142,7 +142,7 @@ class CostToGo:
         py = (self.grid.origin_y + rr * self.grid.cell_size).ravel().astype(np.float32)
         ph = ((tt + 0.5) * 2.0 * np.pi / n_theta).ravel().astype(np.float32)  # bin-center heading
         self.settle_sim.start_pose.assign(np.stack([px, py, ph], 1))
-        self.settle_sim.omega.zero_()
+        self.settle_sim.wheel_omega.zero_()
         self._mu = Heightmap(
             np.full((self.grid.cells_y, self.grid.cells_x), 0.8, np.float32),
             (self.grid.origin_x, self.grid.origin_y),

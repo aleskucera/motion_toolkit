@@ -343,7 +343,7 @@ def step_kernel(
     grid: Grid,
     robot: Robot,
     solver: Solver,
-    omega: wp.array(dtype=wp.vec3),  # [B] (wL, wR, w_rear) this step
+    wheel_omega: wp.array(dtype=wp.vec3),  # [B] (wL, wR, w_rear) this step
     controlled: wp.array(dtype=wp.vec3),  # [B] (x, y, yaw) current state
     derived: wp.array(dtype=wp.vec3),  # [B] (z, pitch, roll) current state
     controlled_next: wp.array(dtype=wp.vec3),  # [B] (x, y, yaw) settled NEW state -> written
@@ -379,7 +379,7 @@ def step_kernel(
     alpha = 1.0 + solver.k_turn * total_grip / (robot.gravity * robot.mass)  # turn resistance
 
     # --- predict: twist through the CURRENT orientation, Euler integrate ---
-    om = omega[tid]
+    om = wheel_omega[tid]
     vx = robot.wheel_radius * (om[0] + om[1]) / 2.0
     wz = robot.wheel_radius * (om[1] - om[0]) / (2.0 * robot.half_track * alpha)
     vy = -x_icr * wz
@@ -413,7 +413,7 @@ def rollout_kernel(
     robot: Robot,
     solver: Solver,
     start_pose: wp.array(dtype=wp.vec3),  # [B] (x, y, yaw)
-    omega: wp.array2d(dtype=wp.vec3),  # [T, B] (wL, wR, w_rear)
+    wheel_omega: wp.array2d(dtype=wp.vec3),  # [T, B] (wL, wR, w_rear)
     controlled: wp.array2d(dtype=wp.vec3),  # [T+1, B] (x, y, yaw)
     derived: wp.array2d(dtype=wp.vec3),  # [T+1, B] (z, pitch, roll)
     loads_out: wp.array2d(dtype=wp.vec3),  # [T, B]
@@ -461,7 +461,7 @@ def rollout_kernel(
         x_icr = grip_x / total_grip  # grip-weighted ICR offset
         alpha = 1.0 + solver.k_turn * total_grip / (robot.gravity * robot.mass)  # turn resistance
 
-        om = omega[t, b]
+        om = wheel_omega[t, b]
         vx = robot.wheel_radius * (om[0] + om[1]) / 2.0
         wz = robot.wheel_radius * (om[1] - om[0]) / (2.0 * robot.half_track * alpha)
         vy = -x_icr * wz

@@ -368,7 +368,7 @@ def run(
                 )  # per-rollout validity
                 elite = (
                     np.argsort(planner.J_cand.numpy())[: max(8, int(0.02 * planner.n_cand))]
-                    * planner.K
+                    * planner.n_slip
                 )
                 fan = dict(
                     ctr=planner.sim.controlled.numpy(),
