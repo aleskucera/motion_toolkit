@@ -43,7 +43,9 @@ if TYPE_CHECKING:
 
 @wp.kernel
 def _clamp3d_kernel(
-    v_in: wp.array3d(dtype=wp.float32), vcap: wp.float32, v_out: wp.array3d(dtype=wp.float32)
+    v_in: wp.array3d(dtype=wp.float32),
+    vcap: wp.float32,
+    v_out: wp.array3d(dtype=wp.float32),
 ):
     """Copy V, replacing the solver's +inf (unreachable) with a large finite cap so the cost
     kernel's trilinear sampling never blends to inf."""
@@ -60,7 +62,7 @@ def _feasibility_kernel(
     derived: wp.array2d(dtype=wp.vec3f),  # (z, pitch, roll) per pose; row 0 = the static settle
     residual: wp.array2d(dtype=wp.float32),
     clearance: wp.array2d(dtype=wp.float32),
-    robot: Robot,  # limits/weights (radians) -- the same struct the rollouts drive
+    robot: Robot,
     blocked: wp.array3d(dtype=wp.float32),
     tilt: wp.array3d(dtype=wp.float32),
 ):
@@ -93,14 +95,10 @@ def _goal_cell_kernel(
     resolution: wp.float32,
     height: wp.int32,
     width: wp.int32,
-    goal_rc: wp.array(dtype=wp.int32),  # [2] out (row, col) -- keeps the goal ON DEVICE (graph-safe)
+    goal_rc: wp.array(dtype=wp.int32),  # [2] out (row, col)
 ):
-    """Map the world goal to its grid cell on device, so the whole solve can be captured once as a
-    graph and replayed with a moving goal (no host-side cell index baked into the graph). dim=1."""
     goal_rc[0] = wp.clamp(int((goal_xy[1] - ymin) / resolution), 0, height - 1)  # row from y
     goal_rc[1] = wp.clamp(int((goal_xy[0] - xmin) / resolution), 0, width - 1)  # col from x
-
-
 
 
 class CostToGo:
@@ -168,16 +166,15 @@ class CostToGo:
         )
         self.blocked = wp.zeros_like(self.V)
         self.graded_tilt = wp.zeros_like(self.V)
-        # Tier-2 device capture: stable buffers the captured graph reads (refreshed each call OUTSIDE
-        # the graph), the goal cell computed on device, and the cached graph (one replayable solve).
-        xmin, _, ymin, _ = self.bounds
-        self._xmin, self._ymin = float(xmin), float(ymin)
+
         self._elev_in = wp.zeros((ny, nx), dtype=wp.float32, device=self.device)
         self._goal_xy = wp.zeros(2, dtype=wp.float32, device=self.device)
         self._goal_rc = wp.zeros(2, dtype=wp.int32, device=self.device)
         self._graph = None
-        # opt-in per-stage profiling (CUDA-event timing inside the captured graph; off = zero overhead)
-        self._prof = StageProfiler(self.device, ("settle", "feasibility", "route", "clamp"), profile)
+
+        self._prof = StageProfiler(
+            self.device, ("settle", "feasibility", "route", "clamp"), profile
+        )
         self._n_compute = 0
 
     def reset_timing(self) -> None:
@@ -212,8 +209,8 @@ class CostToGo:
             dim=1,
             inputs=[
                 self._goal_xy,
-                self._xmin,
-                self._ymin,
+                self.bounds[0],
+                self.bounds[2],
                 self.grid.cell_size,
                 self.grid.cells_y,
                 self.grid.cells_x,
@@ -241,9 +238,10 @@ class CostToGo:
         assert (
             elevation.device == self.device
         ), f"elevation must be a wp.array on {self.device}, got {elevation.device}"
-        # refresh the stable inputs OUTSIDE the graph; the captured graph reads these owned buffers.
+
         wp.copy(self._elev_in, elevation)
         self._goal_xy.assign(np.asarray(goal_xy[:2], np.float32))
+
         if self.device.is_cuda:
             if self._graph is None:
                 with wp.ScopedCapture(device=self.device) as cap:
@@ -252,7 +250,8 @@ class CostToGo:
             wp.capture_launch(self._graph)
         else:
             self._record_compute(capture=False)
+
         self._n_compute += 1
-        if self._prof.enabled and self._n_compute > 1:  # skip the first (graph-build / warmup) sample
+        if self._prof.enabled and self._n_compute > 1:  # skip the graph-build sample
             self._prof.accumulate()
         return self.V

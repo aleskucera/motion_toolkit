@@ -16,7 +16,10 @@ import warp as wp
 
 
 @wp.kernel
-def _free_goal_kernel(blocked: wp.array(dtype=wp.float32, ndim=3), goal_rc: wp.array(dtype=wp.int32)):
+def _free_goal_kernel(
+    blocked: wp.array(dtype=wp.float32, ndim=3),
+    goal_rc: wp.array(dtype=wp.int32),
+):
     """Force the goal cell feasible at every heading, so the value iteration always has a source."""
     t = wp.tid()
     blocked[goal_rc[0], goal_rc[1], t] = 0.0
@@ -122,7 +125,9 @@ def _relax_lattice_pose_kernel(
         changed[0] = 1
 
 
-def _build_primitives(n_theta, resolution, step, turn_radius, max_sweep, nseg):
+def _build_primitives(
+    n_theta: int, resolution: float, step: float, turn_radius: float, max_sweep: int, nseg: int
+) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Host-side forward-arc motion primitives. For each heading bin and each turn rate, integrate
     the arc of length `step`, and record: endpoint cell offset (dr, dc), resulting heading bin, arc
     cost, and the swept cells (offsets) the arc passes through (for collision). Min turn radius
@@ -188,8 +193,10 @@ class LatticeValueSolver:
         step_cells = self._step / self.resolution
         max_sweep = max(6, int(math.ceil(step_cells)) * 2 + 3)
         nseg = max(8, int(step_cells * 4))
-        n_prim, prim_dr, prim_dc, prim_heading, prim_cost, sweep_dr, sweep_dc, sweep_n = _build_primitives(
-            self.n_theta, self.resolution, self._step, float(turn_radius), max_sweep, nseg
+        n_prim, prim_dr, prim_dc, prim_heading, prim_cost, sweep_dr, sweep_dc, sweep_n = (
+            _build_primitives(
+                self.n_theta, self.resolution, self._step, float(turn_radius), max_sweep, nseg
+            )
         )
         self.n_prim = n_prim
         # motion-primitive table on device, indexed [heading_bin, primitive]: where each forward arc
@@ -197,20 +204,37 @@ class LatticeValueSolver:
         with wp.ScopedDevice(self.device):
             self._prim_dr = wp.array(prim_dr, dtype=wp.int32)  # endpoint row offset of the arc
             self._prim_dc = wp.array(prim_dc, dtype=wp.int32)  # endpoint col offset
-            self._prim_heading = wp.array(prim_heading, dtype=wp.int32)  # heading bin the arc ends at
-            self._prim_cost = wp.array(prim_cost, dtype=wp.float32)  # arc length (the move's base cost)
-            self._sweep_dr = wp.array(sweep_dr, dtype=wp.int32)  # row offsets of the cells the arc crosses
+            self._prim_heading = wp.array(
+                prim_heading, dtype=wp.int32
+            )  # heading bin the arc ends at
+            self._prim_cost = wp.array(
+                prim_cost, dtype=wp.float32
+            )  # arc length (the move's base cost)
+            self._sweep_dr = wp.array(
+                sweep_dr, dtype=wp.int32
+            )  # row offsets of the cells the arc crosses
             self._sweep_dc = wp.array(sweep_dc, dtype=wp.int32)  # col offsets of those swept cells
             self._sweep_n = wp.array(sweep_n, dtype=wp.int32)  # how many swept cells each arc has
             # two value buffers, ping-ponged each sweep (read one, write the other, swap); +changed flag
             self._dist_a = wp.zeros((self.height, self.width, self.n_theta), dtype=wp.float32)
             self._dist_b = wp.zeros((self.height, self.width, self.n_theta), dtype=wp.float32)
-            self._changed = wp.zeros(1, dtype=wp.int32)  # >0 if any cell improved this sweep (convergence)
-            self._keep_running = wp.zeros(1, dtype=wp.int32)  # device while-condition for capture_while
+            self._changed = wp.zeros(
+                1, dtype=wp.int32
+            )  # >0 if any cell improved this sweep (convergence)
+            self._keep_running = wp.zeros(
+                1, dtype=wp.int32
+            )  # device while-condition for capture_while
             self._iter = wp.zeros(1, dtype=wp.int32)
         self._cap = self.height + self.width  # max bodies (each = 2 sweeps -> 2*(h+w) sweeps total)
 
-    def _relax(self, dist_in, dist_out, blocked, tilt, tilt_weight):
+    def _relax(
+        self,
+        dist_in: wp.array,
+        dist_out: wp.array,
+        blocked: wp.array,
+        tilt: wp.array,
+        tilt_weight: float,
+    ) -> None:
         """One min-relaxation sweep dist_in -> dist_out (race-free pull); raises self._changed if any
         cell improved."""
         wp.launch(
@@ -235,25 +259,38 @@ class LatticeValueSolver:
             device=self.device,
         )
 
-    def _record_solve(self, blocked, tilt, goal_rc, tilt_weight, capture):
+    def _record_solve(
+        self,
+        blocked: wp.array,
+        tilt: wp.array,
+        goal_rc: wp.array,
+        tilt_weight: float,
+        capture: bool,
+    ) -> wp.array:
         """Record the device-side value iteration: free the goal cell, seed, then min-relax to a fixed
         point. The convergence loop runs ON DEVICE via capture_while (graph-safe) -- a 2-SWEEP body
         (a->b->a) keeps the ping-pong buffers fixed inside the captured graph, so the result always
-        lands in self._dist_a. capture=False uses an eager host while-loop (CPU / no-graph fallback)."""
-        dev = self.device
+        lands in self._dist_a. capture=False uses an eager host while-loop (CPU / no-graph fallback).
+        """
         grid_dim = (self.height, self.width, self.n_theta)
-        wp.launch(_free_goal_kernel, dim=self.n_theta, inputs=[blocked, goal_rc], device=dev)
+
+        wp.launch(
+            _free_goal_kernel,
+            dim=self.n_theta,
+            inputs=[blocked, goal_rc],
+            device=self.device,
+        )
         wp.launch(
             _init_lattice_kernel,
             dim=grid_dim,
             inputs=[goal_rc, self._inf],
             outputs=[self._dist_a],
-            device=dev,
+            device=self.device,
         )
         self._keep_running.fill_(1)
         self._iter.zero_()
 
-        def body():
+        def body() -> None:
             self._changed.zero_()
             self._relax(self._dist_a, self._dist_b, blocked, tilt, tilt_weight)
             self._relax(self._dist_b, self._dist_a, blocked, tilt, tilt_weight)
@@ -261,7 +298,7 @@ class LatticeValueSolver:
                 _keep_going_kernel,
                 dim=1,
                 inputs=[self._changed, self._iter, self._cap, self._keep_running],
-                device=dev,
+                device=self.device,
             )
 
         if capture:
