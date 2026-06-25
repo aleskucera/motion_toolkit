@@ -26,6 +26,7 @@ import warp as wp
 from .. import dynamics
 from .. import worlds as W
 from ..control.mppi import MppiGpu
+from ..control.mppi import RobustConfig
 from ..control.terminal import dock_control
 from ..driver import WarpDriver
 from ..engine import GridParams
@@ -220,17 +221,7 @@ def run(
         dynamics.robot_params(), dynamics.planning_solver(), win_grid, 4096, 70, device
     )
     plan_sim.set_uniform_friction(0.8)
-    planner = MppiGpu(
-        plan_sim,
-        0.5,
-        4.0,
-        _LATTICE_W,
-        0,
-        sigma_knot=1.0,
-        n_knots=4,
-        n_scenarios=K,
-        n_theta=24,
-    )
+    planner = MppiGpu(plan_sim, _LATTICE_W, robust=RobustConfig(n_scenarios=K), n_theta=24)
     planner.reset_nominal(1.5)
     rww = rwh = int(round(max(route_m, win_m) / cell))
     kr = max(1, int(lat_coarsen))

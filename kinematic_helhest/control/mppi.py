@@ -12,6 +12,8 @@ Kernels (all suffixed _kernel):
   _bump_seed/_reset_minmax     device-side RNG counter + reduction resets (graph-safe)
 """
 
+from dataclasses import dataclass
+
 import numpy as np
 import warp as wp
 
@@ -21,6 +23,46 @@ from ..engine.terrain import Grid
 from ..profiling import StageProfiler
 
 _N_BISECT = 14  # device-side bisection iterations for the CEM top-k threshold
+
+
+@dataclass
+class SamplingConfig:
+    """MppiGpu config: how candidates are sampled + the elite selected each refine."""
+
+    sigma: float = 0.5  # per-step Gaussian jitter on the wheel speeds
+    sigma_knot: float = 1.0  # spline-knot noise -> smooth committed maneuvers
+    n_knots: int = 4  # control knots spread over the horizon
+    wmin: float = 0.0  # wheel-speed box [wmin, wmax]; wmin >= 0 -> no reverse
+    wmax: float = 4.0
+    wide_frac: float = 0.25  # fraction of candidates drawn from the WIDE global-search prior
+    elite_frac: float = 0.02  # CEM top-k elite fraction
+
+
+@dataclass
+class RobustConfig:
+    """MppiGpu config: CVaR-over-wheel-slip robustness (option F). n_scenarios=1 -> plain MPPI."""
+
+    n_scenarios: int = 1  # K slip scenarios per candidate
+    cvar_beta: float = 0.5  # CVaR tail fraction (the candidate's cost = mean of its worst beta*K)
+    slip_lo: float = 0.6  # slip-retention lower bound for the sampled scenarios
+
+
+@wp.struct
+class CostWeights:
+    """Per-rollout cost WEIGHTS, baked once (fixed per planner). The robot's envelope + feasibility
+    thresholds (roll/pitch limits, roll/pitch cost shape, clear_margin, resid_tol) come from the Robot
+    struct the kernel is handed -- one source of truth shared with the cost-to-go feasibility."""
+
+    goal_terminal: float
+    goal_running: float
+    explore_fallback: float
+    # the cost-to-go's unreachable cap (planner.cw.lattice_cap = ctg._vcap); V >= it means the goal
+    # is unreachable in-window (the field is flat) -> arm the explore_fallback straight-line pull
+    lattice_cap: float
+    out_of_bounds: float
+    effort: float
+    smoothness: float
+    infeasible: float
 
 
 @wp.func
@@ -129,24 +171,6 @@ def _sample_omega_kernel(
     omega[t, r] = wp.vec3(
         wp.clamp(wheel_l * slip[k, 0], wmin, wmax), wp.clamp(wheel_r * slip[k, 1], wmin, wmax), 0.0
     )
-
-
-@wp.struct
-class CostWeights:
-    """Per-rollout cost WEIGHTS, baked once (fixed per planner). The robot's envelope + feasibility
-    thresholds (roll/pitch limits, roll/pitch cost shape, clear_margin, resid_tol) come from the Robot
-    struct the kernel is handed -- one source of truth shared with the cost-to-go feasibility."""
-
-    goal_terminal: float
-    goal_running: float
-    explore_fallback: float
-    # the cost-to-go's unreachable cap (planner.cw.lattice_cap = ctg._vcap); V >= it means the goal
-    # is unreachable in-window (the field is flat) -> arm the explore_fallback straight-line pull
-    lattice_cap: float
-    out_of_bounds: float
-    effort: float
-    smoothness: float
-    infeasible: float
 
 
 @wp.kernel
@@ -356,36 +380,30 @@ class MppiGpu:
     def __init__(
         self,
         sim,
-        sigma,
-        wmax,
         weights,
-        seed=0,
-        sigma_knot=0.0,
-        n_knots=4,
-        elite_frac=0.02,
-        wmin=0.0,
-        wide_frac=0.25,
-        n_scenarios=1,
-        cvar_beta=0.5,
-        slip_lo=0.6,
+        sampling=None,  # SamplingConfig (noise / wheel-speed box / elite fraction)
+        robust=None,  # RobustConfig (CVaR over wheel-slip scenarios)
         n_theta=16,
+        seed=0,
         profile=False,  # opt-in per-stage CUDA-event timing of the refine loop (tiny event nodes)
     ):
+        sampling = sampling or SamplingConfig()
+        robust = robust or RobustConfig()
         self.sim = sim
         self.dev = sim.device
         self.B, self.T = sim.B, sim.T
         # robust eval (option F): the B rollouts are n_cand candidates x K slip scenarios.
         # K=1 is non-robust (one scenario, no slip) -> identical to plain MPPI.
-        self.K = int(n_scenarios)
+        self.K = int(robust.n_scenarios)
         if self.B % self.K != 0:
             raise ValueError(f"sim.B ({self.B}) must be divisible by n_scenarios ({self.K})")
         self.n_cand = self.B // self.K
-        self.m_tail = max(1, int(round(float(cvar_beta) * self.K)))  # CVaR = mean of worst m_tail
-        self.sigma, self.wmax, self.wmin = float(sigma), float(wmax), float(wmin)
-        self.sigma_knot, self.n_knots = float(sigma_knot), int(n_knots)
-        self.n_wide = int(float(wide_frac) * self.n_cand)  # candidates drawn from the WIDE prior
+        self.m_tail = max(1, int(round(robust.cvar_beta * self.K)))  # CVaR = mean of worst m_tail
+        self.sigma, self.wmax, self.wmin = sampling.sigma, sampling.wmax, sampling.wmin
+        self.sigma_knot, self.n_knots = sampling.sigma_knot, sampling.n_knots
+        self.n_wide = int(sampling.wide_frac * self.n_cand)  # candidates drawn from the WIDE prior
         # CEM elite count (over candidates)
-        self.target_k = float(int(float(elite_frac) * self.n_cand))
+        self.target_k = float(int(sampling.elite_frac * self.n_cand))
         w = weights
         cw = CostWeights()
         cw.goal_terminal = float(w.get("goal_terminal", 0.0))
@@ -405,7 +423,7 @@ class MppiGpu:
         slip = np.ones((self.K, 2), np.float32)  # scenario 0 = no slip; rest sample the disturbance
         if self.K > 1:
             rng = np.random.default_rng(int(seed) + 4242)
-            slip[1:] = rng.uniform(float(slip_lo), 1.0, (self.K - 1, 2)).astype(np.float32)
+            slip[1:] = rng.uniform(robust.slip_lo, 1.0, (self.K - 1, 2)).astype(np.float32)
         self.slip = wp.array(slip, dtype=float, device=d)
         self.U = wp.zeros((self.T, 2), dtype=float, device=d)
         self.J = wp.zeros(self.B, dtype=float, device=d)  # cost per scenario-rollout

@@ -18,6 +18,7 @@ import warp as wp
 from . import dynamics
 from . import worlds as W
 from .control.mppi import MppiGpu
+from .control.mppi import RobustConfig
 from .control.terminal import dock_control
 from .driver import WarpDriver
 from .engine import GridParams
@@ -60,17 +61,7 @@ def evaluate(
         wp.array(np.ascontiguousarray(scene.H, np.float32), dtype=wp.float32, device=device)
     )
     plan_sim.set_friction(mu)
-    planner = MppiGpu(
-        plan_sim,
-        0.5,
-        4.0,
-        _LATTICE_W,
-        0,
-        sigma_knot=1.0,
-        n_knots=4,
-        n_scenarios=K,
-        n_theta=n_theta,
-    )
+    planner = MppiGpu(plan_sim, _LATTICE_W, robust=RobustConfig(n_scenarios=K), n_theta=n_theta)
     planner.reset_nominal(1.5)
     # routing field, optionally coarse (k>1): max-pool the terrain (keeps thin walls), solve low-res
     k = max(1, int(lat_coarsen))
