@@ -125,32 +125,11 @@ def _plot_all(out):
     print(f"saved {out}")
 
 
-def _stress(device="cuda", max_steps=500):
-    """Run the planner (baseline vs orientation-aware lattice) on every world; print reach/steps/final dist."""
-    from .control import mppi
-
-    print(f"{'world':9}{'config':12}{'reached':9}{'steps':7}{'dist':6}")
-    for name, (builder, start, goal) in WORLDS.items():
-        hm, mu, g = builder(), matching_friction(builder()), np.asarray(goal)
-        for cfg, kw in [("baseline", {}), ("lattice", dict(lattice=True))]:
-            try:
-                p, r = mppi.plan(hm, mu, np.asarray(start, np.float32), g,
-                                 device=device, seed=0, max_steps=max_steps, **kw)
-                print(f"{name:9}{cfg:12}{str(bool(r)):9}{len(p) - 1:<7}{np.linalg.norm(p[-1, :2] - g):<6.2f}")
-            except Exception as e:
-                print(f"{name:9}{cfg:12}ERROR {type(e).__name__}: {e}")
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", default="/tmp/worlds.png")
-    ap.add_argument("--stress", action="store_true", help="run the planner on every world + report")
-    ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
-    if args.stress:
-        _stress(device=args.device)
-    else:
-        _plot_all(args.out)
+    _plot_all(args.out)
 
 
 if __name__ == "__main__":
