@@ -12,9 +12,9 @@ Both windows step in lockstep (same robot/sim); only the cameras are independent
 global map (window 1) smears while the local rollouts (window 2) stay on true geometry. In each window:
 mouse-drag orbits, scroll zooms, ESC/Q quits.
 
-  python -m kinematic_helhest.viz.navigate_partial_dual --world pocket
-  python -m kinematic_helhest.viz.navigate_partial_dual --world pocket --drift 0.04
-  python -m kinematic_helhest.viz.navigate_partial_dual --world pocket --shot /tmp/dual.png --shot-frame 150
+  python -m kinematic_helhest.viz.navigate_partial_view --world pocket
+  python -m kinematic_helhest.viz.navigate_partial_view --world pocket --drift 0.04
+  python -m kinematic_helhest.viz.navigate_partial_view --world pocket --shot /tmp/dual.png --shot-frame 150
 """
 import argparse
 from collections import deque
@@ -24,7 +24,7 @@ import warp as wp
 
 from .. import dynamics
 from .. import worlds as W
-from ..control.mppi_gpu import MppiGpu
+from ..control.mppi import MppiGpu
 from ..control.terminal import dock_control
 from ..driver import WarpDriver
 from ..engine import GridParams
@@ -37,6 +37,7 @@ from ..perception.lidar import lidar_scan
 from ..perception.lidar import MultiScanMap
 from ..planning.costtogo import CostToGo
 from .costfield import _trace_optimal
+from .render import _commands
 from .render import _draw
 from .render import _init_gl
 from .render import build_robot
@@ -167,7 +168,7 @@ def _cbs(cam, ms):
 
 
 def run(world="pocket", K=8, dock_radius=1.5, lat_coarsen=4, win_m=9.0, route_m=16.0, local_scans=5,
-        drift=0.0, fan_n=160, device="cuda", shot=None, shot_frame=None, max_frames=2000):
+        drift=0.0, drive=False, fan_n=160, device="cuda", shot=None, shot_frame=None, max_frames=2000):
     import glfw
     from OpenGL import GL as gl
 
@@ -234,12 +235,22 @@ def run(world="pocket", K=8, dock_radius=1.5, lat_coarsen=4, win_m=9.0, route_m=
     fan = None         # latest rollouts (dict) for window 2
     crop = None        # (wx0, wy0) of the fine planning window, to clip window-2's terrain to it
     cost_C = None
+    mode = {"manual": drive, "m_prev": False}  # press M (either window) to toggle AUTO <-> MANUAL
+
+    def _press(k):  # key down in EITHER window -> driving works whichever window has focus
+        return glfw.PRESS if any(glfw.get_key(w_, k) == glfw.PRESS for w_ in (win_l, win_r)) else glfw.RELEASE
+
     f = 0
     while not (glfw.window_should_close(win_l) or glfw.window_should_close(win_r)):
         glfw.poll_events()
         if any(glfw.get_key(w_, k) == glfw.PRESS
                for w_ in (win_l, win_r) for k in (glfw.KEY_ESCAPE, glfw.KEY_Q)):
             break
+        m_now = _press(glfw.KEY_M) == glfw.PRESS  # edge-detected mode toggle
+        if m_now and not mode["m_prev"]:
+            mode["manual"] = not mode["manual"]
+            print("MANUAL drive: I=fwd K=back J/L=turn" if mode["manual"] else "AUTO (MPPI)")
+        mode["m_prev"] = m_now
         st = drv.render_state()
         rx, ry, yaw = st.x, st.y, st.yaw
         trail.append([rx, ry, st.place["z"] + 0.05]); trail = trail[-6000:]
@@ -276,12 +287,12 @@ def run(world="pocket", K=8, dock_radius=1.5, lat_coarsen=4, win_m=9.0, route_m=
             Hc = relev[:rcny * kr, :rcnx * kr].reshape(rcny, kr, rcnx, kr).max(axis=(1, 3)) if kr > 1 else relev
             V = ctg.compute(wp.array(np.ascontiguousarray(Hc), dtype=wp.float32, device=device), goal_r)
             planner.set_lattice(V, sgrid)
-            if dock_radius > 0.0 and d < dock_radius:
+            if dock_radius > 0.0 and d < dock_radius and not mode["manual"]:
                 cmd = dock_control(state_l, goal_l)
             else:
-                planner.replan(state_l, goal_l, 3)
+                planner.replan(state_l, goal_l, 3)  # always plan, so window 2 shows the fan + plan
                 u = planner.nominal()
-                cmd = np.array([u[0, 0], u[0, 1], 0.5 * (u[0, 0] + u[0, 1])], np.float32)
+                auto_cmd = np.array([u[0, 0], u[0, 1], 0.5 * (u[0, 0] + u[0, 1])], np.float32)
                 der = planner.sim.derived.numpy()
                 clr, rsd = planner.sim.clearance.numpy(), planner.sim.residual.numpy()
                 pit, rol = der[:T, :, 1], der[:T, :, 2]
@@ -290,6 +301,8 @@ def run(world="pocket", K=8, dock_radius=1.5, lat_coarsen=4, win_m=9.0, route_m=
                 elite = np.argsort(planner.J_cand.numpy())[:max(8, int(0.02 * planner.n_cand))] * planner.K
                 fan = dict(ctr=planner.sim.controlled.numpy(), z=der[..., 0], feas=feas,
                            elite=elite, wx0=wx0, wy0=wy0)
+                # MANUAL: you drive (keyboard, either window); AUTO: follow the MPPI nominal (cyan)
+                cmd = _commands(_press).astype(np.float32) if mode["manual"] else auto_cmd
             drv.step(cmd)
             Vmin = V.numpy().min(axis=2)
             cost_C = _cost_colors(Vmin, ctg._vcap, scene, rwx0, rwy0, rccell, rcny, rcnx)
@@ -374,6 +387,8 @@ def main():
     ap.add_argument("--route-m", type=float, default=16.0)
     ap.add_argument("--local-scans", type=int, default=5)
     ap.add_argument("--drift", type=float, default=0.0)
+    ap.add_argument("--drive", action="store_true",
+                    help="start in MANUAL drive mode (I/J/K/L, either window); press M to toggle live")
     ap.add_argument("--fan-n", type=int, default=160, help="how many rollouts to draw in window 2")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--shot", default=None, help="save a side-by-side still of both windows")
@@ -382,7 +397,7 @@ def main():
     args = ap.parse_args()
     run(world=args.world, K=args.K, dock_radius=args.dock_radius, lat_coarsen=args.lat_coarsen,
         win_m=args.win_m, route_m=args.route_m, local_scans=args.local_scans, drift=args.drift,
-        fan_n=args.fan_n, device=args.device, shot=args.shot, shot_frame=args.shot_frame)
+        drive=args.drive, fan_n=args.fan_n, device=args.device, shot=args.shot, shot_frame=args.shot_frame)
 
 
 if __name__ == "__main__":
