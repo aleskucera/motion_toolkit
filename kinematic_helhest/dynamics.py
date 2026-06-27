@@ -14,7 +14,7 @@ Two solver fidelities share the same dt and turn gain:
 from .engine import RobotParams
 from .engine import SolverParams
 
-DT = 0.05  # control timestep -- the plan horizon step AND the driver frame step (must match)
+DT = 0.1  # control timestep -- the plan horizon step AND the driver frame step (must match)
 K_TURN = 2.0  # skid-steer turn gain
 
 
