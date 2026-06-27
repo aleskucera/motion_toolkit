@@ -76,19 +76,21 @@ class CostWeights:
 
 @dataclass(frozen=True)
 class CostParams:  # host-side cost weights -- what you tune; build() -> the device CostWeights
-    """The MPPI cost weights. A weight left at 0 disables its term in the kernel. The robot's envelope
-    + feasibility thresholds are NOT here -- they live on the Robot struct (one shared source)."""
+    """The MPPI cost weights. The defaults are the lattice-routing tuning the demos run (routing +
+    feasibility; the terminal dock handles reach+stop). A weight set to 0 disables its term in the
+    kernel. The robot's envelope + feasibility thresholds are NOT here -- they live on the Robot
+    struct (one shared source)."""
 
-    goal_terminal: float = 0.0  # cost-to-go V^2 at the horizon end -> end the plan at the goal
+    goal_terminal: float = 3.0  # cost-to-go V^2 at the horizon end -> end the plan at the goal
     # cost-to-go V^2 averaged over the horizon -> make progress every step
-    goal_running: float = 0.0
+    goal_running: float = 0.3
     # straight-line pull where V saturates (goal unreachable in-window)
-    explore_fallback: float = 0.0
-    out_of_bounds: float = 0.0  # soft wall just inside the world edge (V is clamped off-grid)
-    effort: float = 0.0  # penalize wheel-speed^2
-    smoothness: float = 0.0  # penalize wheel-speed CHANGES (jerk)
+    explore_fallback: float = 1.0
+    out_of_bounds: float = 50.0  # soft wall just inside the world edge (V is clamped off-grid)
+    effort: float = 2e-3  # penalize wheel-speed^2
+    smoothness: float = 2e-3  # penalize wheel-speed CHANGES (jerk)
     # penalize clearance/residual/tip-over violations (does obstacle avoidance)
-    infeasible: float = 0.0
+    infeasible: float = 1e5
 
     def build(self) -> CostWeights:
         cw = CostWeights()
@@ -101,19 +103,6 @@ class CostParams:  # host-side cost weights -- what you tune; build() -> the dev
         cw.smoothness = self.smoothness
         cw.infeasible = self.infeasible
         return cw
-
-
-# The lattice-routing cost tuning the demos share (routing + feasibility only; the dock handles
-# reach+stop). NOT the dataclass default -- CostParams() is all-zeros on purpose (0 = term off).
-ROUTING_COST_PARAMS = CostParams(
-    goal_terminal=3.0,
-    goal_running=0.3,
-    infeasible=1e5,
-    effort=2e-3,
-    smoothness=2e-3,
-    out_of_bounds=50.0,
-    explore_fallback=1.0,  # explore toward the goal where the routing field saturates
-)
 
 
 @wp.func

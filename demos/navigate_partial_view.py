@@ -24,9 +24,9 @@ import numpy as np
 import warp as wp
 from kinematic_helhest import dynamics
 from kinematic_helhest import worlds as W
+from kinematic_helhest.control.mppi import CostParams
 from kinematic_helhest.control.mppi import MppiGpu
 from kinematic_helhest.control.mppi import RobustConfig
-from kinematic_helhest.control.mppi import ROUTING_COST_PARAMS
 from kinematic_helhest.control.terminal import dock_control
 from kinematic_helhest.driver import WarpDriver
 from kinematic_helhest.engine import GridParams
@@ -220,9 +220,7 @@ def run(
         dynamics.robot_params(), dynamics.planning_solver(), win_grid, 4096, 70, device
     )
     plan_sim.set_uniform_friction(0.8)
-    planner = MppiGpu(
-        plan_sim, ROUTING_COST_PARAMS, robust=RobustConfig(n_slip_samples=K), n_theta=24
-    )
+    planner = MppiGpu(plan_sim, CostParams(), robust=RobustConfig(n_slip_samples=K), n_theta=24)
     planner.reset_nominal(1.5)
     rww = rwh = int(round(max(route_m, win_m) / cell))
     kr = max(1, int(lat_coarsen))

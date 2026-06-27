@@ -18,9 +18,9 @@ import numpy as np
 import warp as wp
 from kinematic_helhest import dynamics
 from kinematic_helhest import worlds as W
+from kinematic_helhest.control.mppi import CostParams
 from kinematic_helhest.control.mppi import MppiGpu
 from kinematic_helhest.control.mppi import RobustConfig
-from kinematic_helhest.control.mppi import ROUTING_COST_PARAMS
 from kinematic_helhest.control.terminal import dock_control
 from kinematic_helhest.driver import WarpDriver
 from kinematic_helhest.engine import GridParams
@@ -65,7 +65,7 @@ def navigate(
     )
     plan_sim.set_uniform_friction(0.8)
     planner = MppiGpu(
-        plan_sim, ROUTING_COST_PARAMS, robust=RobustConfig(n_slip_samples=K), n_theta=n_theta
+        plan_sim, CostParams(), robust=RobustConfig(n_slip_samples=K), n_theta=n_theta
     )
     planner.reset_nominal(1.5)
 
