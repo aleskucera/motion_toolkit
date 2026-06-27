@@ -6,37 +6,23 @@ for them (CVaR even hurts there). This harness drives the actual WarpDriver with
 routing + the terminal dock, exactly as navigate_live does but headless, and reports per world:
 reach / frames / closest approach / wall-contact frames. This is the loop that matches reality.
 
-  python -m kinematic_helhest.eval --world pocket
-  python -m kinematic_helhest.eval --stress [--K 8] [--dock-radius 1.5]
+  python demos/eval.py --world pocket
+  python demos/eval.py --stress [--K 8] [--dock-radius 1.5]
 """
 
 import argparse
 
 import numpy as np
 import warp as wp
-
-from . import dynamics
-from . import worlds as W
-from .control.mppi import CostParams
-from .control.mppi import MppiGpu
-from .control.mppi import RobustConfig
-from .control.terminal import dock_control
-from .driver import WarpDriver
-from .engine import GridParams
-from .engine import Simulator
-
-# lattice routing cost weights: routing + feasibility only (the terminal dock handles reach+stop).
-# The robot's tip-over envelope + feasibility thresholds come from the Robot struct (sim.robot), read
-# straight by the cost kernel -- not duplicated here.
-_LATTICE_W = CostParams(
-    goal_terminal=3.0,
-    goal_running=0.3,
-    infeasible=1e5,
-    effort=2e-3,
-    smoothness=2e-3,
-    out_of_bounds=50.0,
-    explore_fallback=1.0,  # explore toward the goal where the routing field saturates
-)
+from kinematic_helhest import dynamics
+from kinematic_helhest import worlds as W
+from kinematic_helhest.control.mppi import MppiGpu
+from kinematic_helhest.control.mppi import RobustConfig
+from kinematic_helhest.control.mppi import ROUTING_COST_PARAMS
+from kinematic_helhest.control.terminal import dock_control
+from kinematic_helhest.driver import WarpDriver
+from kinematic_helhest.engine import GridParams
+from kinematic_helhest.engine import Simulator
 
 
 def evaluate(
@@ -62,7 +48,9 @@ def evaluate(
         wp.array(np.ascontiguousarray(scene.H, np.float32), dtype=wp.float32, device=device)
     )
     plan_sim.set_friction(mu)
-    planner = MppiGpu(plan_sim, _LATTICE_W, robust=RobustConfig(n_slip_samples=K), n_theta=n_theta)
+    planner = MppiGpu(
+        plan_sim, ROUTING_COST_PARAMS, robust=RobustConfig(n_slip_samples=K), n_theta=n_theta
+    )
     planner.reset_nominal(1.5)
     # routing field, optionally coarse (k>1): max-pool the terrain (keeps thin walls), solve low-res
     k = max(1, int(lat_coarsen))
@@ -72,7 +60,7 @@ def evaluate(
     )
     Hc = np.ascontiguousarray(Hc, np.float32)
     cgrid = GridParams(cnx, cny, ccell, scene.x0, scene.y0)
-    from .planning.costtogo import CostToGo
+    from kinematic_helhest.planning.costtogo import CostToGo
 
     clat = CostToGo(
         cgrid, dynamics.robot_params(), dynamics.planning_solver(), n_theta=n_theta, device=device

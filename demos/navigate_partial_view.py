@@ -12,9 +12,9 @@ Both windows step in lockstep (same robot/sim); only the cameras are independent
 global map (window 1) smears while the local rollouts (window 2) stay on true geometry. In each window:
 mouse-drag orbits, scroll zooms, ESC/Q quits.
 
-  python -m kinematic_helhest.viz.navigate_partial_view --world pocket
-  python -m kinematic_helhest.viz.navigate_partial_view --world pocket --drift 0.04
-  python -m kinematic_helhest.viz.navigate_partial_view --world pocket --shot /tmp/dual.png --shot-frame 150
+  python demos/navigate_partial_view.py --world pocket
+  python demos/navigate_partial_view.py --world pocket --drift 0.04
+  python demos/navigate_partial_view.py --world pocket --shot /tmp/dual.png --shot-frame 150
 """
 
 import argparse
@@ -22,28 +22,27 @@ from collections import deque
 
 import numpy as np
 import warp as wp
-
-from .. import dynamics
-from .. import worlds as W
-from ..control.mppi import MppiGpu
-from ..control.mppi import RobustConfig
-from ..control.terminal import dock_control
-from ..driver import WarpDriver
-from ..engine import GridParams
-from ..engine import Simulator
-from ..eval import _LATTICE_W
-from ..heightmap import Heightmap
-from ..navigate_partial import _crop_window
-from ..navigate_partial import _drift_scan
-from ..perception.lidar import lidar_scan
-from ..perception.lidar import MultiScanMap
-from ..planning.costtogo import CostToGo
-from .costfield import _trace_optimal
-from .render import _commands
-from .render import _draw
-from .render import _init_gl
-from .render import build_robot
-from .render import build_terrain
+from kinematic_helhest import dynamics
+from kinematic_helhest import worlds as W
+from kinematic_helhest.control.mppi import MppiGpu
+from kinematic_helhest.control.mppi import RobustConfig
+from kinematic_helhest.control.mppi import ROUTING_COST_PARAMS
+from kinematic_helhest.control.terminal import dock_control
+from kinematic_helhest.driver import WarpDriver
+from kinematic_helhest.engine import GridParams
+from kinematic_helhest.engine import Simulator
+from kinematic_helhest.heightmap import Heightmap
+from kinematic_helhest.perception.lidar import crop_window
+from kinematic_helhest.perception.lidar import drift_scan
+from kinematic_helhest.perception.lidar import lidar_scan
+from kinematic_helhest.perception.lidar import MultiScanMap
+from kinematic_helhest.planning.costtogo import CostToGo
+from kinematic_helhest.planning.lattice_solver import trace_optimal
+from kinematic_helhest.viz.render import _commands
+from kinematic_helhest.viz.render import _draw
+from kinematic_helhest.viz.render import _init_gl
+from kinematic_helhest.viz.render import build_robot
+from kinematic_helhest.viz.render import build_terrain
 
 PW, PH = 900, 780  # each window's size
 
@@ -221,7 +220,9 @@ def run(
         dynamics.robot_params(), dynamics.planning_solver(), win_grid, 4096, 70, device
     )
     plan_sim.set_uniform_friction(0.8)
-    planner = MppiGpu(plan_sim, _LATTICE_W, robust=RobustConfig(n_slip_samples=K), n_theta=24)
+    planner = MppiGpu(
+        plan_sim, ROUTING_COST_PARAMS, robust=RobustConfig(n_slip_samples=K), n_theta=24
+    )
     planner.reset_nominal(1.5)
     rww = rwh = int(round(max(route_m, win_m) / cell))
     kr = max(1, int(lat_coarsen))
@@ -319,7 +320,7 @@ def run(
                 drift_y += float(rng.normal(0.0, drift))
                 # coupled rotational drift (rad/step)
                 drift_yaw += float(rng.normal(0.0, 0.1 * drift))
-                gobs, gkn = _drift_scan(
+                gobs, gkn = drift_scan(
                     obs, known, scene.x0, scene.y0, cell, rx, ry, drift_x, drift_y, drift_yaw
                 )
             else:
@@ -332,7 +333,7 @@ def run(
                     local.integrate(o, kk)
             else:
                 local = mm
-            elev, kn, wx0, wy0 = _crop_window(local, scene, rx, ry, ww, wh, cell)
+            elev, kn, wx0, wy0 = crop_window(local, scene, rx, ry, ww, wh, cell)
             elev = np.where(kn, elev, 0.0).astype(np.float32)
             goal_l = (goal[0] - wx0, goal[1] - wy0)
             state_l = np.array([rx - wx0, ry - wy0, yaw], np.float32)
@@ -340,7 +341,7 @@ def run(
             plan_sim.set_terrain(
                 wp.array(np.ascontiguousarray(elev), dtype=wp.float32, device=device)
             )
-            relev, rkn, rwx0, rwy0 = _crop_window(mm, scene, rx, ry, rww, rwh, cell)
+            relev, rkn, rwx0, rwy0 = crop_window(mm, scene, rx, ry, rww, rwh, cell)
             relev = np.where(rkn, relev, 0.0).astype(np.float32)
             goal_r = (goal[0] - rwx0, goal[1] - rwy0)
             Hc = (
@@ -383,9 +384,7 @@ def run(
             drv.step(cmd)
             Vmin = V.numpy().min(axis=2)
             cost_C = _cost_colors(Vmin, ctg._vcap, scene, rwx0, rwy0, rccell, rcny, rcnx)
-            rpts = _trace_optimal(
-                ctg, (rx - rwx0, ry - rwy0, yaw), 24, rcnx, rcny, 0.0, 0.0, rccell
-            )
+            rpts = trace_optimal(ctg, (rx - rwx0, ry - rwy0, yaw), 24, rcnx, rcny, 0.0, 0.0, rccell)
             route = (rpts + np.array([rwx0, rwy0])) if len(rpts) > 1 else None
 
         # window-1 mesh: the GLOBAL belief; window-2 mesh: the LOCAL map the MPPI actually plans on

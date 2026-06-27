@@ -8,7 +8,7 @@ goal lies outside the window the cost-to-go clamps it to the window edge -> a ca
 as the window scrolls. The WarpDriver is reality (ground truth); its contacts reveal if optimism ever
 drove the robot into an unseen wall.
 
-  python -m kinematic_helhest.navigate_partial --world pocket --shot /tmp/partial_pocket.png
+  python demos/navigate_partial.py --world pocket --shot /tmp/partial_pocket.png
 """
 
 import argparse
@@ -16,59 +16,20 @@ from collections import deque
 
 import numpy as np
 import warp as wp
-
-from . import dynamics
-from . import worlds as W
-from .control.mppi import MppiGpu
-from .control.mppi import RobustConfig
-from .control.terminal import dock_control
-from .driver import WarpDriver
-from .engine import GridParams
-from .engine import Simulator
-from .eval import _LATTICE_W
-from .perception.lidar import lidar_scan
-from .perception.lidar import MultiScanMap
-from .planning.costtogo import CostToGo
-
-
-def _crop_window(mm, scene, rx, ry, ww, wh, cell):
-    """Fixed (wh x ww) window centered on the robot, cropped from the world-frame map (out-of-world
-    cells stay unknown). Returns (elev, known, wx0, wy0) -- wx0/wy0 is the window's world origin, so
-    a world point maps to window-LOCAL coords as P - (wx0, wy0)."""
-    c0 = int(round((rx - scene.x0) / cell)) - ww // 2
-    r0 = int(round((ry - scene.y0) / cell)) - wh // 2
-    elev = np.zeros((wh, ww), np.float32)
-    known = np.zeros((wh, ww), bool)
-    sr0, sr1 = max(0, r0), min(scene.ny, r0 + wh)  # overlap of window with the world array
-    sc0, sc1 = max(0, c0), min(scene.nx, c0 + ww)
-    if sr1 > sr0 and sc1 > sc0:
-        dr, dc = sr0 - r0, sc0 - c0
-        elev[dr : dr + (sr1 - sr0), dc : dc + (sc1 - sc0)] = mm.elev[sr0:sr1, sc0:sc1]
-        known[dr : dr + (sr1 - sr0), dc : dc + (sc1 - sc0)] = mm.known[sr0:sr1, sc0:sc1]
-    return elev, known, scene.x0 + c0 * cell, scene.y0 + r0 * cell
-
-
-def _drift_scan(obs, known, x0, y0, cell, rx, ry, dx, dy, dyaw):
-    """Apply an accumulated SE(2) drift -- rotation `dyaw` about the robot + translation (dx, dy) -- to
-    a rasterized scan, then re-rasterize. The GLOBAL map then smears like a drifting pose estimate
-    (rotation INCLUDED), while the live LOCAL scan is left untouched (the whole point of the split).
-    """
-    ri, ci = np.nonzero(known)
-    if ri.size == 0:
-        return obs, known
-    px, py = x0 + ci * cell, y0 + ri * cell
-    c, s = np.cos(dyaw), np.sin(dyaw)
-    qx = rx + c * (px - rx) - s * (py - ry) + dx  # rotate about the robot, then translate
-    qy = ry + s * (px - rx) + c * (py - ry) + dy
-    qr = np.round((qy - y0) / cell).astype(int)
-    qc = np.round((qx - x0) / cell).astype(int)
-    ny, nx = known.shape
-    ok = (qr >= 0) & (qr < ny) & (qc >= 0) & (qc < nx)
-    o = np.zeros_like(obs)
-    k = np.zeros_like(known)
-    o[qr[ok], qc[ok]] = obs[ri[ok], ci[ok]]
-    k[qr[ok], qc[ok]] = True
-    return o, k
+from kinematic_helhest import dynamics
+from kinematic_helhest import worlds as W
+from kinematic_helhest.control.mppi import MppiGpu
+from kinematic_helhest.control.mppi import RobustConfig
+from kinematic_helhest.control.mppi import ROUTING_COST_PARAMS
+from kinematic_helhest.control.terminal import dock_control
+from kinematic_helhest.driver import WarpDriver
+from kinematic_helhest.engine import GridParams
+from kinematic_helhest.engine import Simulator
+from kinematic_helhest.perception.lidar import crop_window
+from kinematic_helhest.perception.lidar import drift_scan
+from kinematic_helhest.perception.lidar import lidar_scan
+from kinematic_helhest.perception.lidar import MultiScanMap
+from kinematic_helhest.planning.costtogo import CostToGo
 
 
 def navigate(
@@ -103,7 +64,9 @@ def navigate(
         dynamics.robot_params(), dynamics.planning_solver(), win_grid, B, T, device
     )
     plan_sim.set_uniform_friction(0.8)
-    planner = MppiGpu(plan_sim, _LATTICE_W, robust=RobustConfig(n_slip_samples=K), n_theta=n_theta)
+    planner = MppiGpu(
+        plan_sim, ROUTING_COST_PARAMS, robust=RobustConfig(n_slip_samples=K), n_theta=n_theta
+    )
     planner.reset_nominal(1.5)
 
     # DECOUPLED routing: the cost-to-go is solved on a LARGER (but still bounded, robot-centered)
@@ -172,7 +135,7 @@ def navigate(
             drift_x += float(rng.normal(0.0, drift))
             drift_y += float(rng.normal(0.0, drift))
             drift_yaw += float(rng.normal(0.0, 0.1 * drift))  # coupled rotational drift (rad/step)
-            gobs, gkn = _drift_scan(
+            gobs, gkn = drift_scan(
                 obs, known, scene.x0, scene.y0, cell, rx, ry, drift_x, drift_y, drift_yaw
             )
         else:
@@ -189,7 +152,7 @@ def navigate(
             local = mm
 
         # FINE planning window: the MPPI rollouts + feasibility run here (window-LOCAL coords)
-        elev, kn, wx0, wy0 = _crop_window(local, scene, rx, ry, ww, wh, cell)
+        elev, kn, wx0, wy0 = crop_window(local, scene, rx, ry, ww, wh, cell)
         elev = np.where(kn, elev, 0.0).astype(np.float32)  # unknown -> flat (optimistic)
         goal_l = (goal[0] - wx0, goal[1] - wy0)
         state_l = np.array([rx - wx0, ry - wy0, yaw], np.float32)  # robot ~at window center
@@ -197,7 +160,7 @@ def navigate(
 
         # LARGER coarse routing window: cost-to-go solved robot-centered in its OWN local frame, then
         # sampled by the MPPI in the planning frame via sgrid's constant offset (graph-safe).
-        relev, rkn, rwx0, rwy0 = _crop_window(mm, scene, rx, ry, rww, rwh, cell)
+        relev, rkn, rwx0, rwy0 = crop_window(mm, scene, rx, ry, rww, rwh, cell)
         relev = np.where(rkn, relev, 0.0).astype(np.float32)
         goal_r = (goal[0] - rwx0, goal[1] - rwy0)
         Hc = (
