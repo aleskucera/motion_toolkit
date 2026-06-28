@@ -10,9 +10,13 @@ The grid (cells_x, cells_y, cell_size, origin) is FIXED at construction. In the 
 rolling map the window dimensions never change — only the terrain *values* do — so
 each cycle overwrites the owned buffers in place.
 
-Forward-only for now (no requires_grad / tape); the differentiable calibration path
-keeps its own buffers in tests/engine/gradients.py.
+`Simulator` is the forward-only path (fused `rollout_kernel`, graph-capturable). The
+`DifferentiableSimulator` subclass allocates grad buffers and adds the taped per-step path
+(`rollout_taped` + `backward`) for calibration; override its `loss()` to define the objective.
+The standalone FD oracle in tests/engine/gradients.py still keeps its own buffers.
 """
+
+from collections.abc import Callable
 
 import numpy as np
 import warp as wp
@@ -21,9 +25,33 @@ from warp import Device
 from .envelope import _contact_kernel
 from .envelope import _gather_kernel
 from .robot import RobotParams
+from .step import init_state_kernel
 from .step import rollout_kernel
 from .step import SolverParams
+from .step import step_kernel
 from .terrain import GridParams
+
+
+@wp.kernel
+def _final_x_loss(controlled: wp.array2d(dtype=wp.vec3), step: int, loss: wp.array(dtype=float)):
+    b = wp.tid()
+    wp.atomic_add(loss, 0, controlled[step, b][0])
+
+
+def demo_loss(sim: "DifferentiableSimulator") -> wp.array:
+    """Default `loss_fn` for `rollout_taped`: sum of final-row x over the batch -- a stand-in for
+    benchmarks. A `loss_fn` launches its scalar-loss kernel(s) over `sim`'s rollout buffers (it
+    runs inside the tape) and returns the [1] loss array; swap it for a real objective (e.g.
+    trajectory matching against logged data)."""
+    loss = wp.zeros(1, dtype=float, device=sim.device, requires_grad=True)
+    wp.launch(
+        _final_x_loss,
+        sim.batch_size,
+        inputs=[sim.controlled, sim.n_steps],
+        outputs=[loss],
+        device=sim.device,
+    )
+    return loss
 
 
 class Simulator:
@@ -35,12 +63,16 @@ class Simulator:
         batch_size: int,
         n_steps: int,
         device: Device | str | None = None,
+        _requires_grad: bool = False,
     ):
 
         self.device = wp.get_device(device)
 
         self.batch_size = batch_size
         self.n_steps = n_steps
+        # Private: set by DifferentiableSimulator so the rollout buffers carry .grad. The
+        # forward Simulator never touches it -- the fused path is unaffected either way.
+        self.requires_grad = _requires_grad
 
         self.robot = robot_params.build(device)  # device Robot struct
         self.solver = solver_params.build()  # device Solver struct
@@ -49,24 +81,27 @@ class Simulator:
         self.env_radius = int(np.ceil(robot_params.wheel_radius / grid_params.cell_size))
         ny, nx = grid_params.cells_y, grid_params.cells_x
 
+        rg = _requires_grad
         with wp.ScopedDevice(self.device):
             # terrain: owned envelope + friction, plus the arg-max scratch; raw is borrowed.
-            self.elevation = wp.zeros((ny, nx), dtype=wp.float32)
-            self.envelope = wp.zeros((ny, nx), dtype=wp.float32)
-            self.friction = wp.zeros((ny, nx), dtype=wp.float32)
+            # envelope/friction are differentiable leaves (calibration targets); the dilation
+            # scratch (contact indices, cap) carries no grad -- it runs outside the tape.
+            self.elevation = wp.zeros((ny, nx), dtype=wp.float32, requires_grad=rg)
+            self.envelope = wp.zeros((ny, nx), dtype=wp.float32, requires_grad=rg)
+            self.friction = wp.zeros((ny, nx), dtype=wp.float32, requires_grad=rg)
             self._contact_iy = wp.zeros((ny, nx), dtype=wp.int32)
             self._contact_ix = wp.zeros((ny, nx), dtype=wp.int32)
             self._cap = wp.zeros((ny, nx), dtype=wp.float32)
 
             # rollout buffers + control inputs, allocated ONCE.
-            self.controlled = wp.zeros((n_steps + 1, batch_size), dtype=wp.vec3f)
-            self.derived = wp.zeros((n_steps + 1, batch_size), dtype=wp.vec3f)
-            self.loads = wp.zeros((n_steps, batch_size), dtype=wp.vec3f)
-            self.turning = wp.zeros((n_steps, batch_size), dtype=wp.vec2f)
-            self.clearance = wp.zeros((n_steps, batch_size), dtype=wp.float32)
-            self.residual = wp.zeros((n_steps, batch_size), dtype=wp.float32)
-            self.wheel_omega = wp.zeros((n_steps, batch_size), dtype=wp.vec3f)
-            self.start_pose = wp.zeros(batch_size, dtype=wp.vec3f)
+            self.controlled = wp.zeros((n_steps + 1, batch_size), dtype=wp.vec3f, requires_grad=rg)
+            self.derived = wp.zeros((n_steps + 1, batch_size), dtype=wp.vec3f, requires_grad=rg)
+            self.loads = wp.zeros((n_steps, batch_size), dtype=wp.vec3f, requires_grad=rg)
+            self.turning = wp.zeros((n_steps, batch_size), dtype=wp.vec2f, requires_grad=rg)
+            self.clearance = wp.zeros((n_steps, batch_size), dtype=wp.float32, requires_grad=rg)
+            self.residual = wp.zeros((n_steps, batch_size), dtype=wp.float32, requires_grad=rg)
+            self.wheel_omega = wp.zeros((n_steps, batch_size), dtype=wp.vec3f, requires_grad=rg)
+            self.start_pose = wp.zeros(batch_size, dtype=wp.vec3f, requires_grad=rg)
 
     def set_terrain(self, elevation: wp.array):
         wp.copy(self.elevation, elevation)
@@ -159,3 +194,100 @@ class Simulator:
             self.clearance.numpy(),
             self.residual.numpy(),
         )
+
+
+class DifferentiableSimulator(Simulator):
+    """Forward-and-backward simulator for gradient-based calibration.
+
+    Same buffers as `Simulator` but allocated with `requires_grad` so the taped per-step path
+    can backprop. The fused `rollout_kernel` carries state in registers and isn't autodiffable,
+    so `rollout_taped` replays the per-step `step_kernel` instead (one launch per step -- slower
+    than the fused forward, which is why this is a separate class). Usage:
+
+        sim = DifferentiableSimulator(robot, solver, grid, B, T, device)
+        sim.set_terrain(elev); sim.set_friction(mu)
+        sim.wheel_omega.assign(...); sim.start_pose.assign(...)
+        sim.rollout_taped(my_loss_fn); sim.backward()   # loss_fn defaults to demo_loss
+        g = sim.friction.grad.numpy()        # d(loss)/d(friction)
+
+    The envelope dilation in `set_terrain` runs OUTSIDE the tape, so gradients reach the dilated
+    `envelope`/`friction` but not the raw pre-dilation elevation.
+    """
+
+    def __init__(
+        self,
+        robot_params: RobotParams,
+        solver_params: SolverParams,
+        grid_params: GridParams,
+        batch_size: int,
+        n_steps: int,
+        device: Device | str | None = None,
+    ):
+        super().__init__(
+            robot_params,
+            solver_params,
+            grid_params,
+            batch_size,
+            n_steps,
+            device,
+            _requires_grad=True,
+        )
+        self.tape: wp.Tape | None = None
+        self._loss: wp.array | None = None
+
+    def rollout_taped(self, loss_fn: Callable = demo_loss) -> wp.array:
+        """Record init + T per-step launches + `loss_fn(self)` on a fresh tape; return the loss
+        array. `self.wheel_omega`/`self.start_pose` must already hold the controls/init pose.
+
+        `loss_fn` is called INSIDE the tape's `with` block, so its `wp.launch`es are recorded and
+        `backward` can connect the loss to the inputs. It takes this simulator and returns the [1]
+        loss array; defaults to `demo_loss` (sum of final-row x). The loss is injected rather
+        than fixed because the objective is domain-specific (calibration vs benchmark)."""
+        self.tape = wp.Tape()
+        with self.tape:
+            wp.launch(
+                init_state_kernel,
+                self.batch_size,
+                inputs=[self.envelope, self.grid, self.robot, self.solver, self.start_pose],
+                outputs=[self.controlled, self.derived],
+                device=self.device,
+            )
+            for t in range(self.n_steps):
+                wp.launch(
+                    step_kernel,
+                    self.batch_size,
+                    inputs=[
+                        self.envelope,
+                        self.elevation,
+                        self.friction,
+                        self.grid,
+                        self.robot,
+                        self.solver,
+                        self.wheel_omega[t],
+                        self.controlled[t],
+                        self.derived[t],
+                    ],
+                    outputs=[
+                        self.controlled[t + 1],
+                        self.derived[t + 1],
+                        self.loads[t],
+                        self.turning[t],
+                        self.clearance[t],
+                        self.residual[t],
+                    ],
+                    device=self.device,
+                )
+            self._loss = loss_fn(self)
+        return self._loss
+
+    def backward(self) -> None:
+        """Backprop the recorded loss. Gradients land in the `.grad` of the differentiable
+        inputs (envelope/friction/wheel_omega/start_pose)."""
+        if self._loss is None:
+            raise RuntimeError("call rollout_taped() before backward()")
+        self.tape.backward(loss=self._loss)
+
+    def zero_grad(self) -> None:
+        """Zero the grads recorded on the tape (call between optimizer iterations)."""
+        if self.tape is not None:
+            self.tape.zero()

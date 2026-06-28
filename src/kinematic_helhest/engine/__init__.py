@@ -17,6 +17,7 @@ in the top-level `tests/engine/` package (run e.g. `python -m tests.engine.step`
 
 from .robot import Robot
 from .robot import RobotParams
+from .simulator import DifferentiableSimulator
 from .simulator import Simulator
 from .step import clearances
 from .step import init_state_kernel
