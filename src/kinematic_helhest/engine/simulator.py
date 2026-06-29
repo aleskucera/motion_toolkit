@@ -330,6 +330,10 @@ class DifferentiableSimulator(BaseSimulator):
         """A [B, ny, nx] device stack -- copied in, then the arg-max CONTACT (off-tape) + GATHER
         (envelope valid). `rollout_taped` re-runs only the cheap gather on the tape for the gradient,
         reusing this contact -- so re-call `set_terrain` after changing `elevation`."""
+        assert tuple(elevation.shape) == tuple(self.elevation.shape), (
+            f"elevation {tuple(elevation.shape)} must match the sim's [B, ny, nx] "
+            f"{tuple(self.elevation.shape)}"
+        )
         wp.copy(self.elevation, elevation)
         self._contact()
         self._gather()
@@ -338,6 +342,10 @@ class DifferentiableSimulator(BaseSimulator):
         """Per-rollout friction from a [B, ny, nx] device array (copied in place). Overrides the
         base Heightmap setter: friction is a differentiable calibration target, so it's set from a
         wp.array (typically the current on-device estimate), matching `set_terrain`."""
+        assert tuple(friction.shape) == tuple(self.friction.shape), (
+            f"friction {tuple(friction.shape)} must match the sim's [B, ny, nx] "
+            f"{tuple(self.friction.shape)}"
+        )
         wp.copy(self.friction, friction)
 
     def rollout_taped(self, loss_fn: Callable = demo_loss) -> wp.array:
