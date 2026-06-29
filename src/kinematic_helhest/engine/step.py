@@ -184,10 +184,14 @@ def _scatter_h(
     hit the same node).
     """
     c = _locate(grid, x, y)
-    wp.atomic_add(adj_envelope, c.y_idx, c.x_idx, coef * (1.0 - c.frac_x) * (1.0 - c.frac_y))
-    wp.atomic_add(adj_envelope, c.y_idx, c.x_idx + 1, coef * c.frac_x * (1.0 - c.frac_y))
-    wp.atomic_add(adj_envelope, c.y_idx + 1, c.x_idx, coef * (1.0 - c.frac_x) * c.frac_y)
-    wp.atomic_add(adj_envelope, c.y_idx + 1, c.x_idx + 1, coef * c.frac_x * c.frac_y)
+    xi = int(c[0])
+    yi = int(c[1])
+    frac_x = c[2]
+    frac_y = c[3]
+    wp.atomic_add(adj_envelope, yi, xi, coef * (1.0 - frac_x) * (1.0 - frac_y))
+    wp.atomic_add(adj_envelope, yi, xi + 1, coef * frac_x * (1.0 - frac_y))
+    wp.atomic_add(adj_envelope, yi + 1, xi, coef * (1.0 - frac_x) * frac_y)
+    wp.atomic_add(adj_envelope, yi + 1, xi + 1, coef * frac_x * frac_y)
 
 
 @wp.func_grad(settle)
@@ -267,10 +271,14 @@ def _scatter_h_bt(
 ):
     """_scatter_h for one slice b of a [B, ny, nx] envelope adjoint."""
     c = _locate(grid, x, y)
-    wp.atomic_add(adj_env, b, c.y_idx, c.x_idx, coef * (1.0 - c.frac_x) * (1.0 - c.frac_y))
-    wp.atomic_add(adj_env, b, c.y_idx, c.x_idx + 1, coef * c.frac_x * (1.0 - c.frac_y))
-    wp.atomic_add(adj_env, b, c.y_idx + 1, c.x_idx, coef * (1.0 - c.frac_x) * c.frac_y)
-    wp.atomic_add(adj_env, b, c.y_idx + 1, c.x_idx + 1, coef * c.frac_x * c.frac_y)
+    xi = int(c[0])
+    yi = int(c[1])
+    frac_x = c[2]
+    frac_y = c[3]
+    wp.atomic_add(adj_env, b, yi, xi, coef * (1.0 - frac_x) * (1.0 - frac_y))
+    wp.atomic_add(adj_env, b, yi, xi + 1, coef * frac_x * (1.0 - frac_y))
+    wp.atomic_add(adj_env, b, yi + 1, xi, coef * (1.0 - frac_x) * frac_y)
+    wp.atomic_add(adj_env, b, yi + 1, xi + 1, coef * frac_x * frac_y)
 
 
 @wp.func

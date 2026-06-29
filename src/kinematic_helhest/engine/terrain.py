@@ -38,29 +38,22 @@ class GridParams:
         return grid
 
 
-@wp.struct
-class _Cell:
-    """Bilinear stencil for a world point: lower-left corner index + in-cell fraction."""
-
-    x_idx: wp.int32  # x index of the lower-left corner cell (-> elevation[y_idx, x_idx])
-    y_idx: wp.int32  # y index of the lower-left corner cell
-    frac_x: wp.float32  # in-cell offset toward x_idx+1, in [0,1] (the bilinear weight)
-    frac_y: wp.float32  # in-cell offset toward y_idx+1, in [0,1]
-
-
 @wp.func
 def _locate(grid: Grid, x: wp.float32, y: wp.float32):
-    """World (x, y) -> bilinear stencil. The ONE place the cell-center mapping
-    `(x - origin)/cell_size - 0.5` lives -- shared by sample_field, its analytic
-    gradient, and the d/dH adjoint scatter so the convention can never drift."""
+    """World (x, y) -> bilinear stencil, packed as vec4(x_idx, y_idx, frac_x, frac_y): the lower-left
+    corner index (as a float -- cast back with int()) and the in-cell offset toward +1, in [0,1].
+    The ONE place the cell-center mapping `(x - origin)/cell_size - 0.5` lives -- shared by
+    sample_field, its analytic gradient, and the d/dH adjoint scatter so the convention can never
+    drift. Packed in a PLAIN vec4, not a struct: an int-member struct round-trip zeroes the auto-grad
+    of `frac` w.r.t. (x, y), which silently kills sample_field's POSITION gradient (e.g. friction
+    sampled at a pose-dependent contact point -- a cross-step term that grows with the rollout)."""
     fx = (x - grid.origin_x) / grid.cell_size - 0.5
     fy = (y - grid.origin_y) / grid.cell_size - 0.5
-    c = _Cell()
-    c.x_idx = wp.clamp(int(wp.floor(fx)), 0, grid.cells_x - 2)
-    c.y_idx = wp.clamp(int(wp.floor(fy)), 0, grid.cells_y - 2)
-    c.frac_x = wp.clamp(fx - float(c.x_idx), 0.0, 1.0)
-    c.frac_y = wp.clamp(fy - float(c.y_idx), 0.0, 1.0)
-    return c
+    x_idx = wp.clamp(int(wp.floor(fx)), 0, grid.cells_x - 2)
+    y_idx = wp.clamp(int(wp.floor(fy)), 0, grid.cells_y - 2)
+    frac_x = wp.clamp(fx - float(x_idx), 0.0, 1.0)
+    frac_y = wp.clamp(fy - float(y_idx), 0.0, 1.0)
+    return wp.vec4(float(x_idx), float(y_idx), frac_x, frac_y)
 
 
 @wp.func
@@ -70,19 +63,24 @@ def sample_field(
     x: wp.float32,
     y: wp.float32,
 ):
-    """Bilinear-interpolate a 2D grid field (elevation, envelope, friction, ...) at world (x, y)."""
+    """Bilinear-interpolate a 2D grid field (elevation, envelope, friction, ...) at world (x, y).
+    Differentiable w.r.t. BOTH the field values and the sample position (x, y) -- see `_locate`."""
     c = _locate(grid, x, y)
+    xi = int(c[0])
+    yi = int(c[1])
+    frac_x = c[2]
+    frac_y = c[3]
 
-    v00 = field[c.y_idx, c.x_idx]
-    v10 = field[c.y_idx, c.x_idx + 1]
-    v01 = field[c.y_idx + 1, c.x_idx]
-    v11 = field[c.y_idx + 1, c.x_idx + 1]
+    v00 = field[yi, xi]
+    v10 = field[yi, xi + 1]
+    v01 = field[yi + 1, xi]
+    v11 = field[yi + 1, xi + 1]
 
     return (
-        (1.0 - c.frac_x) * (1.0 - c.frac_y) * v00
-        + c.frac_x * (1.0 - c.frac_y) * v10
-        + (1.0 - c.frac_x) * c.frac_y * v01
-        + c.frac_x * c.frac_y * v11
+        (1.0 - frac_x) * (1.0 - frac_y) * v00
+        + frac_x * (1.0 - frac_y) * v10
+        + (1.0 - frac_x) * frac_y * v01
+        + frac_x * frac_y * v11
     )
 
 
@@ -94,20 +92,24 @@ def sample_height_grad(
     y: wp.float32,
 ):
     c = _locate(grid, x, y)
-    h00 = elevation[c.y_idx, c.x_idx]
-    h10 = elevation[c.y_idx, c.x_idx + 1]
-    h01 = elevation[c.y_idx + 1, c.x_idx]
-    h11 = elevation[c.y_idx + 1, c.x_idx + 1]
+    xi = int(c[0])
+    yi = int(c[1])
+    frac_x = c[2]
+    frac_y = c[3]
+    h00 = elevation[yi, xi]
+    h10 = elevation[yi, xi + 1]
+    h01 = elevation[yi + 1, xi]
+    h11 = elevation[yi + 1, xi + 1]
 
     h = (
-        (1.0 - c.frac_x) * (1.0 - c.frac_y) * h00
-        + c.frac_x * (1.0 - c.frac_y) * h10
-        + (1.0 - c.frac_x) * c.frac_y * h01
-        + c.frac_x * c.frac_y * h11
+        (1.0 - frac_x) * (1.0 - frac_y) * h00
+        + frac_x * (1.0 - frac_y) * h10
+        + (1.0 - frac_x) * frac_y * h01
+        + frac_x * frac_y * h11
     )
 
-    gx = ((1.0 - c.frac_y) * (h10 - h00) + c.frac_y * (h11 - h01)) / grid.cell_size
-    gy = ((1.0 - c.frac_x) * (h01 - h00) + c.frac_x * (h11 - h10)) / grid.cell_size
+    gx = ((1.0 - frac_y) * (h10 - h00) + frac_y * (h11 - h01)) / grid.cell_size
+    gy = ((1.0 - frac_x) * (h01 - h00) + frac_x * (h11 - h10)) / grid.cell_size
     return wp.vec3(h, gx, gy)
 
 

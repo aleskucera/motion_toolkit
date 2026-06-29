@@ -194,16 +194,25 @@ def check_bt_grad_fd():
     batched-vs-solo and the 2D step_kernel FD oracle don't cover: friction (final-x loss + a turn)
     and raw elevation (final-z loss). A fresh sim per evaluation (no grad accumulation), and a
     coarse-enough eps that float32 cancellation doesn't dominate (the error grows at smaller eps).
+
+    Friction is NON-UNIFORM on purpose: with uniform mu the grip-weighted ICR
+    x_icr = Sum(mu_i N_i x_i)/Sum(mu_i N_i) is mu-independent (mu cancels), so a uniform field
+    exercises only the alpha turn-gain path. A varying field over a turning trajectory drives x_icr,
+    whose friction is sampled at a POSE-dependent contact point -- the cross-step term that needs
+    sample_field's position gradient. (Warp's auto-grad silently drops that term unless `_locate`
+    avoids the int-bearing-struct round-trip; this regression guards exactly that.)
     """
     scene = hmmod.ramp_scene()
     ny, nx = scene.H.shape
     B, T = 2, 18
     grid = GridParams(scene.nx, scene.ny, scene.cell, scene.x0, scene.y0)
     omega = _to_wheel_omega(
-        np.tile(np.array([1.0, 3.0], np.float32), (B, T, 1))
-    )  # turn -> friction matters
+        np.tile(np.array([0.5, 3.5], np.float32), (B, T, 1))
+    )  # a SHARP turn: the harder it turns, the more x_icr (and its position grad) drives final-x
     elev0 = np.broadcast_to(scene.H, (B, ny, nx)).astype(np.float32)
-    fric0 = np.full((B, ny, nx), 0.8, np.float32)
+    fric0 = (np.random.default_rng(0).random((B, ny, nx), dtype=np.float32) * 0.8 + 0.4).astype(
+        np.float32
+    )
 
     def run(elev, fric, loss_fn, grad_of):
         s = DifferentiableSimulator(

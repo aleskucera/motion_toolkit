@@ -132,10 +132,10 @@ def sample_lattice(
     t0 = int(ftf) % n_theta
     t1 = (t0 + 1) % n_theta
     fth = ft - ftf
-    fx = c.frac_x
-    fy = c.frac_y
-    xi = c.x_idx
-    yi = c.y_idx
+    fx = c[2]
+    fy = c[3]
+    xi = int(c[0])
+    yi = int(c[1])
     va = _bilinear(field, yi, xi, fx, fy, t0)
     vb = _bilinear(field, yi, xi, fx, fy, t1)
     return (1.0 - fth) * va + fth * vb
