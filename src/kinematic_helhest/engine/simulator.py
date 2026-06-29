@@ -315,9 +315,10 @@ class DifferentiableSimulator(BaseSimulator):
         )
 
     def _gather(self) -> None:
-        """envelope = elevation[contact] + cap using the fixed `self._best_k`. Recorded on the tape
-        in `rollout_taped` (its scatter adjoint IS d(envelope)/d(elevation) -- the analytical
-        gradient); also run off-tape in `set_terrain` to leave `envelope` valid."""
+        """envelope = elevation[contact] + cap using the fixed `self._best_k`. Recorded ON the tape
+        in `rollout_taped` -- its scatter adjoint IS d(envelope)/d(elevation), the analytical
+        gradient. This is the ONLY place envelope is built, so it isn't valid until `rollout_taped`.
+        """
         wp.launch(
             gather_bt,
             dim=self.elevation.shape,
@@ -327,15 +328,14 @@ class DifferentiableSimulator(BaseSimulator):
         )
 
     def set_terrain(self, elevation: wp.array) -> None:
-        """A [B, ny, nx] device stack -- copied in, then the arg-max CONTACT (off-tape) + GATHER
-        (envelope valid). `rollout_taped` re-runs only the cheap gather on the tape for the gradient,
-        reusing this contact -- so re-call `set_terrain` after changing `elevation`."""
+        """A [B, ny, nx] device stack -- copied in, then the off-tape arg-max CONTACT (-> best_k).
+        The gather (envelope) runs only on the tape in `rollout_taped`, reusing this contact, so
+        re-call `set_terrain` after changing `elevation`. (envelope is NOT computed here.)"""
         assert (
             elevation.shape == self.elevation.shape
         ), f"elevation {elevation.shape} must match the sim's [B, ny, nx] {self.elevation.shape}"
         wp.copy(self.elevation, elevation)
         self._contact()
-        self._gather()
 
     def set_friction(self, friction: wp.array) -> None:
         """Per-rollout friction from a [B, ny, nx] device array (copied in place). Overrides the
