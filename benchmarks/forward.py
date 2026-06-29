@@ -11,6 +11,7 @@ Run from the repo root:  python -m benchmarks.forward [--dt 0.1]
 """
 
 import argparse
+import time
 
 import numpy as np
 import warp as wp
@@ -21,7 +22,16 @@ from kinematic_helhest.control.reference import _to_wheel_omega
 from kinematic_helhest.engine import ForwardSimulator
 from kinematic_helhest.engine import GridParams
 
-from ._common import time_fn
+
+def _time(fn, reps, device):
+    """Mean wall-clock of `fn` over `reps`, with a warmup + device syncs around the timed loop."""
+    fn()
+    wp.synchronize_device(device)
+    t0 = time.perf_counter()
+    for _ in range(reps):
+        fn()
+    wp.synchronize_device(device)
+    return (time.perf_counter() - t0) / reps
 
 
 def _build(scene, mu, B, T, device, dt):
@@ -50,7 +60,7 @@ def _header():
 
 def _row(scene, mu, B, T, device, dt, reps):
     sim = _build(scene, mu, B, T, device, dt)
-    t = time_fn(sim.rollout_launch, reps, device)
+    t = _time(sim.rollout_launch, reps, device)
     print(f"    {B:>6} {T:>4} {t*1e3:>9.2f} {B*T*dt/t:>9.1e}x {B*T/t/1e6:>9.0f}")
 
 

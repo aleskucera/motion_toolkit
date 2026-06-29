@@ -9,6 +9,8 @@ needs GPU shared memory).
 Run from the repo root:  python -m benchmarks.differentiable
 """
 
+import time
+
 import numpy as np
 import warp as wp
 from kinematic_helhest import dynamics
@@ -18,7 +20,16 @@ from kinematic_helhest.control.reference import _to_wheel_omega
 from kinematic_helhest.engine import DifferentiableSimulator
 from kinematic_helhest.engine import GridParams
 
-from ._common import time_fn
+
+def _time(fn, reps, device):
+    """Mean wall-clock of `fn` over `reps`, with a warmup + device syncs around the timed loop."""
+    fn()
+    wp.synchronize_device(device)
+    t0 = time.perf_counter()
+    for _ in range(reps):
+        fn()
+    wp.synchronize_device(device)
+    return (time.perf_counter() - t0) / reps
 
 
 def _build(scene, mu, B, T, device):
@@ -61,9 +72,9 @@ def _header():
 def _row(scene, mu, B, T, device, reps):
     sim = _build(scene, mu, B, T, device)
     sim.rollout_taped()  # warm up: triggers codegen + gives backward a tape
-    t_contact = time_fn(sim._contact, reps, device)
-    t_taped = time_fn(sim.rollout_taped, reps, device)
-    t_bwd = time_fn(sim.backward, reps, device)
+    t_contact = _time(sim._contact, reps, device)
+    t_taped = _time(sim.rollout_taped, reps, device)
+    t_bwd = _time(sim.backward, reps, device)
     step = t_taped + t_bwd
     print(
         f"    {B:>5} {T:>4} {t_contact*1e3:>10.2f}m {t_taped*1e3:>8.2f}m {t_bwd*1e3:>7.2f}m "
