@@ -25,7 +25,6 @@ from warp import Device
 
 from .envelope import _contact_kernel
 from .envelope import _gather_kernel
-from .envelope import contact_offset_table
 from .envelope import gather_bt
 from .envelope import make_tiled_contact
 from .envelope import pad_edge
@@ -245,14 +244,14 @@ class DifferentiableSimulator(BaseSimulator):
     Gradients flow to the raw terrain (`elevation`/`friction`) and the state buffers
     (`controlled`/`derived`); controls (`wheel_omega`) and `start_pose` are NOT grad-tracked -- we
     don't differentiate w.r.t. control, and a non-grad leaf simply skips its gradient without
-    breaking the terrain chain. The dilation is split: the arg-max CONTACT runs off-tape (fast,
-    non-diff) and the GATHER runs on-tape (envelope = elevation[contact] + cap), so
+    breaking the terrain chain. The dilation is split: a shared-memory tiled arg-max CONTACT runs
+    off-tape (fast, non-diff) and the GATHER runs on-tape (envelope = elevation[contact] + cap), so
     `d(loss)/d(raw elevation)` flows through the cheap scatter adjoint -- the analytical gradient,
-    not autodiff of the convolution. Contact is a shared-memory tiled arg-max on CUDA (~2x) and an
-    offset-table scan on CPU; both feed the same gather, so the class runs on CPU or CUDA.
+    not autodiff of the convolution.
 
-    NOTE: per-rollout terrain costs B x the grid memory (x2 for grads), so B is the number of
-    calibration episodes (10s-100s), not the thousands used for planning.
+    CUDA-only (the tiled contact needs GPU shared memory). NOTE: per-rollout terrain costs B x the
+    grid memory (x2 for grads), so B is the number of calibration episodes (10s-100s), not the
+    thousands used for planning.
     """
 
     def __init__(
@@ -265,12 +264,22 @@ class DifferentiableSimulator(BaseSimulator):
         device: Device | str | None = None,
     ):
         super().__init__(robot_params, solver_params, grid_params, batch_size, n_steps, device)
+        if not self.device.is_cuda:
+            raise RuntimeError(
+                "DifferentiableSimulator is CUDA-only: the tiled arg-max contact needs GPU shared "
+                "memory. Build it with device='cuda'."
+            )
         self.tape: wp.Tape | None = None
         self._loss: wp.array | None = None
 
         ny, nx = self.cells_y, self.cells_x
         R, T = self.env_radius, DILATE_TILE
         dy, dx, cap = wheel_offset_table(R, self.cell_size, self.wheel_radius)
+        # `_best_k` is the off-tape contact (arg-max offset per cell); the offset table feeds both the
+        # tiled contact and the gather. Edge-padded, tile-aligned halo buffer for the tiled contact.
+        self._tiled_contact = make_tiled_contact(R, T)
+        self._n_tiles = ((ny + T - 1) // T, (nx + T - 1) // T)
+        pny, pnx = self._n_tiles[0] * T + 2 * R, self._n_tiles[1] * T + 2 * R
         with wp.ScopedDevice(self.device):  # per-rollout terrain [B, ny, nx]
             self.elevation = wp.zeros((batch_size, ny, nx), dtype=wp.float32, requires_grad=True)
             self.envelope = wp.zeros((batch_size, ny, nx), dtype=wp.float32, requires_grad=True)
@@ -278,48 +287,30 @@ class DifferentiableSimulator(BaseSimulator):
             self._best_k = wp.zeros(
                 (batch_size, ny, nx), dtype=wp.float32
             )  # contact offset (no grad)
+            self._elev_pad = wp.zeros((batch_size, pny, pnx), dtype=wp.float32)
             self._off_dy = wp.array(dy, dtype=wp.int32)
             self._off_dx = wp.array(dx, dtype=wp.int32)
             self._off_cap = wp.array(cap, dtype=wp.float32)
-        # Contact (the off-tape arg-max -> self._best_k) selects by device: CUDA uses the shared-
-        # memory tiled arg-max (~2x faster), CPU the offset-table scan. Both feed the same cheap
-        # on-tape gather (which supplies the gradient).
-        self._tiled_contact = None
-        if self.device.is_cuda:
-            self._tiled_contact = make_tiled_contact(R, T)
-            self._n_tiles = ((ny + T - 1) // T, (nx + T - 1) // T)
-            pny, pnx = self._n_tiles[0] * T + 2 * R, self._n_tiles[1] * T + 2 * R
-            with wp.ScopedDevice(self.device):
-                self._elev_pad = wp.zeros((batch_size, pny, pnx), dtype=wp.float32)
         # State/diagnostic buffers carry grad; controls + start pose do NOT (no control gradients).
         self._alloc_rollout_buffers(requires_grad=True, control_grad=False)
 
     def _contact(self) -> None:
-        """Off-tape arg-max -> self._best_k (the contact offset index per cell). CUDA: shared-memory
-        tiled arg-max (~2x); CPU: the offset-table scan. Non-differentiable (the gather supplies the
-        gradient), so it can be the fast tiled path without any backward cost."""
-        if self._tiled_contact is not None:
-            wp.launch(
-                pad_edge,
-                dim=self._elev_pad.shape,
-                inputs=[self.elevation, self.env_radius, self._elev_pad],
-                device=self.device,
-            )
-            wp.launch_tiled(
-                self._tiled_contact,
-                dim=(self.batch_size, self._n_tiles[0], self._n_tiles[1]),
-                inputs=[self._elev_pad, self._off_dy, self._off_dx, self._off_cap, self._best_k],
-                block_dim=128,
-                device=self.device,
-            )
-        else:
-            wp.launch(
-                contact_offset_table,
-                dim=self.elevation.shape,
-                inputs=[self.elevation, self._off_dy, self._off_dx, self._off_cap],
-                outputs=[self._best_k],
-                device=self.device,
-            )
+        """Off-tape shared-memory tiled arg-max -> self._best_k (the contact offset per cell).
+        Non-differentiable (the gather supplies the gradient), so the fast tiled path costs no
+        backward. Edge-pads first so the halo loads never go out of bounds."""
+        wp.launch(
+            pad_edge,
+            dim=self._elev_pad.shape,
+            inputs=[self.elevation, self.env_radius, self._elev_pad],
+            device=self.device,
+        )
+        wp.launch_tiled(
+            self._tiled_contact,
+            dim=(self.batch_size, self._n_tiles[0], self._n_tiles[1]),
+            inputs=[self._elev_pad, self._off_dy, self._off_dx, self._off_cap, self._best_k],
+            block_dim=128,
+            device=self.device,
+        )
 
     def _gather(self) -> None:
         """envelope = elevation[contact] + cap using the fixed `self._best_k`. Recorded on the tape

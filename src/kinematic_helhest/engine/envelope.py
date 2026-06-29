@@ -8,11 +8,10 @@ The dilation = arg-max of (elevation[neighbor] + cap) over the disk. The gradien
 adjoint scatters to the arg-max (contact) cell. Implementations:
   - 2D `_contact_kernel` + `_gather_kernel` (one thread per output cell): the forward planner's
     shared [ny, nx] terrain, and the FD oracle. CPU or CUDA.
-  - batched [B, ny, nx] for DifferentiableSimulator -- split into `contact` (off-tape: pick the
-    arg-max offset `best_k`) + `gather_bt` (on-tape: envelope = elevation[contact] + cap, whose
-    cheap scatter adjoint IS the analytical gradient). Contact has two forms producing the same
-    `best_k`: `contact_offset_table` (CPU+CUDA) and `make_tiled_contact` (shared-memory tiled
-    arg-max, ~2x faster, CUDA-only, needs an edge-padded input via `pad_edge`).
+  - batched [B, ny, nx] for DifferentiableSimulator (CUDA-only) -- split into `make_tiled_contact`
+    (off-tape: a shared-memory tiled arg-max picking the offset `best_k`; needs an edge-padded input
+    via `pad_edge`) + `gather_bt` (on-tape: envelope = elevation[contact] + cap, whose cheap scatter
+    adjoint IS the analytical gradient -- no autodiff through the convolution).
 """
 
 import math
@@ -70,11 +69,10 @@ def _gather_kernel(
     envelope[iy, ix] = elevation[contact_iy[iy, ix], contact_ix[iy, ix]] + contact_cap[iy, ix]
 
 
-# --- batched dilation for DifferentiableSimulator: contact (off-tape, picks the arg-max offset k)
-# + gather (on-tape, the analytical gradient). Splitting them keeps the expensive arg-max off the
-# tape and makes the backward a cheap scatter (vs. autodiffing the whole convolution). `contact`
-# has two implementations -- an offset-table scan (A, CPU+CUDA) and a shared-memory tiled arg-max
-# (B, CUDA, ~2x faster) -- that produce the SAME `best_k`, so the single `gather` serves both.
+# --- batched dilation for DifferentiableSimulator (CUDA): tiled arg-max contact (off-tape, picks
+# offset k) + gather (on-tape, the analytical gradient). Splitting them keeps the expensive arg-max
+# off the tape and makes the backward a cheap scatter (vs. autodiffing the whole convolution). The
+# offset table feeds both the tiled contact (the disk loop) and the gather (best_k -> cell).
 def wheel_offset_table(
     env_radius: int, cell_size: float, wheel_radius: float
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -89,30 +87,6 @@ def wheel_offset_table(
                 dx_l.append(dx)
                 cap_l.append(math.sqrt(wheel_radius * wheel_radius - dist * dist) - wheel_radius)
     return np.array(dy_l, np.int32), np.array(dx_l, np.int32), np.array(cap_l, np.float32)
-
-
-@wp.kernel
-def contact_offset_table(
-    elevation: wp.array3d(dtype=wp.float32),  # [B, ny, nx]
-    off_dy: wp.array(dtype=wp.int32),
-    off_dx: wp.array(dtype=wp.int32),
-    off_cap: wp.array(dtype=wp.float32),
-    best_k: wp.array3d(dtype=wp.float32),  # arg-max offset index per cell (float; gather casts int)
-):
-    """Contact pass A (CPU+CUDA): per-cell arg-max over the offset table; write the winning index."""
-    b, iy, ix = wp.tid()
-    ny = elevation.shape[1]
-    nx = elevation.shape[2]
-    best_lift = float(-1.0e9)
-    bk = int(0)
-    for k in range(off_dy.shape[0]):
-        qy = wp.clamp(iy + off_dy[k], 0, ny - 1)
-        qx = wp.clamp(ix + off_dx[k], 0, nx - 1)
-        lift = elevation[b, qy, qx] + off_cap[k]
-        if lift > best_lift:
-            best_lift = lift
-            bk = k
-    best_k[b, iy, ix] = float(bk)
 
 
 @wp.kernel
