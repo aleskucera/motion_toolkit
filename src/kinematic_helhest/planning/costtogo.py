@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import warp as wp
 
-from ..engine import Simulator
+from ..engine import ForwardSimulator
 from ..engine.robot import Robot  # the built struct, passed straight into the feasibility kernel
 from ..heightmap import Heightmap
 from ..profiling import StageProfiler
@@ -129,7 +129,7 @@ class CostToGo:
         )
 
         ny, nx = self.grid.cells_y, self.grid.cells_x
-        self.settle_sim = Simulator(
+        self.settle_sim = ForwardSimulator(
             robot_params=robot_params,
             solver_params=solver_params,
             grid_params=grid_params,

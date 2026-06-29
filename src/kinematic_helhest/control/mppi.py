@@ -18,7 +18,7 @@ import numpy as np
 import warp as wp
 
 from ..engine.robot import Robot
-from ..engine.simulator import Simulator
+from ..engine.simulator import ForwardSimulator
 from ..engine.terrain import _locate
 from ..engine.terrain import Grid
 from ..profiling import StageProfiler
@@ -417,14 +417,14 @@ class MppiGpu:
     """GPU-resident MPPI: owns the nominal control `U` + scratch on device and runs the
     refine (sample -> rollout -> cost -> CEM reweight) entirely on the GPU. On CUDA
     the refine is captured once and replayed as a graph (the RNG counter is bumped
-    in-graph, so each replay draws fresh noise); on CPU it runs eager. Wraps a Simulator.
+    in-graph, so each replay draws fresh noise); on CPU it runs eager. Wraps a ForwardSimulator.
 
     `goal` and `start_pose` are device arrays set per replan, so the captured graph picks
     up new values; the weights/sigma/wmax/elite_frac are baked at capture (fixed per planner)."""
 
     def __init__(
         self,
-        sim: Simulator,
+        sim: ForwardSimulator,
         cost: CostParams,  # cost weights (host) -> built into the device CostWeights struct
         sampling: SamplingConfig = SamplingConfig(),  # noise / wheel-speed box / elite fraction
         robust: RobustConfig = RobustConfig(),  # CVaR over wheel-slip scenarios

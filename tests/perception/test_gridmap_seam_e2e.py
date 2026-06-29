@@ -14,7 +14,7 @@ import numpy as np
 import warp as wp
 from kinematic_helhest import dynamics
 from kinematic_helhest import worlds as W
-from kinematic_helhest.engine import Simulator
+from kinematic_helhest.engine import ForwardSimulator
 from kinematic_helhest.perception.gridmap import grid_params_from
 from terrain_toolkit import TerrainPipeline
 
@@ -33,7 +33,7 @@ def cloud_from_heightmap(H: np.ndarray, x0: float, y0: float, cell: float) -> np
 def settle_z(grid, elevation: np.ndarray, pose) -> np.ndarray:
     """Settle a single robot at `pose` (zero control) on the given grid+elevation; return the
     derived (z, pitch, roll)."""
-    sim = Simulator(dynamics.robot_params(), dynamics.execution_solver(), grid, 1, 1, DEVICE)
+    sim = ForwardSimulator(dynamics.robot_params(), dynamics.execution_solver(), grid, 1, 1, DEVICE)
     sim.set_terrain(
         wp.array(np.ascontiguousarray(elevation, np.float32), dtype=wp.float32, device=DEVICE)
     )

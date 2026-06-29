@@ -4,7 +4,7 @@
 The import of `GridMap` is type-only -- the shim duck-types the instance at runtime, so
 motion_toolkit keeps terrain_toolkit an OPTIONAL dependency (you only ever hold a GridMap
 when terrain_toolkit produced one). The elevation/valid arrays pass through untouched
-(`gm.elevation` is fed straight to `Simulator.set_terrain`, zero-copy if it is a wp.array).
+(`gm.elevation` is fed straight to `ForwardSimulator.set_terrain`, zero-copy if it is a wp.array).
 """
 
 from __future__ import annotations

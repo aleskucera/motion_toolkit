@@ -21,8 +21,8 @@ from kinematic_helhest.control.mppi import MppiGpu
 from kinematic_helhest.control.mppi import RobustConfig
 from kinematic_helhest.control.terminal import dock_control
 from kinematic_helhest.driver import WarpDriver
+from kinematic_helhest.engine import ForwardSimulator
 from kinematic_helhest.engine import GridParams
-from kinematic_helhest.engine import Simulator
 
 
 def evaluate(
@@ -43,7 +43,9 @@ def evaluate(
     mu = W.matching_friction(scene)
     goal = np.asarray(goal, np.float64)
     grid = GridParams(scene.nx, scene.ny, scene.cell, scene.x0, scene.y0)
-    plan_sim = Simulator(dynamics.robot_params(), dynamics.planning_solver(), grid, B, T, device)
+    plan_sim = ForwardSimulator(
+        dynamics.robot_params(), dynamics.planning_solver(), grid, B, T, device
+    )
     plan_sim.set_terrain(
         wp.array(np.ascontiguousarray(scene.H, np.float32), dtype=wp.float32, device=device)
     )

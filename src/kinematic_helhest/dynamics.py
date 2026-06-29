@@ -3,7 +3,7 @@
 The planner, the interactive driver, and the settle-feasibility sampler must all simulate the
 *same* vehicle -- otherwise the plan describes a different robot than the one being driven (the
 plan->real lag/clip bug came from exactly this: plan dt=0.1 vs drive dt=0.05). Everything that
-builds a Simulator pulls its RobotParams / SolverParams / timestep from here instead of writing
+builds a ForwardSimulator pulls its RobotParams / SolverParams / timestep from here instead of writing
 its own, so the configs can't drift.
 
 Two solver fidelities share the same dt and turn gain:

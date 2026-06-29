@@ -18,19 +18,19 @@ import time
 
 import numpy as np
 import warp as wp
-
 from kinematic_helhest import friction
 from kinematic_helhest import heightmap as hmmod
 from kinematic_helhest.control.reference import _to_wheel_omega
+from kinematic_helhest.engine import ForwardSimulator
 from kinematic_helhest.engine import GridParams
 from kinematic_helhest.engine import RobotParams
-from kinematic_helhest.engine import Simulator
 from kinematic_helhest.engine import SolverParams
+
 from tests.engine.gradients import dsettle_dHenv
 
 
 def _sim(scene, mu, B, T, device):
-    sim = Simulator(
+    sim = ForwardSimulator(
         RobotParams(),
         SolverParams(dt=0.05, k_turn=2.0, newton_iters=12),
         GridParams(scene.nx, scene.ny, scene.cell, scene.x0, scene.y0),

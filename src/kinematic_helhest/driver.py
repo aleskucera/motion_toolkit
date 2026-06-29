@@ -1,6 +1,6 @@
 """The 'real robot': a single-vehicle stepper on the Warp engine, one settle per control step.
 
-This is the execution model the planner is steering -- distinct from the B-batch planning Simulator.
+This is the execution model the planner is steering -- distinct from the B-batch planning ForwardSimulator.
 It lives in core (not viz) so headless code (the eval harness, tests) can drive a robot without
 pulling in OpenGL. The interactive viewer and the eval loop both step this same object, so what you
 watch on screen and what we measure are the same vehicle.
@@ -12,14 +12,14 @@ import numpy as np
 import warp as wp
 
 from . import dynamics
+from .engine import ForwardSimulator
 from .engine import GridParams
-from .engine import Simulator
 from .engine import SolverParams
 from .model import euler_zyx
 
 
 class WarpDriver:
-    """Wraps a B=1, T=1 `Simulator` and the current pose; steps one frame per call."""
+    """Wraps a B=1, T=1 `ForwardSimulator` and the current pose; steps one frame per call."""
 
     def __init__(
         self,
@@ -36,7 +36,7 @@ class WarpDriver:
         wp.init()
         self.resid_tol, self.clear_margin = resid_tol, clear_margin
         sp = SolverParams(dt=dt, k_turn=k_turn, newton_iters=12, tilt_clamp=tilt_clamp)
-        self.sim = Simulator(
+        self.sim = ForwardSimulator(
             dynamics.robot_params(),
             sp,
             GridParams(hm.nx, hm.ny, hm.cell, hm.x0, hm.y0),

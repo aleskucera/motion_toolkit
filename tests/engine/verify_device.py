@@ -6,7 +6,7 @@ Three checks (CPU by default; pass --device cuda for the GPU path):
      the bounds min corner directly (one convention end-to-end, no half-cell shift);
   2. on-device `engine.envelope.wheel_envelope` == numpy `heightmap.wheel_envelope`
      oracle on the real scenes;
-  3. a device-fed `Simulator` reproduces the host (numpy-scene) path
+  3. a device-fed `ForwardSimulator` reproduces the host (numpy-scene) path
      rollout-for-rollout on the same cell grid.
 
 Run:  python -m tests.engine.verify_device [--device cuda]
@@ -16,15 +16,14 @@ import argparse
 
 import numpy as np
 import warp as wp
-
 from kinematic_helhest import friction
 from kinematic_helhest import heightmap as hmmod
 from kinematic_helhest.control.reference import _to_wheel_omega
+from kinematic_helhest.engine import ForwardSimulator
 from kinematic_helhest.engine import Grid
 from kinematic_helhest.engine import GridParams
 from kinematic_helhest.engine import RobotParams
 from kinematic_helhest.engine import sample_field
-from kinematic_helhest.engine import Simulator
 from kinematic_helhest.engine import SolverParams
 from kinematic_helhest.engine.envelope import _contact_kernel
 from kinematic_helhest.engine.envelope import _gather_kernel
@@ -32,7 +31,7 @@ from kinematic_helhest.engine.envelope import _gather_kernel
 
 def wheel_envelope(elevation, cell_size, wheel_radius, device="cpu"):
     """Verification-only: allocate scratch + run the two engine envelope passes
-    (raw elevation -> dilated). Mirrors what `Simulator.set_terrain` does into its
+    (raw elevation -> dilated). Mirrors what `ForwardSimulator.set_terrain` does into its
     owned buffers."""
     ny, nx = elevation.shape
     env_radius = int(np.ceil(wheel_radius / cell_size))
@@ -130,7 +129,7 @@ def check_end_to_end(device, B=16, T=25):
     start = (-1.0, 0.0, 0.0)
     wheel_omega = _to_wheel_omega(np.full((B, T, 2), 2.0, np.float32))
 
-    host = Simulator(
+    host = ForwardSimulator(
         RobotParams(),
         params,
         GridParams(scene.nx, scene.ny, scene.cell, scene.x0, scene.y0),
@@ -146,7 +145,7 @@ def check_end_to_end(device, B=16, T=25):
 
     H_wp = wp.array(np.ascontiguousarray(scene.H, np.float32), dtype=wp.float32, device=device)
     grid = GridParams(scene.nx, scene.ny, scene.cell, scene.x0, scene.y0)
-    dev = Simulator(RobotParams(), params, grid, B, T, device)
+    dev = ForwardSimulator(RobotParams(), params, grid, B, T, device)
     dev.set_terrain(H_wp)
     dev.set_uniform_friction(0.8)
     pd, _, cd, rd = dev.rollout(wheel_omega, start)

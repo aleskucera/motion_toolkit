@@ -257,6 +257,94 @@ def adj_settle(
     wp.adjoint[controlled] += adj_pose
 
 
+# Batched-terrain settle: the custom-grad function can NOT take a per-rollout slice envelope[b]
+# (Warp scatters wp.adjoint of a view into freed/None storage -> segfault), so the FULL [B,ny,nx]
+# array + the index b are threaded through; the forward delegates to the 2D settle on the slice and
+# the adjoint scatters into wp.adjoint[envelope] at [b, ...] via _scatter_h_bt.
+@wp.func
+def _scatter_h_bt(
+    adj_env: wp.array3d(dtype=wp.float32), b: int, grid: Grid, x: float, y: float, coef: float
+):
+    """_scatter_h for one slice b of a [B, ny, nx] envelope adjoint."""
+    c = _locate(grid, x, y)
+    wp.atomic_add(adj_env, b, c.y_idx, c.x_idx, coef * (1.0 - c.frac_x) * (1.0 - c.frac_y))
+    wp.atomic_add(adj_env, b, c.y_idx, c.x_idx + 1, coef * c.frac_x * (1.0 - c.frac_y))
+    wp.atomic_add(adj_env, b, c.y_idx + 1, c.x_idx, coef * (1.0 - c.frac_x) * c.frac_y)
+    wp.atomic_add(adj_env, b, c.y_idx + 1, c.x_idx + 1, coef * c.frac_x * c.frac_y)
+
+
+@wp.func
+def settle_bt(
+    envelope: wp.array3d(dtype=wp.float32),
+    b: int,
+    grid: Grid,
+    robot: Robot,
+    solver: Solver,
+    controlled: wp.vec3,
+    derived_init: wp.vec3,
+) -> wp.vec3:
+    """Settle rollout b on its own terrain slice. Forward only -- the custom grad replaces the
+    body, so the inner 2D settle(envelope[b]) is never differentiated (no view-adjoint)."""
+    return settle(envelope[b], grid, robot, solver, controlled, derived_init)
+
+
+@wp.func_grad(settle_bt)
+def adj_settle_bt(
+    envelope: wp.array3d(dtype=wp.float32),
+    b: int,
+    grid: Grid,
+    robot: Robot,
+    solver: Solver,
+    controlled: wp.vec3,
+    derived_init: wp.vec3,
+    adj_ret: wp.vec3,
+):
+    """adj_settle for slice b: identical IFT math, reading envelope[b] (forward) and scattering
+    into wp.adjoint[envelope] at [b, ...]."""
+    x = controlled[0]
+    y = controlled[1]
+    yaw = controlled[2]
+    derived = settle(envelope[b], grid, robot, solver, controlled, derived_init)
+    Rz = rot_z(yaw)
+    Ry = rot_y(derived[1])
+    Rx = rot_x(derived[2])
+    Rot = Rz * Ry * Rx
+    dRp = Rz * drot_y(derived[1]) * Rx
+    dRr = Rz * Ry * drot_x(derived[2])
+    dRyaw = drot_z(yaw) * Ry * Rx
+    p = wp.vec3(x, y, derived[0])
+
+    J = wp.mat33()
+    gx = wp.vec3()
+    gy = wp.vec3()
+    for i in range(wp.static(3)):
+        st_i = wp.static(i)
+        wheel_pos = robot.wheel_pos[st_i]
+        wheel_center = p + Rot * wheel_pos
+        s = sample_height_grad(envelope[b], grid, wheel_center[0], wheel_center[1])
+        gx[st_i] = s[1]
+        gy[st_i] = s[2]
+        dp = dRp * wheel_pos
+        dr = dRr * wheel_pos
+        J[st_i, 0] = 1.0
+        J[st_i, 1] = dp[2] - s[1] * dp[0] - s[2] * dp[1]
+        J[st_i, 2] = dr[2] - s[1] * dr[0] - s[2] * dr[1]
+    lam = solve3(wp.transpose(J), adj_ret)
+
+    adj_pose = wp.vec3()
+    for i in range(wp.static(3)):
+        st_i = wp.static(i)
+        wheel_pos = robot.wheel_pos[st_i]
+        wheel_center = p + Rot * wheel_pos
+        dy = dRyaw * wheel_pos
+        cw = dy[2] - gx[st_i] * dy[0] - gy[st_i] * dy[1]
+        adj_pose[0] = adj_pose[0] + gx[st_i] * lam[st_i]
+        adj_pose[1] = adj_pose[1] + gy[st_i] * lam[st_i]
+        adj_pose[2] = adj_pose[2] - cw * lam[st_i]
+        _scatter_h_bt(wp.adjoint[envelope], b, grid, wheel_center[0], wheel_center[1], lam[st_i])
+    wp.adjoint[controlled] += adj_pose
+
+
 @wp.func
 def normal_loads(
     envelope: wp.array2d(dtype=wp.float32), grid: Grid, robot: Robot, R: wp.mat33, p: wp.vec3
@@ -310,9 +398,92 @@ def chassis_clearance(
 # ----------------------------------------------------------------------------
 # forward step + rollout
 # ----------------------------------------------------------------------------
+# step_predict/step_finalize hold the per-thread physics shared by the shared-terrain and
+# batched-terrain kernels (Warp inlines @wp.func, so each kernel's codegen is identical to a
+# hand-written one -- no cost for the feature it doesn't use). Terrain reads go through 2D views:
+# the shared kernel passes the whole [ny,nx] field, the batched kernel passes its slice terrain[tid].
+# The ONE op that can't take a view is the custom-grad settle, so it's called in the kernel between
+# predict and finalize (settle on 2D, settle_bt on the full 3D array + index). No @wp.struct return
+# (struct returns don't differentiate cleanly here): predict returns the pose, finalize writes the
+# rest into the output arrays at tid.
+
+
+@wp.func
+def step_predict(
+    env_i: wp.array2d(dtype=wp.float32),
+    fric_i: wp.array2d(dtype=wp.float32),
+    grid: Grid,
+    robot: Robot,
+    solver: Solver,
+    om: wp.vec3,  # (wL, wR, w_rear) this step
+    pc: wp.vec3,  # (x, y, yaw) current state
+    tc: wp.vec3,  # (z, pitch, roll) current state
+    tid: int,
+    turn_out: wp.array(dtype=wp.vec2),  # [B] (alpha, x_icr) -> written at tid
+) -> wp.vec3:
+    """Grip-weighted ICR + turn resistance from the CURRENT pose, then Euler integrate. Write
+    turn_out[tid]=(alpha, x_icr); return the predicted (pre-settle) pose (xn, yn, yawn)."""
+    x = pc[0]
+    y = pc[1]
+    yaw = pc[2]
+    R = euler_zyx(yaw, tc[1], tc[2])
+    p = wp.vec3(x, y, tc[0])
+
+    loads = normal_loads(env_i, grid, robot, R, p)  # per-wheel normal load N_i
+    total_grip = float(0.0)  # Sum_i grip_i
+    grip_x = float(0.0)  # Sum_i grip_i * wheel_x  (x_icr = grip_x / total_grip)
+    for i in range(wp.static(3)):
+        st_i = wp.static(i)
+        wheel_pos = robot.wheel_pos[st_i]
+        wheel_center = p + R * wheel_pos
+        n = sample_normal(env_i, grid, wheel_center[0], wheel_center[1])
+        ct = wheel_center - robot.wheel_radius * n  # contact point
+        grip = sample_field(fric_i, grid, ct[0], ct[1]) * loads[st_i]  # grip_i = mu_i * N_i
+        total_grip += grip
+        grip_x += grip * wheel_pos[0]
+    x_icr = grip_x / total_grip  # grip-weighted ICR offset
+    alpha = 1.0 + solver.k_turn * total_grip / (robot.gravity * robot.mass)  # turn resistance
+
+    vx = robot.wheel_radius * (om[0] + om[1]) / 2.0
+    wz = robot.wheel_radius * (om[1] - om[0]) / (2.0 * robot.half_track * alpha)
+    vy = -x_icr * wz
+    vw = R * wp.vec3(vx, vy, 0.0)
+    turn_out[tid] = wp.vec2(alpha, x_icr)
+    return wp.vec3(x + vw[0] * solver.dt, y + vw[1] * solver.dt, yaw + wz * solver.dt)
+
+
+@wp.func
+def step_finalize(
+    env_i: wp.array2d(dtype=wp.float32),
+    elev_i: wp.array2d(dtype=wp.float32),
+    grid: Grid,
+    robot: Robot,
+    pose_next: wp.vec3,  # predicted (xn, yn, yawn)
+    settled: wp.vec3,  # settled (z, pitch, roll) of the new pose
+    tid: int,
+    controlled_next: wp.array(dtype=wp.vec3),  # [B] -> written at tid
+    derived_next: wp.array(dtype=wp.vec3),
+    loads_out: wp.array(dtype=wp.vec3),
+    clear_out: wp.array(dtype=float),
+    resid_out: wp.array(dtype=float),
+):
+    """Write the NEW state + diagnostics at tid from the predicted pose and its settled tilt."""
+    controlled_next[tid] = pose_next
+    derived_next[tid] = settled
+    xn = pose_next[0]
+    yn = pose_next[1]
+    yawn = pose_next[2]
+    Rn = euler_zyx(yawn, settled[1], settled[2])
+    pn = wp.vec3(xn, yn, settled[0])
+    loads_out[tid] = normal_loads(env_i, grid, robot, Rn, pn)
+    clear_out[tid] = chassis_clearance(elev_i, grid, robot, Rn, pn)
+    cres = clearances(env_i, grid, robot, xn, yn, yawn, settled[0], settled[1], settled[2])
+    resid_out[tid] = wp.max(wp.max(wp.abs(cres[0]), wp.abs(cres[1])), wp.abs(cres[2]))
+
+
 @wp.kernel
 def init_state_kernel(
-    envelope: wp.array2d(dtype=wp.float32),
+    envelope: wp.array2d(dtype=wp.float32),  # [ny, nx] shared across the batch
     grid: Grid,
     robot: Robot,
     solver: Solver,
@@ -320,13 +491,8 @@ def init_state_kernel(
     controlled: wp.array2d(dtype=wp.vec3),  # [T+1, B] (x, y, yaw)      -> writes row 0
     derived: wp.array2d(dtype=wp.vec3),  # [T+1, B] (z, pitch, roll) -> writes row 0
 ):
-    """Seed row 0 of a rollout: settle the start pose onto the terrain.
-
-    Each thread is one rollout (tid = batch index). The controlled DOF (x, y, yaw)
-    come from `start_pose`; the derived DOF (z, pitch, roll) are solved by `settle`,
-    warm-started with z = envelope(x, y) + wheel_radius and zero tilt. Writes
-    controlled[0]/derived[0]; `step` advances from there.
-    """
+    """Seed row 0 of a rollout (shared terrain): settle the start pose onto the terrain. Each
+    thread is one rollout (tid = batch index), warm-started with z = envelope + wheel_radius."""
     tid = wp.tid()
     pc = start_pose[tid]
     z0 = sample_field(envelope, grid, pc[0], pc[1]) + robot.wheel_radius
@@ -336,8 +502,27 @@ def init_state_kernel(
 
 
 @wp.kernel
+def init_state_kernel_bt(
+    envelope: wp.array3d(dtype=wp.float32),  # [B, ny, nx] per-rollout terrain
+    grid: Grid,
+    robot: Robot,
+    solver: Solver,
+    start_pose: wp.array(dtype=wp.vec3),  # [B] (x, y, yaw)
+    controlled: wp.array2d(dtype=wp.vec3),  # [T+1, B] -> writes row 0
+    derived: wp.array2d(dtype=wp.vec3),  # [T+1, B] -> writes row 0
+):
+    """Batched-terrain init: rollout tid settles its start pose on its own slice envelope[tid]."""
+    tid = wp.tid()
+    pc = start_pose[tid]
+    z0 = sample_field(envelope[tid], grid, pc[0], pc[1]) + robot.wheel_radius
+    settled = settle_bt(envelope, tid, grid, robot, solver, pc, wp.vec3(z0, 0.0, 0.0))
+    controlled[0, tid] = pc
+    derived[0, tid] = settled
+
+
+@wp.kernel
 def step_kernel(
-    envelope: wp.array2d(dtype=wp.float32),
+    envelope: wp.array2d(dtype=wp.float32),  # [ny, nx] shared across the batch
     elevation: wp.array2d(dtype=wp.float32),
     friction: wp.array2d(dtype=wp.float32),
     grid: Grid,
@@ -354,53 +539,84 @@ def step_kernel(
     resid_out: wp.array(dtype=float),  # [B] settle residual (max|c|) of the NEW state
 ):
     tid = wp.tid()
-    pc = controlled[tid]
     tc = derived[tid]
-    x = pc[0]
-    y = pc[1]
-    yaw = pc[2]
-    R = euler_zyx(yaw, tc[1], tc[2])
-    p = wp.vec3(x, y, tc[0])
-
-    # --- turning params from the CURRENT pose: the grip-weighted ICR + turn resistance ---
-    loads = normal_loads(envelope, grid, robot, R, p)  # per-wheel normal load N_i
-    total_grip = float(0.0)  # Sum_i grip_i
-    grip_x = float(0.0)  # Sum_i grip_i * wheel_x  (x_icr = grip_x / total_grip)
-    for i in range(wp.static(3)):
-        st_i = wp.static(i)
-        wheel_pos = robot.wheel_pos[st_i]
-        wheel_center = p + R * wheel_pos
-        n = sample_normal(envelope, grid, wheel_center[0], wheel_center[1])
-        ct = wheel_center - robot.wheel_radius * n  # contact point
-        grip = sample_field(friction, grid, ct[0], ct[1]) * loads[st_i]  # grip_i = mu_i * N_i
-        total_grip += grip
-        grip_x += grip * wheel_pos[0]
-    x_icr = grip_x / total_grip  # grip-weighted ICR offset
-    alpha = 1.0 + solver.k_turn * total_grip / (robot.gravity * robot.mass)  # turn resistance
-
-    # --- predict: twist through the CURRENT orientation, Euler integrate ---
-    om = wheel_omega[tid]
-    vx = robot.wheel_radius * (om[0] + om[1]) / 2.0
-    wz = robot.wheel_radius * (om[1] - om[0]) / (2.0 * robot.half_track * alpha)
-    vy = -x_icr * wz
-    vw = R * wp.vec3(vx, vy, 0.0)
-    xn = x + vw[0] * solver.dt
-    yn = y + vw[1] * solver.dt
-    yawn = yaw + wz * solver.dt
-
-    # --- project: settle the new pose (warm-started from current derived) ---
-    pose_next = wp.vec3(xn, yn, yawn)
+    pose_next = step_predict(
+        envelope,
+        friction,
+        grid,
+        robot,
+        solver,
+        wheel_omega[tid],
+        controlled[tid],
+        tc,
+        tid,
+        turn_out,
+    )
     settled = settle(envelope, grid, robot, solver, pose_next, tc)
-    controlled_next[tid] = pose_next
-    derived_next[tid] = settled
+    step_finalize(
+        envelope,
+        elevation,
+        grid,
+        robot,
+        pose_next,
+        settled,
+        tid,
+        controlled_next,
+        derived_next,
+        loads_out,
+        clear_out,
+        resid_out,
+    )
 
-    Rn = euler_zyx(yawn, settled[1], settled[2])
-    pn = wp.vec3(xn, yn, settled[0])
-    loads_out[tid] = normal_loads(envelope, grid, robot, Rn, pn)
-    turn_out[tid] = wp.vec2(alpha, x_icr)
-    clear_out[tid] = chassis_clearance(elevation, grid, robot, Rn, pn)
-    cres = clearances(envelope, grid, robot, xn, yn, yawn, settled[0], settled[1], settled[2])
-    resid_out[tid] = wp.max(wp.max(wp.abs(cres[0]), wp.abs(cres[1])), wp.abs(cres[2]))
+
+@wp.kernel
+def step_kernel_bt(
+    envelope: wp.array3d(dtype=wp.float32),  # [B, ny, nx] per-rollout terrain
+    elevation: wp.array3d(dtype=wp.float32),
+    friction: wp.array3d(dtype=wp.float32),
+    grid: Grid,
+    robot: Robot,
+    solver: Solver,
+    wheel_omega: wp.array(dtype=wp.vec3),  # [B] (wL, wR, w_rear) this step
+    controlled: wp.array(dtype=wp.vec3),  # [B] (x, y, yaw) current state
+    derived: wp.array(dtype=wp.vec3),  # [B] (z, pitch, roll) current state
+    controlled_next: wp.array(dtype=wp.vec3),  # [B] -> written
+    derived_next: wp.array(dtype=wp.vec3),
+    loads_out: wp.array(dtype=wp.vec3),
+    turn_out: wp.array(dtype=wp.vec2),
+    clear_out: wp.array(dtype=float),
+    resid_out: wp.array(dtype=float),
+):
+    """Batched-terrain step: rollout tid steps on its own slices; settle uses the full 3D array."""
+    tid = wp.tid()
+    tc = derived[tid]
+    pose_next = step_predict(
+        envelope[tid],
+        friction[tid],
+        grid,
+        robot,
+        solver,
+        wheel_omega[tid],
+        controlled[tid],
+        tc,
+        tid,
+        turn_out,
+    )
+    settled = settle_bt(envelope, tid, grid, robot, solver, pose_next, tc)
+    step_finalize(
+        envelope[tid],
+        elevation[tid],
+        grid,
+        robot,
+        pose_next,
+        settled,
+        tid,
+        controlled_next,
+        derived_next,
+        loads_out,
+        clear_out,
+        resid_out,
+    )
 
 
 @wp.kernel

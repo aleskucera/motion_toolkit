@@ -23,8 +23,8 @@ from kinematic_helhest.control.mppi import MppiGpu
 from kinematic_helhest.control.mppi import RobustConfig
 from kinematic_helhest.control.terminal import dock_control
 from kinematic_helhest.driver import WarpDriver
+from kinematic_helhest.engine import ForwardSimulator
 from kinematic_helhest.engine import GridParams
-from kinematic_helhest.engine import Simulator
 from kinematic_helhest.perception.lidar import crop_window
 from kinematic_helhest.perception.lidar import drift_scan
 from kinematic_helhest.perception.lidar import lidar_scan
@@ -60,7 +60,7 @@ def navigate(
     drv = WarpDriver(scene, mu, init_pose=tuple(start), device=device)  # REALITY (ground truth)
     # the planner lives on the WINDOW grid (local origin 0); terrain is set per-cycle from the crop
     win_grid = GridParams(ww, wh, cell, 0.0, 0.0)
-    plan_sim = Simulator(
+    plan_sim = ForwardSimulator(
         dynamics.robot_params(), dynamics.planning_solver(), win_grid, B, T, device
     )
     plan_sim.set_uniform_friction(0.8)
