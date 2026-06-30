@@ -78,3 +78,7 @@ uv run python test_synthetic.py --preset noisy        # tilted plane + bump
 uv run python test_ouster.py --path ouster.npy        # real lidar
 uv run python profile_pipeline.py --path ouster.npy   # per-stage profile
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
