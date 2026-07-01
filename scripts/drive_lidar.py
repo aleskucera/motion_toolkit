@@ -1,23 +1,27 @@
-"""Interactive 3D LiDAR viewer — drive an Ouster OSDome around a room.
+"""Interactive 3D LiDAR viewer — drive an Ouster OSDome and filter moving people.
 
 Models an Ouster OSDome (Rev7) mounted FRONT-facing: a 180° hemisphere of
 128 uniform beams pointing along the robot's heading, with the datasheet's real
-min/max range (0.5–45 m) and distance-dependent range precision. Real-time
+min/max range (0.5-45 m) and distance-dependent range precision. Real-time
 glfw + legacy OpenGL (same stack as motion_toolkit's viewer, which works on
-Wayland where open3d's GL viewer fails). Each frame polls the keyboard, moves the
-sensor, re-casts the Warp ray-cast LiDAR against a world of box obstacles, and
-draws the point cloud in 3D — so you see the returns, occlusion shadows, and the
-max-range cutoff update live as you drive. (Beam angles are a nominal uniform
-hemisphere; drop in the sensor's metadata JSON for the exact calibrated table.)
+Wayland where open3d's GL viewer fails).
+
+Two people walk around an OUTDOOR scene (open sky, no ceiling). Toggle the
+accumulated map on and you build a persistent cloud as you drive (poses are exact
+in sim, so no ICP needed); toggle the filter and free-space RAY-CARVING deletes
+the moving people and their trails — including the tops of their heads, which
+have only open sky behind them (a no-return beam is itself proof of free space).
+Their orange ground-truth boxes keep moving so you can see what was removed.
 
 Controls (polled — hold to move):
     W / S     forward / back        arrows    orbit camera
     A / D     turn left / right     - / =     zoom out / in
     Q / E     strafe                R         reset pose
+    M         toggle accumulated map (vs live scan)
+    F         toggle dynamic-obstacle filter        C   clear the map
     Esc       quit
 
 Needs `glfw` + `PyOpenGL` and a display:  uv pip install glfw PyOpenGL
-(the system libglfw is already present on most Linux desktops).
 
 Run: python scripts/drive_lidar.py
 """
@@ -27,46 +31,68 @@ from __future__ import annotations
 import math
 
 import numpy as np
+import warp as wp
+from terrain_toolkit import DeviceMapAccumulator
+from terrain_toolkit import DynamicPointFilter
 from terrain_toolkit.sim import GroundSpec
 from terrain_toolkit.sim import make_osdome_lidar
+from terrain_toolkit.sim import osdome_sensor_config
 from terrain_toolkit.sim.ouster import OSDOME_MAX_RANGE_M
 
 WIN_W, WIN_H = 1280, 800
-ROOM = 10.0  # half-extent of the room walls (m)
 GROUND = 60.0  # half-extent of the (open) ground plane — past the 45 m max range
 SENSOR_Z = 0.6  # sensor height (m)
 MOVE_SPEED = 3.0  # m/s
 TURN_SPEED = 1.6  # rad/s
 DROPOUT = 0.03  # stand-in for far / low-reflectivity return dropouts
+OSDOME_COLS = 1024  # Ouster OSDome azimuth columns (drop to 512 if heavy)
 
-# Ouster OSDome, FRONT-facing (128-channel hemisphere along +x). Real modes are
-# 1024/2048 columns; drop to 512 if the interactive loop feels heavy.
-OSDOME_COLS = 1024
+MAP_VOXEL = 0.15  # accumulated-map voxel size (m)
+MAP_RADIUS = 25.0  # keep accumulated points within this radius of the sensor (m)
 
 # viridis-ish 3-stop ramp for coloring points by height.
 _STOPS = np.array([[0.27, 0.0, 0.33], [0.13, 0.55, 0.55], [0.99, 0.91, 0.14]], np.float32)
 
 
-def _world() -> tuple[np.ndarray, np.ndarray]:
-    """Box obstacles as (M, 3) lo/hi corners: three walls (front open) + props.
+def _device() -> wp.context.Device:
+    wp.init()
+    return wp.get_device("cuda:0") if wp.is_cuda_available() else wp.get_device("cpu")
 
-    The +x wall is intentionally omitted, so facing forward you look out the open
-    side over empty ground — where returns stop at the sensor's max range.
+
+def _static_world() -> tuple[np.ndarray, np.ndarray]:
+    """Static obstacles (M, 3) lo/hi: an OUTDOOR scene under open sky.
+
+    Scattered walls and pillars, not enclosed and with no ceiling — the real
+    setting for this robot. Ray-carving removes the moving people here even though
+    there's open sky behind their heads (a no-return beam is itself free-space
+    evidence), so no artificial background is needed.
     """
-    t, h = 0.2, 2.5
+    h = 3.0
     boxes = [
-        ([-ROOM, -ROOM, 0.0], [ROOM, -ROOM + t, h]),  # back (y = -ROOM)
-        ([-ROOM, ROOM - t, 0.0], [ROOM, ROOM, h]),  # front-left (y = +ROOM)
-        ([-ROOM, -ROOM, 0.0], [-ROOM + t, ROOM, h]),  # rear (x = -ROOM)
-        # (+x wall dropped — the open side)
-        ([-4.0, 2.0, 0.0], [-3.4, 2.6, h]),
+        ([6.0, -7.0, 0.0], [6.4, 7.0, h]),  # a building face ahead
+        ([-8.0, -2.0, 0.0], [-2.0, -1.6, h]),  # a fence segment
+        ([-4.0, 2.0, 0.0], [-3.4, 2.6, h]),  # pillars
         ([3.0, -3.0, 0.0], [3.6, -2.4, h]),
-        ([1.0, 4.5, 0.0], [1.6, 5.1, h]),
-        ([-1.5, -1.5, 0.0], [-1.1, -1.1, 1.8]),  # person
-        ([5.0, 1.0, 0.0], [5.4, 1.4, 1.8]),  # person
+        ([1.0, 5.0, 0.0], [1.6, 5.6, h]),
     ]
     lo = np.array([b[0] for b in boxes], dtype=np.float32)
     hi = np.array([b[1] for b in boxes], dtype=np.float32)
+    return lo, hi
+
+
+def _people(t: float) -> tuple[np.ndarray, np.ndarray]:
+    """Two walking people as (2, 3) lo/hi boxes, on steady circular paths.
+
+    Constant-speed orbits (no lingering at a bearing) so the visibility filter
+    always has fresh background behind them to carve against.
+    """
+    centers = [
+        (5.0 * math.cos(0.6 * t), 5.0 * math.sin(0.6 * t)),
+        (3.5 * math.cos(-0.9 * t + 1.5), 3.5 * math.sin(-0.9 * t + 1.5)),
+    ]
+    half, height = 0.25, 1.8
+    lo = np.array([[cx - half, cy - half, 0.0] for cx, cy in centers], dtype=np.float32)
+    hi = np.array([[cx + half, cy + half, height] for cx, cy in centers], dtype=np.float32)
     return lo, hi
 
 
@@ -137,30 +163,73 @@ def _draw_points(gl, pts: np.ndarray, cols: np.ndarray) -> None:
 
 
 class State:
-    def __init__(self):
+    def __init__(self, device: wp.context.Device | None = None):
+        self.device = device if device is not None else _device()
+        # One sensor description drives both the simulated lidar and the filter's
+        # range image, so their FOV / resolution / range can't drift apart.
+        sensor = osdome_sensor_config(columns=OSDOME_COLS)
+        ground = GroundSpec(z=0.0, x_range=(-GROUND, GROUND), y_range=(-GROUND, GROUND))
         self.lidar = make_osdome_lidar(
-            GroundSpec(z=0.0, x_range=(-GROUND, GROUND), y_range=(-GROUND, GROUND)),
-            cols=OSDOME_COLS,
-            facing="front",
-            dropout=DROPOUT,
+            ground, sensor=sensor, facing="front", dropout=DROPOUT, device=self.device
         )
-        self.boxes_lo, self.boxes_hi = _world()
+        # FOV / range come from the sensor; the range-image resolution is tuned
+        # for carving (deliberately coarser than the sensor's native columns —
+        # too-fine bins split a map point from its frontier and under-carve).
+        self.filt = DynamicPointFilter.from_sensor(
+            sensor, margin_m=0.3, margin_rel=0.03, az_bins=720, el_bins=180, device=self.device
+        )
+        # On-device rolling map: carve + add + crop + voxel-thin without leaving
+        # the GPU. Only the displayed cloud is downloaded (for OpenGL).
+        self.acc = DeviceMapAccumulator(MAP_VOXEL, MAP_RADIUS, device=self.device)
+        self.static_lo, self.static_hi = _static_world()
         self._seed = 0
+        self._held: set[str] = set()
+        self.map_wp: wp.array | None = None  # accumulated map, resident on device
+        self.last_scan = np.empty((0, 3), np.float32)
+        self.people_lo, self.people_hi = _people(0.0)
+        self.accumulate = False
+        self.filter_on = True
         self.reset()
 
     def reset(self) -> None:
         self.x, self.y, self.yaw = 0.0, 0.0, 0.0
         self.cam_off = math.pi  # camera azimuth relative to heading (behind)
         self.cam_el = 0.5
-        self.cam_dist = 30.0  # start zoomed out (zoom with -/= to see the 45 m cutoff)
+        self.cam_dist = 30.0
 
-    def scan(self) -> np.ndarray:
+    def update(self, t: float) -> None:
+        """Advance people, cast a scan, and (optionally) accumulate + filter."""
+        self.people_lo, self.people_hi = _people(t)
+        boxes_lo = np.vstack([self.static_lo, self.people_lo])
+        boxes_hi = np.vstack([self.static_hi, self.people_hi])
         self._seed += 1
         origin = np.array([self.x, self.y, SENSOR_Z])
-        return self.lidar.scan(origin, self.yaw, self.boxes_lo, self.boxes_hi, seed=self._seed)
+        # Device-native: keep the scan on the GPU (points/valid/frontier as wp.arrays).
+        pts_wp, valid_wp, free_wp = self.lidar.scan(
+            origin, self.yaw, boxes_lo, boxes_hi, seed=self._seed, return_device=True
+        )
+
+        if not self.accumulate:
+            # Live view: download just this scan's returns for OpenGL.
+            self.last_scan = pts_wp.numpy()[valid_wp.numpy().astype(bool)]
+            return
+
+        carve = None
+        if self.filter_on and self.map_wp is not None and len(self.map_wp) > 0:
+            # Ray-carve on-device: a mask of map points this scan's beams passed
+            # through. A no-return beam frees space to max range, so heads against
+            # open sky get carved too — with no host round trip.
+            carve = self.filt.carve(self.map_wp, free_wp, origin)
+        self.map_wp = self.acc.step(self.map_wp, carve, pts_wp, valid_wp, (self.x, self.y))
+
+    def view_points(self) -> np.ndarray:
+        if not self.accumulate:
+            return self.last_scan
+        # Download the map once, only for rendering.
+        return self.map_wp.numpy() if self.map_wp is not None else np.empty((0, 3), np.float32)
 
 
-def _render(gl, glu, st: State, pts: np.ndarray, fb: tuple[int, int]) -> None:
+def _render(gl, glu, st: State, fb: tuple[int, int]) -> None:
     w, h = fb
     az = st.yaw + st.cam_off
     tgt = np.array([st.x, st.y, 1.0])
@@ -176,14 +245,19 @@ def _render(gl, glu, st: State, pts: np.ndarray, fb: tuple[int, int]) -> None:
     gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
     gl.glMatrixMode(gl.GL_PROJECTION)
     gl.glLoadIdentity()
-    glu.gluPerspective(55.0, w / max(h, 1), 0.1, 200.0)
+    glu.gluPerspective(55.0, w / max(h, 1), 0.1, 250.0)
     gl.glMatrixMode(gl.GL_MODELVIEW)
     gl.glLoadIdentity()
     glu.gluLookAt(*eye, *tgt, 0.0, 0.0, 1.0)
 
     _draw_grid(gl)
-    for lo, hi in zip(st.boxes_lo, st.boxes_hi):
+    for lo, hi in zip(st.static_lo, st.static_hi):
         _draw_box(gl, lo, hi, (0.55, 0.57, 0.6))
+    # People ground truth (orange) — stay visible even when filtered from the map.
+    for lo, hi in zip(st.people_lo, st.people_hi):
+        _draw_box(gl, lo, hi, (0.95, 0.55, 0.1))
+
+    pts = st.view_points()
     _draw_points(gl, pts, _height_colors(pts[:, 2]) if len(pts) else pts)
 
     # Sensor body + heading line.
@@ -201,7 +275,15 @@ def _render(gl, glu, st: State, pts: np.ndarray, fb: tuple[int, int]) -> None:
     gl.glEnd()
 
 
-def _handle_input(glfw, win, st: State, dt: float) -> None:
+def _title(st: State) -> str:
+    mode = "accumulated map" if st.accumulate else "live scan"
+    filt = "filter ON" if st.filter_on else "filter OFF"
+    return f"OSDome (max {OSDOME_MAX_RANGE_M:.0f} m) — {mode}, {filt} [{len(st.view_points())} pts]"
+
+
+def _handle_input(glfw, win, st: State, dt: float) -> bool:
+    """Apply held-key motion; return True if a toggle changed the window title."""
+
     def down(key) -> bool:
         return glfw.get_key(win, key) == glfw.PRESS
 
@@ -211,11 +293,10 @@ def _handle_input(glfw, win, st: State, dt: float) -> None:
     c, s = math.cos(st.yaw), math.sin(st.yaw)
     st.x += fwd * c - strafe * s
     st.y += fwd * s + strafe * c
-    m = GROUND - 0.5  # roam the whole ground, including out the open side
+    m = GROUND - 0.5
     st.x = float(np.clip(st.x, -m, m))
     st.y = float(np.clip(st.y, -m, m))
 
-    # Camera orbit + zoom.
     st.cam_off += (
         1.5 * dt * ((1 if down(glfw.KEY_LEFT) else 0) - (1 if down(glfw.KEY_RIGHT) else 0))
     )
@@ -229,6 +310,23 @@ def _handle_input(glfw, win, st: State, dt: float) -> None:
     if down(glfw.KEY_R):
         st.reset()
 
+    # Rising-edge toggles (M/F/C).
+    toggled = False
+    for key, name in ((glfw.KEY_M, "m"), (glfw.KEY_F, "f"), (glfw.KEY_C, "c")):
+        if down(key):
+            if name not in st._held:
+                if name == "m":
+                    st.accumulate = not st.accumulate
+                elif name == "f":
+                    st.filter_on = not st.filter_on
+                else:
+                    st.map_wp = None
+                toggled = True
+            st._held.add(name)
+        else:
+            st._held.discard(name)
+    return toggled
+
 
 def main() -> None:
     try:
@@ -240,8 +338,8 @@ def main() -> None:
 
     if not glfw.init():
         raise SystemExit("glfw.init() failed (no display / missing libglfw?)")
-    title = f"terrain_toolkit — Ouster OSDome (front-facing, max {OSDOME_MAX_RANGE_M:.0f} m)"
-    win = glfw.create_window(WIN_W, WIN_H, title, None, None)
+    st = State()
+    win = glfw.create_window(WIN_W, WIN_H, _title(st), None, None)
     if not win:
         glfw.terminate()
         raise SystemExit("failed to create a window")
@@ -249,7 +347,6 @@ def main() -> None:
     glfw.swap_interval(1)
     _init_gl()
 
-    st = State()
     prev = glfw.get_time()
     while not glfw.window_should_close(win):
         glfw.poll_events()
@@ -259,7 +356,9 @@ def main() -> None:
         if glfw.get_key(win, glfw.KEY_ESCAPE) == glfw.PRESS:
             break
         _handle_input(glfw, win, st, dt)
-        _render(gl, glu, st, st.scan(), glfw.get_framebuffer_size(win))
+        st.update(now)
+        glfw.set_window_title(win, _title(st))
+        _render(gl, glu, st, glfw.get_framebuffer_size(win))
         glfw.swap_buffers(win)
 
     glfw.terminate()
