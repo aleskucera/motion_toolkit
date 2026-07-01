@@ -44,6 +44,69 @@ ros2 launch terrain_toolkit_ros terrain_toolkit_node.launch.py \
 All pipeline parameters can be changed at runtime with `ros2 param set` /
 `rqt_reconfigure` — the pipeline is rebuilt in-place.
 
+## Accumulating mapper (`terrain_accumulator_node`)
+
+`terrain_toolkit_node` maps a single scan. `terrain_accumulator_node` fuses the
+LiDAR stream with robot odometry (`nav_msgs/Odometry`) into a persistent point
+cloud and runs the same pipeline over a **robot-centric window** of it, so the
+published `terrain_map` covers more than one scan (terrain already passed or
+hidden behind obstacles is retained).
+
+Each scan is registered **scan-to-submap** with point-to-plane ICP, using the
+odometry frame-to-frame delta as the initial guess; the refined trajectory
+corrects odom drift. The map is accumulated in `map_frame`, which is bootstrapped
+to the odom frame on the first scan — so it must be **gravity-aligned**
+(odom z-axis up). A `map→odom` correction transform is broadcast for RViz.
+
+> Not a SLAM back-end: there is no loop closure, and ICP roll/pitch corrections
+> can slowly tilt the world frame over very long runs (negligible for the
+> bounded window).
+
+```bash
+ros2 launch terrain_toolkit_ros terrain_accumulator_node.launch.py \
+    lidar_topic:=/points \
+    odom_topic:=/odom \
+    base_frame:=base_link \
+    map_frame:=map \
+    x_range:=12.0 y_range:=12.0
+```
+
+Key extra parameters (beyond the shared pipeline set): `odom_topic`,
+`base_frame` (must match the odometry `child_frame_id`), `map_frame`,
+`accumulation_voxel_m`, `map_max_radius_m`, `icp_enable`, `icp_submap_radius_m`,
+`icp_voxel_size_m`, and the ICP divergence gate (`icp_min_inliers`,
+`icp_max_corr_trans_m`, `icp_max_corr_rot_deg`, `icp_min_submap_points`). See
+`launch/terrain_accumulator_node.launch.py` for the full list and defaults.
+
+### Dynamic obstacle filter (`dynamic_enable`)
+
+Moving objects (people walking around the robot) would otherwise smear into the
+accumulated map. Set `dynamic_enable:=true` to drop them by **map-frame
+visibility**: each scan is compared against the accumulated map through a
+spherical range image rendered from the current sensor pose. Scan points sitting
+*in front of* known static geometry are dropped (a person occluding the
+background), and map points the scan now sees *through* are carved (the trail
+that person left). It removes **moving** objects only — a person standing
+motionless is geometrically a static pillar and is kept. It works for a
+stationary robot (it degenerates to per-beam background subtraction) and for slow
+motion (the tracked pose keeps the two range images aligned).
+
+Tuning: `dynamic_el_min_deg`/`dynamic_el_max_deg` should match your sensor's
+vertical FOV; `dynamic_az_bins`/`dynamic_el_bins` set the range-image resolution
+(roughly the sensor's beam pattern); `dynamic_margin_m` + `dynamic_margin_rel`
+trade false removals (too small) against missed dynamics (too large).
+
+Bring-up checklist:
+
+1. `pip install -e .` (core lib) then `colcon build --packages-select
+   terrain_toolkit_ros --symlink-install`.
+2. Play a bag with a `PointCloud2`, a `nav_msgs/Odometry`, and a static
+   sensor→`base_frame` TF.
+3. Launch as above; in RViz set the fixed frame to `map`.
+4. Confirm `terrain_map` grows past a single scan, stays level, and tracks the
+   robot; check that the `map→odom` TF appears. Watch the log for ICP
+   divergence-fallback / sparse-submap messages.
+
 ## Parameters
 
 | Group | Parameter | Default | Description |

@@ -26,6 +26,7 @@ setup(
     entry_points={
         "console_scripts": [
             "terrain_toolkit_node = terrain_toolkit_ros.terrain_toolkit_node:main",
+            "terrain_accumulator_node = terrain_toolkit_ros.terrain_accumulator_node:main",
         ],
     },
 )
