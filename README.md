@@ -76,6 +76,45 @@ python -m tests.engine.gradients              # implicit-gradient finite-diff or
 The package is `kinematic_helhest`; `engine/` is the runtime, `reference/` is the
 numpy finite-difference oracle (verification only).
 
+## Blender visualization
+
+Export a rollout to a self-contained `.npz`, then animate it in Blender — the
+heightmap becomes a mesh and the robot's 6-DOF pose + per-wheel spin are keyframed.
+
+```bash
+# 1. run a rollout and write the .npz (a straight climb up the ramp scene)
+python -m kinematic_helhest.viz.blender_export rollout.npz
+
+# 2a. build the scene (box+cylinder proxy robot) and open it in Blender
+blender --python src/kinematic_helhest/viz/blender_import.py -- --data rollout.npz
+
+# 2b. headless render straight to MP4 (PNG sequence if Blender lacks FFMPEG)
+blender --background --python src/kinematic_helhest/viz/blender_import.py -- \
+    --data rollout.npz --render out.mp4
+
+# 2c. drive your own rigged model (a .blend with separate wheel objects)
+blender --python src/kinematic_helhest/viz/blender_import.py -- --data rollout.npz \
+    --robot robot.blend \
+    --wheel-left WheelL --wheel-right WheelR --wheel-rear WheelRear
+```
+
+Frame convention is the sim's: X-forward, Y-left, Z-up, meters/radians; wheels spin
+about body Y (`--wheel-axis`). A rigged model is appended whole (hierarchy + materials)
+and auto-aligned: the animation root is placed at the front-axle hub center (mean of the
+left/right wheels), matching the sim's pose origin, so no manual offset/scale is needed.
+The 10 Hz sim is interpolated to `--fps` (default 30) for smooth playback.
+
+### Remote GPU render (dasenka)
+
+`scripts/render_dasenka.sh` ships the script + `.npz` (+ a local `--robot` model) to a
+remote box, renders headless on a pinned GPU (`VK_DEVICE_INDEX` + Vulkan/EEVEE), encodes
+to MP4 there, and copies it back:
+
+```bash
+OUT=~/clip.mp4 RES=1920x1080 ./scripts/render_dasenka.sh rollout.npz <gpu> -- \
+    --robot robot.blend --wheel-left WheelL --wheel-right WheelR --wheel-rear WheelRear
+```
+
 ## Phases
 
 Built in phases, each independently verifiable:
