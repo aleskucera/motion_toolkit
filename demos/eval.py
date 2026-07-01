@@ -9,7 +9,6 @@ reach / frames / closest approach / wall-contact frames. This is the loop that m
   python demos/eval.py --world pocket
   python demos/eval.py --stress [--K 8] [--dock-radius 1.5]
 """
-
 import argparse
 
 import numpy as np
@@ -35,6 +34,7 @@ def evaluate(
     max_frames=1500,
     B=4096,
     T=70,
+    record=False,
 ):
     import time
 
@@ -76,9 +76,13 @@ def evaluate(
     drv = WarpDriver(scene, mu, init_pose=tuple(start), device=device)
 
     contacts, closest, reached, f = 0, 99.0, False, 0
+    poses, cmds = [], []  # trajectory recording (record=True): pose per frame, cmd per step
     for f in range(max_frames):
         st = drv.render_state()
         state = np.array([st.x, st.y, st.yaw], np.float32)
+        if record:
+            p = st.place
+            poses.append((st.x, st.y, p["z"], st.yaw, p["pitch"], p["roll"], st.valid))
         d = float(np.hypot(st.x - goal[0], st.y - goal[1]))
         closest = min(closest, d)
         if d < 0.3:
@@ -90,10 +94,19 @@ def evaluate(
             planner.replan(state, goal, 3)  # MPPI + cost-to-go routing
             u = planner.nominal()
             cmd = np.array([u[0, 0], u[0, 1], 0.5 * (u[0, 0] + u[0, 1])], np.float32)
+        if record:
+            cmds.append(tuple(float(c) for c in cmd))
         drv.step(cmd)
         if drv.clear < 0.05:
             contacts += 1
-    return dict(reached=reached, frames=f + 1, closest=closest, contacts=contacts, ctg_ms=ctg_ms)
+    result = dict(reached=reached, frames=f + 1, closest=closest, contacts=contacts, ctg_ms=ctg_ms)
+    if record:
+        if len(poses) == len(cmds):  # loop hit max_frames -> capture the final pose too
+            st = drv.render_state()
+            p = st.place
+            poses.append((st.x, st.y, p["z"], st.yaw, p["pitch"], p["roll"], st.valid))
+        result.update(poses=poses, cmds=cmds, scene=scene, dt=dynamics.DT)
+    return result
 
 
 def stress(device="cuda", **kw):
