@@ -5,6 +5,7 @@ __pycache__/
 # Generated outputs
 *.html
 *.png
+*.gif
 
 # Data files
 *.npy
