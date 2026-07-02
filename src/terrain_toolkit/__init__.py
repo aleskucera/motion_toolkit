@@ -14,6 +14,8 @@ from .icp import IcpConfig
 from .icp import IcpResult
 from .icp import voxel_downsample
 from .mapping import DeviceMapAccumulator
+from .occlusion import OcclusionConfig
+from .occlusion import OcclusionMask
 from .outlier import OutlierFilterConfig
 from .outlier import RadiusOutlierFilter
 from .outlier import RadiusOutlierFilterConfig
@@ -27,8 +29,6 @@ from .sim import PrimitiveLidar
 from .traversability import FilterConfig
 from .traversability import GeometricTraversabilityAnalyzer
 from .traversability import ObstacleInflator
-from .traversability import OcclusionConfig
-from .traversability import OcclusionMask
 from .traversability import SupportRatioMask
 from .traversability import TemporalGate
 from .traversability import TraversabilityConfig

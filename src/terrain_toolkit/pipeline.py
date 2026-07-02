@@ -12,6 +12,8 @@ from .heightmap import FootprintConfig
 from .heightmap import gaussian_smooth
 from .heightmap import HeightMapBuilder
 from .heightmap import multigrid_inpaint
+from .occlusion import OcclusionConfig
+from .occlusion import OcclusionMask
 from .outlier import OutlierFilterConfig
 from .outlier import RadiusOutlierFilter
 from .outlier import RadiusOutlierFilterConfig
@@ -19,8 +21,6 @@ from .outlier import StatisticalOutlierFilter
 from .traversability import FilterConfig
 from .traversability import GeometricTraversabilityAnalyzer
 from .traversability import ObstacleInflator
-from .traversability import OcclusionConfig
-from .traversability import OcclusionMask
 from .traversability import SupportRatioMask
 from .traversability import TemporalGate
 from .traversability import TraversabilityConfig
