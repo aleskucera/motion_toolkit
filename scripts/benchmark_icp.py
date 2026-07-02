@@ -181,16 +181,12 @@ def main() -> None:
         "upload",
         "grid_build",
         "normals",
-        "launch_kernels",
-        "gpu_sync",
-        "cpu_solve",
+        "iterations",
     ]
     for key in order:
         v = profile_sum.get(key, 0.0) / args.runs
         pct = 100.0 * v / total_times.mean()
-        label = key
-        if key in ("launch_kernels", "gpu_sync", "cpu_solve"):
-            label = f"{key} (all iters summed)"
+        label = f"{key} (GPU, all iters)" if key == "iterations" else f"{key} (GPU)"
         print(f"  {label:32s} {v:7.2f}  ({pct:5.1f}%)")
 
 

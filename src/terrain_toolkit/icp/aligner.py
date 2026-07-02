@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import math
-import time
 from dataclasses import dataclass
 from dataclasses import field
 
@@ -43,39 +42,41 @@ class IcpConfig:
 _MAX_VOXEL_GRID_CELLS = 20_000_000
 
 
-class _Stopwatch:
-    """Optional per-stage GPU timing for `IcpAligner.align`; a no-op unless enabled.
+class _EventTimer:
+    """Per-stage GPU timing via CUDA events; a no-op unless enabled and on CUDA.
 
-    When enabled, `stage()` brackets a block with device syncs so the elapsed
-    time reflects real GPU work; `tic()`/`add()` cover the per-iteration splits.
+    Each `stage()` records a start/stop event pair on the stream — recording is
+    async and adds no sync, so profiling does not serialize the pipeline the way
+    a per-stage `wp.synchronize()` would. `read()` folds the elapsed intervals
+    into per-stage milliseconds at the end (that read syncs on the stop events,
+    so treat the per-stage means as the cost, not the profiled wall-clock).
     """
 
-    def __init__(self, enabled: bool):
-        self.enabled = enabled
+    def __init__(self, device: wp.context.Device, enabled: bool):
+        self.device = device
+        self.enabled = bool(enabled) and device.is_cuda
         self.ms: dict[str, float] = {}
+        self._intervals: list[tuple[str, wp.Event, wp.Event]] = []
 
     @contextlib.contextmanager
     def stage(self, key: str):
         if not self.enabled:
             yield
             return
-        wp.synchronize()
-        start = time.perf_counter()
+        start = wp.Event(device=self.device, enable_timing=True)
+        stop = wp.Event(device=self.device, enable_timing=True)
+        wp.record_event(start)
         try:
             yield
         finally:
-            wp.synchronize()
-            self.ms[key] = self.ms.get(key, 0.0) + (time.perf_counter() - start) * 1000.0
+            wp.record_event(stop)
+            self._intervals.append((key, start, stop))
 
-    def tic(self) -> float:
-        """Sync (when enabled) and return a timestamp, for manual sub-splits."""
-        if self.enabled:
-            wp.synchronize()
-        return time.perf_counter()
-
-    def add(self, key: str, ms: float) -> None:
-        if self.enabled:
-            self.ms[key] = self.ms.get(key, 0.0) + ms
+    def read(self) -> None:
+        """Fold every recorded interval into `ms` (sums repeats, e.g. per-iter)."""
+        for key, start, stop in self._intervals:
+            self.ms[key] = self.ms.get(key, 0.0) + wp.get_event_elapsed_time(start, stop)
+        self._intervals.clear()
 
 
 def _voxel_grid_dims(mins: np.ndarray, maxs: np.ndarray, voxel_size: float) -> tuple[np.ndarray, int]:
@@ -318,24 +319,24 @@ class IcpAligner:
 
         cfg = self.config
         grid_radius = max(cfg.max_correspondence_dist_m, cfg.normal_radius_m)
-        sw = _Stopwatch(profile)
-
-        if cfg.voxel_size_m is not None and cfg.voxel_size_m > 0.0:
-            with sw.stage("voxel_downsample"):
-                source = self._voxel_downsample(source, cfg.voxel_size_m)
-                if cfg.voxel_target:
-                    target = self._voxel_downsample(target, cfg.voxel_size_m)
+        prof = _EventTimer(self.device, profile)
 
         with wp.ScopedDevice(self.device):
-            with sw.stage("upload"):
+            if cfg.voxel_size_m is not None and cfg.voxel_size_m > 0.0:
+                with prof.stage("voxel_downsample"):
+                    source = self._voxel_downsample(source, cfg.voxel_size_m)
+                    if cfg.voxel_target:
+                        target = self._voxel_downsample(target, cfg.voxel_size_m)
+
+            with prof.stage("upload"):
                 src_wp = wp.array(np.ascontiguousarray(source, dtype=np.float32), dtype=wp.vec3)
                 tgt_wp = wp.array(np.ascontiguousarray(target, dtype=np.float32), dtype=wp.vec3)
 
-            with sw.stage("grid_build"):
+            with prof.stage("grid_build"):
                 grid = self._ensure_grid(grid_radius, target)
                 grid.build(points=tgt_wp, radius=float(grid_radius))
 
-            with sw.stage("normals"):
+            with prof.stage("normals"):
                 normals_wp = wp.empty(len(target), dtype=wp.vec3)
                 valid_wp = wp.empty(len(target), dtype=wp.int32)
                 wp.launch(
@@ -370,38 +371,35 @@ class IcpAligner:
 
             for it in range(cfg.max_iters):
                 iters_run = it + 1
-                ts = sw.tic()
                 R = T[:3, :3].astype(np.float32)
                 t = T[:3, 3].astype(np.float32)
 
-                JtJ_wp.zero_()
-                Jtr_wp.zero_()
-                cost_wp.zero_()
-                inliers_wp.zero_()
-
-                wp.launch(
-                    transform_points_kernel,
-                    dim=len(source),
-                    inputs=[src_wp, wp.mat33(R.flatten().tolist()), wp.vec3(*t.tolist())],
-                    outputs=[transformed_wp],
-                )
-                wp.launch(
-                    accumulate_system_kernel,
-                    dim=len(source),
-                    inputs=[
-                        grid.id,
-                        tgt_wp,
-                        normals_wp,
-                        valid_wp,
-                        transformed_wp,
-                        float(cfg.max_correspondence_dist_m),
-                        float(cfg.huber_delta),
-                    ],
-                    outputs=[JtJ_wp, Jtr_wp, cost_wp, inliers_wp],
-                )
-                t_launch = time.perf_counter()
+                with prof.stage("iterations"):
+                    JtJ_wp.zero_()
+                    Jtr_wp.zero_()
+                    cost_wp.zero_()
+                    inliers_wp.zero_()
+                    wp.launch(
+                        transform_points_kernel,
+                        dim=len(source),
+                        inputs=[src_wp, wp.mat33(R.flatten().tolist()), wp.vec3(*t.tolist())],
+                        outputs=[transformed_wp],
+                    )
+                    wp.launch(
+                        accumulate_system_kernel,
+                        dim=len(source),
+                        inputs=[
+                            grid.id,
+                            tgt_wp,
+                            normals_wp,
+                            valid_wp,
+                            transformed_wp,
+                            float(cfg.max_correspondence_dist_m),
+                            float(cfg.huber_delta),
+                        ],
+                        outputs=[JtJ_wp, Jtr_wp, cost_wp, inliers_wp],
+                    )
                 wp.synchronize()  # pull the normal equations back to solve on the host
-                t_sync = time.perf_counter()
 
                 H_upper = JtJ_wp.numpy().astype(np.float64)
                 H = np.triu(H_upper) + np.triu(H_upper, 1).T
@@ -425,11 +423,6 @@ class IcpAligner:
                 T = _exp_se3(delta) @ T
                 final_cost = c
                 final_inliers = n_in
-                t_solve = time.perf_counter()
-
-                sw.add("launch_kernels", (t_launch - ts) * 1000.0)
-                sw.add("gpu_sync", (t_sync - t_launch) * 1000.0)
-                sw.add("cpu_solve", (t_solve - t_sync) * 1000.0)
 
                 dr = float(np.linalg.norm(delta[:3]))
                 dt = float(np.linalg.norm(delta[3:]))
@@ -443,11 +436,13 @@ class IcpAligner:
                     converged = True
                     break
 
+            prof.read()
+
         return IcpResult(
             pose=T,
             iterations=iters_run,
             final_cost=final_cost,
             num_inliers=final_inliers,
             converged=converged,
-            timings_ms=sw.ms if profile else {},
+            timings_ms=prof.ms if profile else {},
         )
