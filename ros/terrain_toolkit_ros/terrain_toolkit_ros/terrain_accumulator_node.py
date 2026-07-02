@@ -45,6 +45,7 @@ from tf2_ros import TransformBroadcaster
 from tf2_ros import TransformException
 
 from ._mapping_math import crop_box
+from ._mapping_math import deskew_scan
 from ._mapping_math import invert_pose
 from ._mapping_math import matrix_to_quaternion
 from ._mapping_math import odom_delta
@@ -54,7 +55,7 @@ from ._pipeline_common import build_pipeline
 from ._pipeline_common import declare_pipeline_parameters
 from ._pipeline_common import grid_to_cloud
 from ._pipeline_common import PIPELINE_PARAMS
-from ._pipeline_common import pointcloud2_to_xyz_array
+from ._pipeline_common import pointcloud2_to_xyz_time_array
 from ._pipeline_common import quaternion_to_matrix
 from ._pipeline_common import read_pipeline_parameters
 
@@ -97,6 +98,8 @@ _NODE_PARAM_KEYS: tuple[str, ...] = (
     "icp_min_submap_points",
     "publish_map_tf",
     "dynamic_enable",
+    "deskew_enable",
+    "deskew_time_field",
 )
 
 
@@ -122,6 +125,7 @@ class TerrainAccumulatorNode(Node):
         self.global_cloud: np.ndarray | None = None
         self.odom_T_base_prev: np.ndarray | None = None
         self.world_T_base_prev: np.ndarray | None = None
+        self._deskew_warned = False  # warn once if deskew is on but the cloud lacks times
 
         self._build_pipeline(p)
         self._build_aligner(p)
@@ -179,6 +183,18 @@ class TerrainAccumulatorNode(Node):
             "sync_slop_s", 0.05, fp("Cloud/odom time-sync tolerance (s)", 0.0, 1.0)
         )
         self.declare_parameter("sync_queue", 30, ip("Cloud/odom sync queue size", 1, 1000))
+
+        # Scan deskew (motion compensation over the sweep)
+        self.declare_parameter(
+            "deskew_enable",
+            True,
+            sp("Motion-compensate each sweep using the odom delta before ICP/accumulate"),
+        )
+        self.declare_parameter(
+            "deskew_time_field",
+            "t",
+            sp("Per-point time field for deskew (Ouster organized clouds use 't')"),
+        )
 
         # Accumulation / map
         self.declare_parameter(
@@ -296,6 +312,8 @@ class TerrainAccumulatorNode(Node):
         self.icp_max_corr_rot_rad: float = float(np.deg2rad(p["icp_max_corr_rot_deg"]))
         self.icp_min_submap_points: int = p["icp_min_submap_points"]
         self.publish_map_tf: bool = p["publish_map_tf"]
+        self.deskew_enable: bool = p["deskew_enable"]
+        self.deskew_time_field: str = p["deskew_time_field"]
         # Window half-extents double as the pipeline grid bounds.
         self.x_range: float = p["x_range"]
         self.y_range: float = p["y_range"]
@@ -377,9 +395,10 @@ class TerrainAccumulatorNode(Node):
         if scan is None or scan[0].shape[0] == 0:
             self.get_logger().warn("Empty / untransformable scan — skipping.")
             return
-        scan_base, base_T_sensor = scan
+        scan_base, base_T_sensor, point_times = scan
 
         # First scan: bootstrap world ≡ odom, seed the map, publish, return.
+        # (No odom delta yet, so this one sweep is left un-deskewed — negligible.)
         if self.odom_T_base_prev is None:
             world_T_base = odom_T_base_curr
             world_pts = transform_points_xyz(world_T_base, scan_base)
@@ -395,6 +414,11 @@ class TerrainAccumulatorNode(Node):
         # Predict the new pose from the odom delta on top of the corrected pose.
         delta = odom_delta(self.odom_T_base_prev, odom_T_base_curr)
         world_T_base_pred = self.world_T_base_prev @ delta
+
+        # Motion-compensate the sweep to its end instant before registering /
+        # accumulating: the odom delta doubles as the constant-velocity sweep motion.
+        if self.deskew_enable:
+            scan_base = self._deskew(scan_base, point_times, delta)
 
         world_T_base = self._register(scan_base, world_T_base_pred)
 
@@ -416,6 +440,34 @@ class TerrainAccumulatorNode(Node):
         self._broadcast_map_tf(world_T_base, odom_msg)
         self.odom_T_base_prev = odom_T_base_curr
         self.world_T_base_prev = world_T_base
+
+    # ------------------------------------------------------------------
+    # Scan deskew (motion compensation over the sweep)
+    # ------------------------------------------------------------------
+
+    def _deskew(
+        self, scan_base: np.ndarray, point_times: np.ndarray | None, delta: np.ndarray
+    ) -> np.ndarray:
+        """Motion-compensate the sweep to its end instant; pass through if unavailable.
+
+        `delta` (base_prev→base_curr) is the sweep motion under the node's
+        constant-velocity assumption (consecutive scans, cloud stamped at scan
+        end — the Ouster default). Point times are normalized so the latest point
+        maps to the reference (end) pose.
+        """
+        if point_times is None:
+            if not self._deskew_warned:
+                self.get_logger().warn(
+                    f"deskew enabled but cloud has no '{self.deskew_time_field}' field "
+                    "— skipping motion compensation."
+                )
+                self._deskew_warned = True
+            return scan_base
+        span = float(point_times.max() - point_times.min())
+        if span <= 0.0:  # single-instant cloud (or a constant field) — nothing to correct
+            return scan_base
+        alphas = (point_times - point_times.min()) / span
+        return deskew_scan(scan_base, alphas, delta).astype(np.float32)
 
     # ------------------------------------------------------------------
     # ICP registration (scan-to-submap, with divergence gate)
@@ -542,12 +594,17 @@ class TerrainAccumulatorNode(Node):
         T[2, 3] = p.z
         return T
 
-    def _scan_in_base(self, cloud_msg: PointCloud2) -> tuple[np.ndarray, np.ndarray] | None:
+    def _scan_in_base(
+        self, cloud_msg: PointCloud2
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None] | None:
         """Transform the cloud into base_frame using the (static) sensor→base TF.
 
-        Returns `(scan_base, base_T_sensor)`: the points in base_frame and the
-        4x4 base←sensor transform (its translation is the sensor origin in base,
-        needed by the dynamic filter's visibility test).
+        Returns `(scan_base, base_T_sensor, point_times)`: the points in
+        base_frame, the 4x4 base←sensor transform (its translation is the sensor
+        origin in base, needed by the dynamic filter's visibility test), and the
+        per-point sweep times (aligned to `scan_base`; None if the cloud has no
+        time field), used by deskew. The static extrinsic preserves point order,
+        so the times stay aligned through the transform.
         """
         try:
             transform = self.tf_buffer.lookup_transform(
@@ -567,14 +624,14 @@ class TerrainAccumulatorNode(Node):
         base_T_sensor[1, 3] = t.y
         base_T_sensor[2, 3] = t.z
 
-        points = pointcloud2_to_xyz_array(cloud_msg)
+        points, point_times = pointcloud2_to_xyz_time_array(cloud_msg, self.deskew_time_field)
         if points.size == 0:
-            return np.empty((0, 3), dtype=np.float32), base_T_sensor
+            return np.empty((0, 3), dtype=np.float32), base_T_sensor, None
 
         scan_base = transform_points_xyz(base_T_sensor, points.astype(np.float64)).astype(
             np.float32
         )
-        return scan_base, base_T_sensor
+        return scan_base, base_T_sensor, point_times
 
 
 def main(args=None) -> None:

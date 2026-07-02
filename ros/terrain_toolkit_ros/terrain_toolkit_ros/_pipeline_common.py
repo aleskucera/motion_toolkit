@@ -425,6 +425,30 @@ def pointcloud2_to_xyz_array(msg: PointCloud2) -> np.ndarray:
     return xyz.astype(np.float32)
 
 
+def pointcloud2_to_xyz_time_array(
+    msg: PointCloud2, time_field: str = "t"
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Parse xyz plus a per-point time field, kept index-aligned.
+
+    Reads `time_field` in the *same* `read_points` call as x/y/z so the shared
+    `skip_nans` mask drops the same rows from both — a separate read would
+    desync the two. Returns `(xyz (N, 3) float32, times (N,) float64)`, with
+    `times = None` when the cloud has no such field (e.g. an unorganized sensor).
+    Ouster organized clouds carry `t` = ns since the scan start, per point.
+    """
+    has_time = any(f.name == time_field for f in msg.fields)
+    names = ("x", "y", "z", time_field) if has_time else ("x", "y", "z")
+    pc = pc2.read_points(msg, field_names=names, skip_nans=True, reshape_organized_cloud=False)
+    if isinstance(pc, np.ndarray) and pc.dtype.names is not None:
+        xyz = np.stack([pc["x"], pc["y"], pc["z"]], axis=-1).astype(np.float32)
+        times = pc[time_field].astype(np.float64) if has_time else None
+    else:  # generator fallback (older sensor_msgs_py)
+        arr = np.array(list(pc), dtype=np.float64)
+        xyz = arr[:, :3].astype(np.float32)
+        times = arr[:, 3] if has_time else None
+    return xyz, times
+
+
 def grid_to_cloud(
     terrain_map: TerrainMap,
     x_min: float,
