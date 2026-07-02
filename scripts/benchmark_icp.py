@@ -178,12 +178,6 @@ def main() -> None:
     print("Per-stage timing (mean ms per align):")
     order = [
         "voxel_downsample",
-        "vx_cpu_setup",
-        "vx_zero_buffers",
-        "vx_upload",
-        "vx_accumulate",
-        "vx_compact",
-        "vx_readback",
         "upload",
         "grid_build",
         "normals",

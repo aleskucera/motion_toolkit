@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import math
 import time
 from dataclasses import dataclass
@@ -42,6 +43,85 @@ class IcpConfig:
 _MAX_VOXEL_GRID_CELLS = 20_000_000
 
 
+class _Stopwatch:
+    """Optional per-stage GPU timing for `IcpAligner.align`; a no-op unless enabled.
+
+    When enabled, `stage()` brackets a block with device syncs so the elapsed
+    time reflects real GPU work; `tic()`/`add()` cover the per-iteration splits.
+    """
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self.ms: dict[str, float] = {}
+
+    @contextlib.contextmanager
+    def stage(self, key: str):
+        if not self.enabled:
+            yield
+            return
+        wp.synchronize()
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            wp.synchronize()
+            self.ms[key] = self.ms.get(key, 0.0) + (time.perf_counter() - start) * 1000.0
+
+    def tic(self) -> float:
+        """Sync (when enabled) and return a timestamp, for manual sub-splits."""
+        if self.enabled:
+            wp.synchronize()
+        return time.perf_counter()
+
+    def add(self, key: str, ms: float) -> None:
+        if self.enabled:
+            self.ms[key] = self.ms.get(key, 0.0) + ms
+
+
+def _voxel_grid_dims(mins: np.ndarray, maxs: np.ndarray, voxel_size: float) -> tuple[np.ndarray, int]:
+    """Per-axis cell counts and total cells for a voxel grid over [mins, maxs]."""
+    dims = np.ceil((maxs - mins) / voxel_size).astype(np.int64) + 1
+    n_vx = int(dims.prod())
+    if n_vx > _MAX_VOXEL_GRID_CELLS:
+        raise ValueError(
+            f"voxel grid has {n_vx} cells (>{_MAX_VOXEL_GRID_CELLS}); use a larger voxel_size"
+        )
+    return dims, n_vx
+
+
+def _voxel_bin(
+    points_wp: wp.array,
+    n: int,
+    min_corner: wp.vec3,
+    inv_voxel: float,
+    dims: np.ndarray,
+    n_vx: int,
+    sums: wp.array,
+    counts: wp.array,
+    counter: wp.array,
+    out: wp.array,
+) -> int:
+    """Bin `points_wp` to one centroid per occupied voxel in caller-owned buffers.
+
+    `sums`/`counts` (len ≥ n_vx) and `counter` must be pre-zeroed; `out` (len ≥ n)
+    receives the centroids. Returns the number written.
+    """
+    wp.launch(
+        voxel_accumulate_kernel,
+        dim=n,
+        inputs=[points_wp, min_corner, inv_voxel, int(dims[0]), int(dims[1]), int(dims[2])],
+        outputs=[sums, counts],
+    )
+    wp.launch(
+        voxel_compact_kernel,
+        dim=n_vx,
+        inputs=[sums, counts],
+        outputs=[counter, out],
+    )
+    wp.synchronize()
+    return int(counter.numpy()[0])
+
+
 def voxel_downsample(
     points: np.ndarray,
     voxel_size: float,
@@ -55,46 +135,22 @@ def voxel_downsample(
     pts = np.ascontiguousarray(points, dtype=np.float32)
     mins = pts.min(axis=0)
     maxs = pts.max(axis=0)
-    dims = np.ceil((maxs - mins) / voxel_size).astype(np.int64) + 1
-    n_vx = int(dims.prod())
-    if n_vx > _MAX_VOXEL_GRID_CELLS:
-        raise ValueError(
-            f"voxel grid has {n_vx} cells (>{_MAX_VOXEL_GRID_CELLS}); use a larger voxel_size"
-        )
+    dims, n_vx = _voxel_grid_dims(mins, maxs, voxel_size)
 
     device = wp.get_device(device)
     with wp.ScopedDevice(device):
         pts_wp = wp.array(pts, dtype=wp.vec3)
-        sums_wp = wp.zeros(n_vx, dtype=wp.vec3)
-        counts_wp = wp.zeros(n_vx, dtype=wp.int32)
-
-        wp.launch(
-            voxel_accumulate_kernel,
-            dim=len(pts),
-            inputs=[
-                pts_wp,
-                wp.vec3(float(mins[0]), float(mins[1]), float(mins[2])),
-                float(1.0 / voxel_size),
-                int(dims[0]),
-                int(dims[1]),
-                int(dims[2]),
-            ],
-            outputs=[sums_wp, counts_wp],
+        sums = wp.zeros(n_vx, dtype=wp.vec3)
+        counts = wp.zeros(n_vx, dtype=wp.int32)
+        counter = wp.zeros(1, dtype=wp.int32)
+        out = wp.empty(len(pts), dtype=wp.vec3)
+        min_corner = wp.vec3(float(mins[0]), float(mins[1]), float(mins[2]))
+        n_out = _voxel_bin(
+            pts_wp, len(pts), min_corner, 1.0 / voxel_size, dims, n_vx, sums, counts, counter, out
         )
+        result = out.numpy()[:n_out]
 
-        out_counter = wp.zeros(1, dtype=wp.int32)
-        out_pts_wp = wp.empty(len(pts), dtype=wp.vec3)
-        wp.launch(
-            voxel_compact_kernel,
-            dim=n_vx,
-            inputs=[sums_wp, counts_wp],
-            outputs=[out_counter, out_pts_wp],
-        )
-        wp.synchronize()
-        n_out = int(out_counter.numpy()[0])
-        out = out_pts_wp.numpy()[:n_out]
-
-    return out.astype(points.dtype, copy=False)
+    return result.astype(points.dtype, copy=False)
 
 
 @dataclass
@@ -183,25 +239,11 @@ class IcpAligner:
             self._grid = wp.HashGrid(*dims, device=self.device)
         return self._grid
 
-    def _voxel_downsample(
-        self,
-        points: np.ndarray,
-        voxel_size: float,
-        sub_timings: dict[str, float] | None = None,
-    ) -> np.ndarray:
+    def _voxel_downsample(self, points: np.ndarray, voxel_size: float) -> np.ndarray:
         """Voxel downsample using reusable pre-allocated buffers."""
         if voxel_size <= 0.0 or len(points) == 0:
             return points
 
-        def _mark(key: str, t_start: float) -> float:
-            if sub_timings is not None:
-                wp.synchronize()
-                now = time.perf_counter()
-                sub_timings[key] = sub_timings.get(key, 0.0) + (now - t_start) * 1000.0
-                return now
-            return t_start
-
-        t0 = time.perf_counter()
         pts = np.ascontiguousarray(points, dtype=np.float32)
         bounds = self.config.voxel_bounds_m
         if bounds is not None:
@@ -210,15 +252,10 @@ class IcpAligner:
         else:
             mins = pts.min(axis=0)
             maxs = pts.max(axis=0)
-        dims = np.ceil((maxs - mins) / voxel_size).astype(np.int64) + 1
-        n_vx = int(dims.prod())
-        if n_vx > _MAX_VOXEL_GRID_CELLS:
-            raise ValueError(
-                f"voxel grid has {n_vx} cells (>{_MAX_VOXEL_GRID_CELLS}); use a larger voxel_size"
-            )
-        t0 = _mark("vx_cpu_setup", t0)
+        dims, n_vx = _voxel_grid_dims(mins, maxs, voxel_size)
 
         with wp.ScopedDevice(self.device):
+            # Grow the shared scratch buffers on demand, else just re-zero them.
             if self._vx_cells < n_vx:
                 self._vx_sums = wp.zeros(n_vx, dtype=wp.vec3)
                 self._vx_counts = wp.zeros(n_vx, dtype=wp.int32)
@@ -226,47 +263,29 @@ class IcpAligner:
             else:
                 self._vx_sums.zero_()
                 self._vx_counts.zero_()
-
             if self._vx_out_capacity < len(pts):
                 self._vx_out = wp.empty(len(pts), dtype=wp.vec3)
                 self._vx_out_capacity = len(pts)
-
             if self._vx_counter is None:
                 self._vx_counter = wp.zeros(1, dtype=wp.int32)
             else:
                 self._vx_counter.zero_()
-            t0 = _mark("vx_zero_buffers", t0)
 
             pts_wp = wp.array(pts, dtype=wp.vec3)
-            t0 = _mark("vx_upload", t0)
-
-            wp.launch(
-                voxel_accumulate_kernel,
-                dim=len(pts),
-                inputs=[
-                    pts_wp,
-                    wp.vec3(float(mins[0]), float(mins[1]), float(mins[2])),
-                    float(1.0 / voxel_size),
-                    int(dims[0]),
-                    int(dims[1]),
-                    int(dims[2]),
-                ],
-                outputs=[self._vx_sums, self._vx_counts],
+            min_corner = wp.vec3(float(mins[0]), float(mins[1]), float(mins[2]))
+            n_out = _voxel_bin(
+                pts_wp,
+                len(pts),
+                min_corner,
+                1.0 / voxel_size,
+                dims,
+                n_vx,
+                self._vx_sums,
+                self._vx_counts,
+                self._vx_counter,
+                self._vx_out,
             )
-            t0 = _mark("vx_accumulate", t0)
-
-            wp.launch(
-                voxel_compact_kernel,
-                dim=n_vx,
-                inputs=[self._vx_sums, self._vx_counts],
-                outputs=[self._vx_counter, self._vx_out],
-            )
-            t0 = _mark("vx_compact", t0)
-
-            wp.synchronize()
-            n_out = int(self._vx_counter.numpy()[0])
             out = self._vx_out.numpy()[:n_out]
-            t0 = _mark("vx_readback", t0)
 
         return out.astype(points.dtype, copy=False)
 
@@ -285,62 +304,38 @@ class IcpAligner:
 
         cfg = self.config
         grid_radius = max(cfg.max_correspondence_dist_m, cfg.normal_radius_m)
-        timings: dict[str, float] = {
-            "voxel_downsample": 0.0,
-            "upload": 0.0,
-            "grid_build": 0.0,
-            "normals": 0.0,
-            "launch_kernels": 0.0,
-            "gpu_sync": 0.0,
-            "cpu_solve": 0.0,
-            "bookkeeping": 0.0,
-        }
+        sw = _Stopwatch(profile)
 
         if cfg.voxel_size_m is not None and cfg.voxel_size_m > 0.0:
-            t_vs = time.perf_counter()
-            sub = {} if profile else None
-            source = self._voxel_downsample(source, cfg.voxel_size_m, sub)
-            if cfg.voxel_target:
-                target = self._voxel_downsample(target, cfg.voxel_size_m, sub)
-            timings["voxel_downsample"] = (time.perf_counter() - t_vs) * 1000.0
-            if sub is not None:
-                timings.update(sub)
-
-        def _tic() -> float:
-            if profile:
-                wp.synchronize()
-            return time.perf_counter()
+            with sw.stage("voxel_downsample"):
+                source = self._voxel_downsample(source, cfg.voxel_size_m)
+                if cfg.voxel_target:
+                    target = self._voxel_downsample(target, cfg.voxel_size_m)
 
         with wp.ScopedDevice(self.device):
-            t0 = _tic()
-            src_wp = wp.array(np.ascontiguousarray(source, dtype=np.float32), dtype=wp.vec3)
-            tgt_wp = wp.array(np.ascontiguousarray(target, dtype=np.float32), dtype=wp.vec3)
-            t1 = _tic()
-            timings["upload"] = (t1 - t0) * 1000.0
+            with sw.stage("upload"):
+                src_wp = wp.array(np.ascontiguousarray(source, dtype=np.float32), dtype=wp.vec3)
+                tgt_wp = wp.array(np.ascontiguousarray(target, dtype=np.float32), dtype=wp.vec3)
 
-            # Build target HashGrid once.
-            grid = self._ensure_grid(grid_radius, target)
-            grid.build(points=tgt_wp, radius=float(grid_radius))
-            t2 = _tic()
-            timings["grid_build"] = (t2 - t1) * 1000.0
+            with sw.stage("grid_build"):
+                grid = self._ensure_grid(grid_radius, target)
+                grid.build(points=tgt_wp, radius=float(grid_radius))
 
-            # Estimate target normals.
-            normals_wp = wp.empty(len(target), dtype=wp.vec3)
-            valid_wp = wp.empty(len(target), dtype=wp.int32)
-            wp.launch(
-                estimate_normals_kernel,
-                dim=len(target),
-                inputs=[
-                    grid.id,
-                    tgt_wp,
-                    float(cfg.normal_radius_m),
-                    int(cfg.normal_min_neighbors),
-                    int(cfg.normal_power_iters),
-                ],
-                outputs=[normals_wp, valid_wp],
-            )
-            t3 = _tic()
-            timings["normals"] = (t3 - t2) * 1000.0
+            with sw.stage("normals"):
+                normals_wp = wp.empty(len(target), dtype=wp.vec3)
+                valid_wp = wp.empty(len(target), dtype=wp.int32)
+                wp.launch(
+                    estimate_normals_kernel,
+                    dim=len(target),
+                    inputs=[
+                        grid.id,
+                        tgt_wp,
+                        float(cfg.normal_radius_m),
+                        int(cfg.normal_min_neighbors),
+                        int(cfg.normal_power_iters),
+                    ],
+                    outputs=[normals_wp, valid_wp],
+                )
 
             transformed_wp = wp.empty(len(source), dtype=wp.vec3)
             JtJ_wp = wp.zeros((6, 6), dtype=wp.float32)
@@ -361,7 +356,7 @@ class IcpAligner:
 
             for it in range(cfg.max_iters):
                 iters_run = it + 1
-                ts = _tic()
+                ts = sw.tic()
                 R = T[:3, :3].astype(np.float32)
                 t = T[:3, 3].astype(np.float32)
 
@@ -391,7 +386,7 @@ class IcpAligner:
                     outputs=[JtJ_wp, Jtr_wp, cost_wp, inliers_wp],
                 )
                 t_launch = time.perf_counter()
-                wp.synchronize()
+                wp.synchronize()  # pull the normal equations back to solve on the host
                 t_sync = time.perf_counter()
 
                 H_upper = JtJ_wp.numpy().astype(np.float64)
@@ -418,10 +413,9 @@ class IcpAligner:
                 final_inliers = n_in
                 t_solve = time.perf_counter()
 
-                if profile:
-                    timings["launch_kernels"] += (t_launch - ts) * 1000.0
-                    timings["gpu_sync"] += (t_sync - t_launch) * 1000.0
-                    timings["cpu_solve"] += (t_solve - t_sync) * 1000.0
+                sw.add("launch_kernels", (t_launch - ts) * 1000.0)
+                sw.add("gpu_sync", (t_sync - t_launch) * 1000.0)
+                sw.add("cpu_solve", (t_solve - t_sync) * 1000.0)
 
                 dr = float(np.linalg.norm(delta[:3]))
                 dt = float(np.linalg.norm(delta[3:]))
@@ -441,5 +435,5 @@ class IcpAligner:
             final_cost=final_cost,
             num_inliers=final_inliers,
             converged=converged,
-            timings_ms=timings if profile else {},
+            timings_ms=sw.ms if profile else {},
         )
