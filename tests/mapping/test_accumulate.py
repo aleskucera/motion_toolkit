@@ -93,11 +93,46 @@ def test_accumulator_matches_numpy() -> None:
     assert dev_cells == ref_cells, "device accumulator occupies different voxels than numpy"
 
 
+def test_accumulator_multiframe() -> None:
+    """Feed a step's output back as the next step's map — guards that the
+    occupied-cell clear zeros last frame's voxels (no stale carry-over)."""
+    dev = wp.get_device("cpu")
+    acc = DeviceMapAccumulator(VOX, RADIUS, z_bounds=(Z0, Z1), device=dev)
+    rng = np.random.default_rng(2)
+
+    map_wp: wp.array | None = None
+    prev_map = np.empty((0, 3), np.float32)
+    center = (0.0, 0.0)
+    for _ in range(3):
+        # Move the robot each frame so the crop window (and occupied set) shifts.
+        center = (center[0] + 1.7, center[1] - 1.1)
+        carve = (rng.random(len(prev_map)) > 0.25).astype(np.int32)
+        pts = rng.uniform([-30, -30, 0], [30, 30, 3], (3000, 3)).astype(np.float32)
+        valid = (rng.random(3000) > 0.1).astype(np.int32)
+
+        new = acc.step(
+            map_wp,
+            wp.array(carve, dtype=wp.int32, device=dev) if len(prev_map) else None,
+            wp.array(pts, dtype=wp.vec3, device=dev),
+            wp.array(valid, dtype=wp.int32, device=dev),
+            center,
+        )
+
+        survivors = np.vstack([prev_map[carve.astype(bool)], pts[valid.astype(bool)]])
+        inr = (survivors[:, 0] - center[0]) ** 2 + (survivors[:, 1] - center[1]) ** 2 <= RADIUS**2
+        ref_cells = _voxel_cells(survivors[inr], center)
+        assert _voxel_cells(new.numpy(), center) == ref_cells, "multiframe voxels diverge from numpy"
+
+        prev_map = new.numpy()
+        map_wp = new
+
+
 def main() -> None:
     wp.init()
     test_carve_matches_filter_and_device()
     test_accumulator_matches_numpy()
-    print("PASS: device-native carve + accumulator match numpy (2 tests)")
+    test_accumulator_multiframe()
+    print("PASS: device-native carve + accumulator match numpy (3 tests)")
 
 
 if __name__ == "__main__":

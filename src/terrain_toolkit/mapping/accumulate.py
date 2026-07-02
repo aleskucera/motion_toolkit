@@ -7,9 +7,14 @@ backs both the offline sim demo and on-robot accumulation.
 
 Keeps the accumulated map resident on the GPU across frames so the per-frame
 pipeline (carve → add new returns → crop to a radius → voxel-thin) never rounds
-through host memory. One `step()` fuses all four into a single masked voxel pass:
-carved map points and out-of-radius / invalid points are simply skipped, and the
-survivors are re-binned to one centroid per occupied voxel.
+through host memory. Each `step()` accumulates the carved map and the new scan
+into a fixed voxel grid with two masked launches (skipping carved / out-of-radius
+/ invalid points), then emits one centroid per occupied voxel.
+
+The grid is dense (millions of cells) but a scan only fills a few thousand, so
+the zero and compact passes track the *occupied* cells: a cell records its index
+the frame it first fills, and only those cells are cleared next frame and scanned
+at compact — making both O(occupied points) instead of O(grid cells).
 """
 
 from __future__ import annotations
@@ -35,11 +40,15 @@ def _voxel_accumulate_masked_kernel(
     dz: wp.int32,
     sums: wp.array(dtype=wp.vec3),
     counts: wp.array(dtype=wp.int32),
+    occupied: wp.array(dtype=wp.int32),
+    occ_counter: wp.array(dtype=wp.int32),
 ):
-    """Sum each kept point into its voxel cell.
+    """Sum each kept point into its voxel cell, recording newly-filled cells.
 
     Skips invalid points and points outside the xy crop radius, so the carve /
-    crop / bin steps fuse into this one launch (no separate mask pass).
+    crop / bin steps fuse into this one launch (no separate mask pass). The first
+    thread to fill a cell (its count goes 0→1) appends the cell index to
+    `occupied`, so the clear and compact passes can touch only filled cells.
     """
     i = wp.tid()
     if valid[i] == 0:
@@ -53,23 +62,36 @@ def _voxel_accumulate_masked_kernel(
     if ix < 0 or ix >= dx or iy < 0 or iy >= dy or iz < 0 or iz >= dz:
         return
     idx = (ix * dy + iy) * dz + iz
+    # atomic_add returns the previous count; exactly one thread sees 0 for a cell,
+    # so each occupied cell is appended to the list exactly once.
+    if wp.atomic_add(counts, idx, 1) == 0:
+        occupied[wp.atomic_add(occ_counter, 0, 1)] = idx
     wp.atomic_add(sums, idx, p)
-    wp.atomic_add(counts, idx, 1)
+
+
+@wp.kernel
+def _voxel_clear_kernel(
+    occupied: wp.array(dtype=wp.int32),
+    sums: wp.array(dtype=wp.vec3),
+    counts: wp.array(dtype=wp.int32),
+):
+    """Reset only the cells filled last frame back to empty (invariant: every
+    non-zero cell is in `occupied`, so this leaves the whole grid zeroed)."""
+    idx = occupied[wp.tid()]
+    sums[idx] = wp.vec3(0.0, 0.0, 0.0)
+    counts[idx] = 0
 
 
 @wp.kernel
 def _voxel_compact_kernel(
     sums: wp.array(dtype=wp.vec3),
     counts: wp.array(dtype=wp.int32),
-    out_counter: wp.array(dtype=wp.int32),
+    occupied: wp.array(dtype=wp.int32),
     out_points: wp.array(dtype=wp.vec3),
 ):
-    """Write one centroid per occupied voxel into a compact output."""
-    v = wp.tid()
-    c = counts[v]
-    if c > 0:
-        slot = wp.atomic_add(out_counter, 0, 1)
-        out_points[slot] = sums[v] / float(c)
+    """Write one centroid per occupied voxel (indexed straight off `occupied`)."""
+    idx = occupied[wp.tid()]
+    out_points[wp.tid()] = sums[idx] / float(counts[idx])
 
 
 class DeviceMapAccumulator:
@@ -100,10 +122,42 @@ class DeviceMapAccumulator:
             raise ValueError(
                 f"voxel grid has {n_vx} cells (>{_MAX_CELLS}); coarsen voxel_size or shrink radius"
             )
+        # Count of cells filled by the previous step(), so the next one clears
+        # exactly those (grid starts fully zeroed, so nothing to clear yet).
+        self._prev_occ = 0
         with wp.ScopedDevice(self.device):
             self._sums = wp.zeros(n_vx, dtype=wp.vec3)
             self._counts = wp.zeros(n_vx, dtype=wp.int32)
-            self._counter = wp.zeros(1, dtype=wp.int32)
+            # At most n_vx distinct cells can be occupied in a frame.
+            self._occupied = wp.empty(n_vx, dtype=wp.int32)
+            self._occ_counter = wp.zeros(1, dtype=wp.int32)
+
+    def _accumulate(
+        self,
+        points: wp.array,
+        mask: wp.array,
+        cx: float,
+        cy: float,
+        min_corner: wp.vec3,
+    ) -> None:
+        """Bin `points` (kept where `mask != 0`) into the shared grid."""
+        wp.launch(
+            _voxel_accumulate_masked_kernel,
+            dim=len(points),
+            inputs=[
+                points,
+                mask,
+                cx,
+                cy,
+                self.radius * self.radius,
+                min_corner,
+                1.0 / self.voxel,
+                self.dx,
+                self.dy,
+                self.dz,
+            ],
+            outputs=[self._sums, self._counts, self._occupied, self._occ_counter],
+        )
 
     def step(
         self,
@@ -122,52 +176,40 @@ class DeviceMapAccumulator:
         cx, cy = float(center[0]), float(center[1])
         n_map = 0 if map_wp is None else len(map_wp)
         n_pts = len(points_wp)
-        n = n_map + n_pts
         with wp.ScopedDevice(self.device):
-            if n == 0:
+            if n_map + n_pts == 0:
+                self._prev_occ = 0
                 return wp.zeros(0, dtype=wp.vec3)
 
-            combined = wp.empty(n, dtype=wp.vec3)
-            mask_in = wp.empty(n, dtype=wp.int32)
-            if n_map:
-                wp.copy(combined, map_wp, 0, 0, n_map)
-                keep = carve_mask if carve_mask is not None else wp.full(n_map, 1, dtype=wp.int32)
-                wp.copy(mask_in, keep, 0, 0, n_map)
-            wp.copy(combined, points_wp, n_map, 0, n_pts)
-            wp.copy(mask_in, valid_wp, n_map, 0, n_pts)
+            # Reset only last frame's occupied cells; the rest are already zero.
+            if self._prev_occ:
+                wp.launch(
+                    _voxel_clear_kernel,
+                    dim=self._prev_occ,
+                    inputs=[self._occupied],
+                    outputs=[self._sums, self._counts],
+                )
+            self._occ_counter.zero_()
 
-            self._sums.zero_()
-            self._counts.zero_()
-            self._counter.zero_()
             min_corner = wp.vec3(cx - self.radius, cy - self.radius, self.z0)
-            # Carve + xy-radius crop + voxel-bin fused into one masked pass.
-            wp.launch(
-                _voxel_accumulate_masked_kernel,
-                dim=n,
-                inputs=[
-                    combined,
-                    mask_in,
-                    cx,
-                    cy,
-                    self.radius * self.radius,
-                    min_corner,
-                    1.0 / self.voxel,
-                    self.dx,
-                    self.dy,
-                    self.dz,
-                ],
-                outputs=[self._sums, self._counts],
-            )
-            out = wp.empty(n, dtype=wp.vec3)
-            wp.launch(
-                _voxel_compact_kernel,
-                dim=len(self._counts),
-                inputs=[self._sums, self._counts],
-                outputs=[self._counter, out],
-            )
+            # Two masked passes into the same grid — carved map, then new scan —
+            # so no host-side concatenation of the two clouds is needed.
+            if n_map:
+                keep = carve_mask if carve_mask is not None else wp.full(n_map, 1, dtype=wp.int32)
+                self._accumulate(map_wp, keep, cx, cy, min_corner)
+            if n_pts:
+                self._accumulate(points_wp, valid_wp, cx, cy, min_corner)
+
             wp.synchronize()
-            n_out = int(self._counter.numpy()[0])
+            n_out = int(self._occ_counter.numpy()[0])
+            self._prev_occ = n_out
+
             new_map = wp.empty(n_out, dtype=wp.vec3)
             if n_out:
-                wp.copy(new_map, out, 0, 0, n_out)
+                wp.launch(
+                    _voxel_compact_kernel,
+                    dim=n_out,
+                    inputs=[self._sums, self._counts, self._occupied],
+                    outputs=[new_map],
+                )
             return new_map
