@@ -257,11 +257,12 @@ class IcpAligner:
             self._grid = wp.HashGrid(*dims, device=self.device)
         return self._grid
 
-    def _voxel_downsample(self, points: np.ndarray, voxel_size: float) -> np.ndarray:
-        """Voxel downsample using reusable pre-allocated buffers."""
-        if voxel_size <= 0.0 or len(points) == 0:
-            return points
+    def _voxel_bin_into_scratch(self, points: np.ndarray, voxel_size: float) -> int:
+        """Voxel-downsample into `self._vx_out` (device); return the point count.
 
+        Unlike the module-level `voxel_downsample`, the result is left on device
+        (no cloud readback) so `align` can copy it straight into its GN buffers.
+        """
         pts = np.ascontiguousarray(points, dtype=np.float32)
         bounds = self.config.voxel_bounds_m
         if bounds is not None:
@@ -272,37 +273,51 @@ class IcpAligner:
             maxs = pts.max(axis=0)
         dims, n_vx = _voxel_grid_dims(mins, maxs, voxel_size)
 
-        with wp.ScopedDevice(self.device):
-            # Grow the shared scratch buffers on demand. sums/counts are left
-            # zeroed by the previous call's compact pass, so no re-zeroing here.
-            if self._vx_cells < n_vx:
-                self._vx_sums = wp.zeros(n_vx, dtype=wp.vec3)
-                self._vx_counts = wp.zeros(n_vx, dtype=wp.int32)
-                self._vx_cells = n_vx
-            if self._vx_out_capacity < len(pts):
-                self._vx_out = wp.empty(len(pts), dtype=wp.vec3)
-                self._vx_occupied = wp.empty(len(pts), dtype=wp.int32)
-                self._vx_out_capacity = len(pts)
-            if self._vx_counter is None:
-                self._vx_counter = wp.zeros(1, dtype=wp.int32)
+        # Grow the shared scratch buffers on demand; sums/counts stay zeroed
+        # between calls (the compact pass clears each cell it reads).
+        if self._vx_cells < n_vx:
+            self._vx_sums = wp.zeros(n_vx, dtype=wp.vec3)
+            self._vx_counts = wp.zeros(n_vx, dtype=wp.int32)
+            self._vx_cells = n_vx
+        if self._vx_out_capacity < len(pts):
+            self._vx_out = wp.empty(len(pts), dtype=wp.vec3)
+            self._vx_occupied = wp.empty(len(pts), dtype=wp.int32)
+            self._vx_out_capacity = len(pts)
+        if self._vx_counter is None:
+            self._vx_counter = wp.zeros(1, dtype=wp.int32)
 
-            pts_wp = wp.array(pts, dtype=wp.vec3)
-            min_corner = wp.vec3(float(mins[0]), float(mins[1]), float(mins[2]))
-            n_out = _voxel_bin(
-                pts_wp,
-                len(pts),
-                min_corner,
-                1.0 / voxel_size,
-                dims,
-                self._vx_sums,
-                self._vx_counts,
-                self._vx_occupied,
-                self._vx_counter,
-                self._vx_out,
-            )
-            out = self._vx_out.numpy()[:n_out]
+        min_corner = wp.vec3(float(mins[0]), float(mins[1]), float(mins[2]))
+        return _voxel_bin(
+            wp.array(pts, dtype=wp.vec3),
+            len(pts),
+            min_corner,
+            1.0 / voxel_size,
+            dims,
+            self._vx_sums,
+            self._vx_counts,
+            self._vx_occupied,
+            self._vx_counter,
+            self._vx_out,
+        )
 
-        return out.astype(points.dtype, copy=False)
+    def _load_cloud(self, points: np.ndarray, out: wp.array, apply_voxel: bool) -> int:
+        """Fill `out` (device) with the optionally-downsampled, capped cloud; return count.
+
+        When voxelizing, the downsampled cloud stays on device — a device→device
+        copy into `out`, avoiding a downsample→host→re-upload round trip. Only the
+        (tiny) point count crosses back to the host.
+        """
+        if apply_voxel and len(points) > 0:
+            n = self._voxel_bin_into_scratch(points, self.config.voxel_size_m)
+            if n <= self.config.max_points:
+                wp.copy(out, self._vx_out, 0, 0, n)
+                return n
+            points = self._vx_out.numpy()[:n]  # rare: still over the cap → host cap below
+        capped = self._cap(np.ascontiguousarray(points, dtype=np.float32))
+        n = len(capped)
+        if n:
+            wp.copy(out, wp.array(capped, dtype=wp.vec3), 0, 0, n)
+        return n
 
     def _cap(self, points: np.ndarray) -> np.ndarray:
         """Subsample to at most `max_points` (the fixed buffers require a bound)."""
@@ -421,25 +436,15 @@ class IcpAligner:
         grid_radius = max(cfg.max_correspondence_dist_m, cfg.normal_radius_m)
         prof = _EventTimer(self.device, profile)
 
+        voxel_on = cfg.voxel_size_m is not None and cfg.voxel_size_m > 0.0
+
         with wp.ScopedDevice(self.device):
-            if cfg.voxel_size_m is not None and cfg.voxel_size_m > 0.0:
-                with prof.stage("voxel_downsample"):
-                    source = self._voxel_downsample(source, cfg.voxel_size_m)
-                    if cfg.voxel_target:
-                        target = self._voxel_downsample(target, cfg.voxel_size_m)
-
-            source = self._cap(source)
-            target = self._cap(target)
-            n_src = len(source)
-            n_tgt = len(target)
-
-            # Fill the first n entries of the preallocated buffers; the rest is
-            # never read (kernels guard on the live counts / the grid extent).
-            with prof.stage("upload"):
-                src_wp = wp.array(np.ascontiguousarray(source, dtype=np.float32), dtype=wp.vec3)
-                tgt_wp = wp.array(np.ascontiguousarray(target, dtype=np.float32), dtype=wp.vec3)
-                wp.copy(self._src, src_wp, 0, 0, n_src)
-                wp.copy(self._tgt, tgt_wp, 0, 0, n_tgt)
+            # Downsample (if enabled), cap, and load into the fixed GN buffers —
+            # device-resident, so only the point counts return to the host. The
+            # rest of each buffer is never read (kernels guard on the live count).
+            with prof.stage("voxel_downsample"):
+                n_src = self._load_cloud(source, self._src, voxel_on)
+                n_tgt = self._load_cloud(target, self._tgt, voxel_on and cfg.voxel_target)
                 self._n_src.fill_(n_src)
 
             with prof.stage("grid_build"):

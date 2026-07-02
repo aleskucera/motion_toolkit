@@ -178,7 +178,6 @@ def main() -> None:
     print("Per-stage timing (mean ms per align):")
     order = [
         "voxel_downsample",
-        "upload",
         "grid_build",
         "normals",
         "iterations",
