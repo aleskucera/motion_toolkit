@@ -12,13 +12,16 @@ Both windows step in lockstep (same robot/sim); only the cameras are independent
 global map (window 1) smears while the local rollouts (window 2) stay on true geometry. In each window:
 mouse-drag orbits, scroll zooms, ESC/Q quits.
 
+Perception is terrain_toolkit's real OSDome 3D lidar; the local planning map (window 2) is dense
+via terrain_toolkit inpaint + confidence masks (occlusion & support).
+
   python demos/navigate_partial_view.py --world pocket
   python demos/navigate_partial_view.py --world pocket --drift 0.04
+  python demos/navigate_partial_view.py --world pocket --distrust-policy height-split
   python demos/navigate_partial_view.py --world pocket --shot /tmp/dual.png --shot-frame 150
 """
 
 import argparse
-from collections import deque
 
 import numpy as np
 import warp as wp
@@ -34,7 +37,6 @@ from kinematic_helhest.engine import GridParams
 from kinematic_helhest.heightmap import Heightmap
 from kinematic_helhest.perception.lidar import crop_window
 from kinematic_helhest.perception.lidar import drift_scan
-from kinematic_helhest.perception.lidar import lidar_scan
 from kinematic_helhest.perception.lidar import MultiScanMap
 from kinematic_helhest.planning.costtogo import CostToGo
 from kinematic_helhest.planning.lattice_solver import trace_optimal
@@ -194,10 +196,12 @@ def run(
     lat_coarsen=4,
     win_m=9.0,
     route_m=16.0,
-    local_scans=5,
     drift=0.0,
     drive=False,
     fan_n=160,
+    distrust_policy="flat",
+    support_ratio=0.35,
+    support_radius_m=0.5,
     device="cuda",
     shot=None,
     shot_frame=None,
@@ -210,6 +214,19 @@ def run(
     builder, start, goal = W.WORLDS[world]
     scene = builder()
     mu = W.matching_friction(scene)
+    # perception front-end: terrain_toolkit's real OSDome 3D ray-cast, rasterized for the global
+    # routing map, and inpaint + confidence masks (occlusion & support) for the local planning map.
+    from kinematic_helhest.perception.terrain_lidar import TerrainInpaintMap
+    from kinematic_helhest.perception.terrain_lidar import TerrainLidar
+
+    tlidar = TerrainLidar(scene, device=device)
+    inpaint_map = TerrainInpaintMap(
+        scene,
+        distrust_policy=distrust_policy,
+        support_ratio=support_ratio,
+        support_radius_m=support_radius_m,
+        device=device,
+    )
     goal = np.asarray(goal, np.float64)
     cell = scene.cell
     ww = wh = int(round(win_m / cell))
@@ -235,8 +252,7 @@ def run(
         rcnx, rcny, rccell, (ww // 2 - rww // 2) * cell, (wh // 2 - rwh // 2) * cell
     ).build()
     mm = MultiScanMap(scene.ny, scene.nx)  # GLOBAL routing map (drift-prone)
-    local = mm  # LOCAL map the MPPI plans on (reassigned per frame to the last-N-scan crop)
-    scan_buf = deque(maxlen=local_scans) if local_scans >= 1 else None
+    local = inpaint_map  # LOCAL map the MPPI plans on (rebuilt per frame from the last-N scans)
     rng = np.random.default_rng(0)
     drift_x = drift_y = drift_yaw = 0.0  # accumulated SE(2) global-map drift (m, m, rad)
     stepB = max(1, plan_sim.batch_size // max(1, fan_n))
@@ -310,9 +326,7 @@ def run(
         d = float(np.hypot(rx - goal[0], ry - goal[1]))
 
         if d >= 0.3:
-            obs, known = lidar_scan(
-                scene.H, scene.x0, scene.y0, cell, (rx, ry, yaw), fov_deg=180.0, max_range=7.0
-            )
+            obs, known = tlidar.scan((rx, ry, yaw))  # rasterized scan -> global routing map
             if drift > 0.0:
                 drift_x += float(rng.normal(0.0, drift))
                 drift_y += float(rng.normal(0.0, drift))
@@ -324,13 +338,11 @@ def run(
             else:
                 gobs, gkn = obs, known
             mm.integrate(gobs, gkn)
-            if scan_buf is not None:
-                scan_buf.append((obs, known))
-                local = MultiScanMap(scene.ny, scene.nx)
-                for o, kk in scan_buf:
-                    local.integrate(o, kk)
-            else:
-                local = mm
+            # local planning map = terrain_toolkit inpaint + confidence masks (occlusion & support)
+            # over the CURRENT single scan -- so it holds only trusted cells and the occlusion mask's
+            # single viewpoint is exactly this scan's pose (no multi-view approximation)
+            inpaint_map.update(tlidar.last_points, (rx, ry), tlidar.last_sensor_z)
+            local = inpaint_map
             elev, kn, wx0, wy0 = crop_window(local, scene, rx, ry, ww, wh, cell)
             elev = np.where(kn, elev, 0.0).astype(np.float32)
             goal_l = (goal[0] - wx0, goal[1] - wy0)
@@ -483,7 +495,6 @@ def main():
     ap.add_argument("--lat-coarsen", type=int, default=4)
     ap.add_argument("--win-m", type=float, default=9.0)
     ap.add_argument("--route-m", type=float, default=16.0)
-    ap.add_argument("--local-scans", type=int, default=5)
     ap.add_argument("--drift", type=float, default=0.0)
     ap.add_argument(
         "--drive",
@@ -491,6 +502,23 @@ def main():
         help="start in MANUAL drive mode (I/J/K/L, either window); press M to toggle live",
     )
     ap.add_argument("--fan-n", type=int, default=160, help="how many rollouts to draw in window 2")
+    ap.add_argument(
+        "--distrust-policy",
+        default="flat",
+        choices=["flat", "height-split"],
+        help="what the local inpaint map does with a confidence-distrusted cell: 'flat' (optimism) "
+        "or 'height-split' (keep untrusted-but-tall visible cells as obstacles)",
+    )
+    ap.add_argument(
+        "--support-ratio",
+        type=float,
+        default=0.35,
+        help="trust an inpainted cell only if >= this fraction of its neighborhood was measured "
+        "(lower = trust more)",
+    )
+    ap.add_argument(
+        "--support-radius-m", type=float, default=0.5, help="support-mask neighborhood radius"
+    )
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--shot", default=None, help="save a side-by-side still of both windows")
     ap.add_argument(
@@ -507,10 +535,12 @@ def main():
         lat_coarsen=args.lat_coarsen,
         win_m=args.win_m,
         route_m=args.route_m,
-        local_scans=args.local_scans,
         drift=args.drift,
         drive=args.drive,
         fan_n=args.fan_n,
+        distrust_policy=args.distrust_policy,
+        support_ratio=args.support_ratio,
+        support_radius_m=args.support_radius_m,
         device=args.device,
         shot=args.shot,
         shot_frame=args.shot_frame,
