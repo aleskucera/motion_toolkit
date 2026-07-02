@@ -7,13 +7,31 @@ import numpy as np
 import warp as wp
 
 from ..sensor import LidarSensorConfig
+from .kernels import _DEPTH_SENTINEL
 from .kernels import classify_kernel
 from .kernels import render_depth_kernel
 
-_DEPTH_SENTINEL = 1.0e18
+
+def _pose_to_warp(
+    sensor_origin: np.ndarray, sensor_rotation: np.ndarray | None
+) -> tuple[wp.vec3, wp.mat33]:
+    """Marshal the sensor pose into the scalar types the kernels take.
+
+    `sensor_rotation` is the world→sensor rotation (3x3); `None` → identity
+    (bin in the world frame). `sensor_origin` is the sensor position (3,).
+    """
+    R = np.eye(3) if sensor_rotation is None else np.asarray(sensor_rotation, dtype=np.float64)
+    rot = wp.mat33(R.flatten().tolist())
+    origin = wp.vec3(*np.asarray(sensor_origin, dtype=np.float64).tolist())
+    return origin, rot
 
 
-@dataclass
+def _upload_points(points: np.ndarray) -> wp.array:
+    """Upload a host (N, 3) cloud to a device `vec3` array."""
+    return wp.array(np.ascontiguousarray(points, dtype=np.float32), dtype=wp.vec3)
+
+
+@dataclass(frozen=True)
 class DynamicFilterConfig:
     """Tuning for `DynamicPointFilter` (see that class for how the filter works).
 
@@ -21,6 +39,10 @@ class DynamicFilterConfig:
     `from_sensor()`, which pulls the FOV, resolution, and min-range from a
     `LidarSensorConfig` so they can't silently disagree with it. Only `margin_m`
     / `margin_rel` are genuinely filter-specific.
+
+    Frozen: the filter reads it once at construction to size its buffers and
+    precompute the grid, so mutating it afterwards would silently desync those.
+    Reconfigure by building a new config + filter.
     """
 
     # Range-image angular resolution. Azimuth spans the full 360°; elevation spans
@@ -78,10 +100,10 @@ class DynamicPointFilter:
     through where something was); a motionless object is a static pillar and kept.
 
     Two entry points:
-      * `carve(map, scan, origin)` → the `map_keep` mask (device- or numpy-native,
-        matching the input type). The per-frame mapping call.
-      * `filter(map, scan, origin)` → `(scan_keep, map_keep)` numpy masks — also
-        drops incoming scan points in front of known geometry.
+      * `carve(map, scan, origin)` → the `map_keep` mask, device-native (device
+        `wp.array`s in and out). The per-frame mapping call, kept on the GPU.
+      * `filter(map, scan, origin)` → `(scan_keep, map_keep)` numpy masks — the
+        host path; also drops incoming scan points in front of known geometry.
     """
 
     def __init__(
@@ -91,12 +113,26 @@ class DynamicPointFilter:
         device: wp.context.Device | None = None,
     ):
         self.config = config or DynamicFilterConfig()
-        self.device = device if device is not None else wp.get_device()
-        self._n_bins = self.config.az_bins * self.config.el_bins
-        # Reusable range-image buffers, reset per render (avoids a per-call alloc).
-        # Two, because filter() keeps the map and scan depth images live at once.
+        self.device = wp.get_device(device)
+        cfg = self.config
+        self._n_bins = cfg.az_bins * cfg.el_bins
+
+        # Angular-grid args shared by the render/classify kernels, fixed by the config:
+        # (az_bins, el_bins, az_min, az_span, el_min, el_max, min_range). Azimuth wraps the
+        # full circle; el_min/el_max in radians. Precomputed once — the config never changes.
+        self._grid = [
+            int(cfg.az_bins),
+            int(cfg.el_bins),
+            float(-math.pi),
+            float(2.0 * math.pi),
+            float(math.radians(cfg.el_min_deg)),
+            float(math.radians(cfg.el_max_deg)),
+            float(cfg.min_range_m),
+        ]
+
         with wp.ScopedDevice(self.device):
-            self._depth = [wp.empty(self._n_bins, dtype=wp.float32) for _ in range(2)]
+            self._map_depth = wp.empty(self._n_bins, dtype=wp.float32)
+            self._scan_depth = wp.empty(self._n_bins, dtype=wp.float32)
 
     @classmethod
     def from_sensor(
@@ -109,37 +145,18 @@ class DynamicPointFilter:
         el_bins: int | None = None,
         device: wp.context.Device | None = None,
     ) -> DynamicPointFilter:
-        """Build a filter whose range image matches `sensor` (FOV, resolution,
-        min-range); only the carve margins are supplied here."""
         config = DynamicFilterConfig.from_sensor(
-            sensor, margin_m=margin_m, margin_rel=margin_rel, az_bins=az_bins, el_bins=el_bins
+            sensor,
+            margin_m=margin_m,
+            margin_rel=margin_rel,
+            az_bins=az_bins,
+            el_bins=el_bins,
         )
         return cls(config, device=device)
 
     # ------------------------------------------------------------------
-    # Internal helpers (all operate on device wp.arrays)
+    # Internal helpers
     # ------------------------------------------------------------------
-
-    def _grid_args(self) -> list[int | float]:
-        """Shared angular-grid args for the render/classify kernels:
-        (az_bins, el_bins, az_min, az_span, el_min, el_max, min_range)."""
-        cfg = self.config
-        return [
-            int(cfg.az_bins),
-            int(cfg.el_bins),
-            float(-math.pi),
-            float(2.0 * math.pi),
-            float(math.radians(cfg.el_min_deg)),
-            float(math.radians(cfg.el_max_deg)),
-            float(cfg.min_range_m),
-        ]
-
-    def _to_wp(self, points: np.ndarray | wp.array) -> tuple[wp.array, int]:
-        """Upload if numpy; pass through if already a device array."""
-        if isinstance(points, wp.array):
-            return points, len(points)
-        arr = wp.array(np.ascontiguousarray(points, dtype=np.float32), dtype=wp.vec3)
-        return arr, len(points)
 
     def _render(
         self,
@@ -147,19 +164,17 @@ class DynamicPointFilter:
         n: int,
         origin: wp.vec3,
         rot: wp.mat33,
-        grid: list[int | float],
         depth: wp.array,
-    ) -> wp.array:
+    ) -> None:
         """Render points into `depth` as a nearest-range image (sentinel-reset first)."""
         depth.fill_(_DEPTH_SENTINEL)
         if n > 0:
             wp.launch(
                 render_depth_kernel,
                 dim=n,
-                inputs=[points_wp, origin, rot, *grid],
+                inputs=[points_wp, origin, rot, *self._grid],
                 outputs=[depth],
             )
-        return depth
 
     def _classify(
         self,
@@ -167,7 +182,6 @@ class DynamicPointFilter:
         n: int,
         origin: wp.vec3,
         rot: wp.mat33,
-        grid: list[int | float],
         other_depth: wp.array,
     ) -> wp.array:
         """Per-point keep mask vs `other_depth` (0 = in front of it → remove)."""
@@ -179,7 +193,7 @@ class DynamicPointFilter:
                 points_wp,
                 origin,
                 rot,
-                *grid,
+                *self._grid,
                 float(self.config.margin_m),
                 float(self.config.margin_rel),
                 other_depth,
@@ -188,50 +202,34 @@ class DynamicPointFilter:
         )
         return keep
 
-    @staticmethod
-    def _pose(
-        sensor_origin: np.ndarray, sensor_rotation: np.ndarray | None
-    ) -> tuple[wp.vec3, wp.mat33]:
-        R = np.eye(3) if sensor_rotation is None else np.asarray(sensor_rotation, dtype=np.float64)
-        rot = wp.mat33(R.flatten().tolist())
-        origin = wp.vec3(*np.asarray(sensor_origin, dtype=np.float64).tolist())
-        return origin, rot
-
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def carve(
         self,
-        map_points: np.ndarray | wp.array,
-        scan_points: np.ndarray | wp.array,
+        map_points: wp.array,
+        scan_points: wp.array,
         sensor_origin: np.ndarray,
         *,
         sensor_rotation: np.ndarray | None = None,
-    ) -> np.ndarray | wp.array:
-        """Carve-only: return the `map_keep` mask (points the scan sees through → 0).
+    ) -> wp.array:
+        """Carve-only, device-native: return the `map_keep` mask (int32, 0 = carve).
 
-        Half the work of `filter()` — one range image + one classify — and
-        device-native: accepts numpy OR `wp.array` inputs and returns a matching
-        type (a numpy bool mask, or a device `wp.array(int32)` when given device
-        arrays, so the whole loop can stay on the GPU).
+        The per-frame mapping call: given the map and the scan's free-space
+        frontier as device `wp.array`s, return an on-device keep-mask marking map
+        points the scan saw through (free space). Half the work of `filter()` — one
+        range image, one classify — and the returned mask is a live device array,
+        stream-ordered with the caller's downstream kernels (no host sync). For a
+        host/numpy result, use `filter()`.
         """
-        was_np = isinstance(map_points, np.ndarray)
         n_map = len(map_points)
         if n_map == 0:
-            return np.ones(0, dtype=bool) if was_np else wp.zeros(0, dtype=wp.int32)
-
-        origin, rot = self._pose(sensor_origin, sensor_rotation)
-        grid = self._grid_args()
+            return wp.zeros(0, dtype=wp.int32)
+        origin, rot = _pose_to_warp(sensor_origin, sensor_rotation)
         with wp.ScopedDevice(self.device):
-            map_wp, _ = self._to_wp(map_points)
-            scan_wp, n_scan = self._to_wp(scan_points)
-            scan_depth = self._render(scan_wp, n_scan, origin, rot, grid, self._depth[0])
-            map_keep = self._classify(map_wp, n_map, origin, rot, grid, scan_depth)
-            if was_np:
-                wp.synchronize()
-                return map_keep.numpy().astype(bool)
-            return map_keep  # device mask, stream-ordered with downstream kernels
+            self._render(scan_points, len(scan_points), origin, rot, self._scan_depth)
+            return self._classify(map_points, n_map, origin, rot, self._scan_depth)
 
     def filter(
         self,
@@ -254,14 +252,13 @@ class DynamicPointFilter:
         if n_map == 0 or n_scan == 0:
             return np.ones(n_scan, dtype=bool), np.ones(n_map, dtype=bool)
 
-        origin, rot = self._pose(sensor_origin, sensor_rotation)
-        grid = self._grid_args()
+        origin, rot = _pose_to_warp(sensor_origin, sensor_rotation)
         with wp.ScopedDevice(self.device):
-            map_wp, _ = self._to_wp(map_points)
-            scan_wp, _ = self._to_wp(scan_points)
-            map_depth = self._render(map_wp, n_map, origin, rot, grid, self._depth[0])
-            scan_depth = self._render(scan_wp, n_scan, origin, rot, grid, self._depth[1])
-            scan_keep = self._classify(scan_wp, n_scan, origin, rot, grid, map_depth)
-            map_keep = self._classify(map_wp, n_map, origin, rot, grid, scan_depth)
+            map_wp = _upload_points(map_points)
+            scan_wp = _upload_points(scan_points)
+            self._render(map_wp, n_map, origin, rot, self._map_depth)
+            self._render(scan_wp, n_scan, origin, rot, self._scan_depth)
+            scan_keep = self._classify(scan_wp, n_scan, origin, rot, self._map_depth)
+            map_keep = self._classify(map_wp, n_map, origin, rot, self._scan_depth)
             wp.synchronize()
             return scan_keep.numpy().astype(bool), map_keep.numpy().astype(bool)

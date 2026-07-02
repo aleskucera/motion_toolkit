@@ -36,15 +36,16 @@ def test_carve_matches_filter_and_device() -> None:
     scan = wall
     o = np.zeros(3)
 
-    _, mk_filter = f.filter(mp, scan, o)  # the full (numpy) path's map_keep
-    mk_carve_np = f.carve(mp, scan, o)  # carve-only, numpy in/out
-    assert np.array_equal(mk_filter, mk_carve_np), "carve() disagrees with filter() map_keep"
+    _, mk_filter = f.filter(mp, scan, o)  # host path's map_keep (bool)
 
+    # Device-native carve must agree with filter()'s map_keep.
     mp_wp = wp.array(mp, dtype=wp.vec3, device=dev)
     scan_wp = wp.array(scan, dtype=wp.vec3, device=dev)
     mk_dev = f.carve(mp_wp, scan_wp, o)  # device in → device mask out
     assert isinstance(mk_dev, wp.array) and mk_dev.device == dev
-    assert np.array_equal(mk_dev.numpy().astype(bool), mk_carve_np), "device carve mask differs"
+    assert np.array_equal(
+        mk_dev.numpy().astype(bool), mk_filter
+    ), "device carve disagrees w/ filter"
 
 
 def _voxel_cells(points: np.ndarray, center: tuple[float, float]) -> set[int]:

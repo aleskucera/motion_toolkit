@@ -4,16 +4,21 @@ import warp as wp
 
 wp.init()
 
+# Fill value for a range-image bin. `render_depth_kernel` only ever lowers a bin
+# via atomic-min, so a bin no point mapped to keeps this exact value — that's how
+# `classify_kernel` recognizes an unobserved bearing. `filter.py` fills with it too.
+_DEPTH_SENTINEL = 1.0e18
+
 
 @wp.func
 def _bin_index(
     d: wp.vec3,
     az_bins: int,
     el_bins: int,
-    az_min: float,
-    az_span: float,
-    el_min: float,
-    el_max: float,
+    az_min: wp.float32,
+    az_span: wp.float32,
+    el_min: wp.float32,
+    el_max: wp.float32,
 ) -> int:
     """Angular bin of a direction vector, or -1 if outside the elevation band.
 
@@ -110,7 +115,7 @@ def classify_kernel(
     if idx < 0:
         return
     od = other_depth[idx]
-    if od > 1.0e17:  # bin unobserved by the other cloud → no evidence
+    if od >= _DEPTH_SENTINEL:  # bin unobserved by the other cloud → no evidence
         return
     margin = margin_m + r * margin_rel
     if od > r + margin:
