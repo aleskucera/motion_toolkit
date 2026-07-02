@@ -216,6 +216,7 @@ class IcpAligner:
         self.device = wp.get_device(device)
         self.verbose = verbose
         self._grid: wp.HashGrid | None = None
+        self._graph = None  # captured GN-loop graph (built lazily on the first align)
         self._capped_warned = False
 
         # Voxel-downsample scratch buffers, grown on demand. sums/counts are kept
@@ -382,13 +383,26 @@ class IcpAligner:
             outputs=[self._keep_running, self._converged],
         )
 
-    def _run_gn_eager(self, grid: wp.HashGrid) -> None:
-        """Device-resident GN loop, host-driven (Phase 2 captures this as a graph)."""
-        for _ in range(self.config.max_iters):
-            self._gn_body(grid)
-            wp.synchronize()
-            if int(self._keep_running.numpy()[0]) == 0:
-                break
+    def _run_gn(self, grid: wp.HashGrid) -> None:
+        """Run the GN loop: a captured CUDA-graph replay on CUDA, eager otherwise.
+
+        The body touches only preallocated buffers with the grid rebuilt in place,
+        so one capture is replayed across every align — the convergence loop runs
+        on device via `capture_while`, with no per-iteration host sync. `capture=`
+        on CPU (no graph support) falls back to a host-driven loop.
+        """
+        if self.device.is_cuda:
+            if self._graph is None:
+                with wp.ScopedCapture(device=self.device) as cap:
+                    wp.capture_while(self._keep_running, lambda: self._gn_body(grid))
+                self._graph = cap.graph
+            wp.capture_launch(self._graph)
+        else:
+            for _ in range(self.config.max_iters):
+                self._gn_body(grid)
+                wp.synchronize()
+                if int(self._keep_running.numpy()[0]) == 0:
+                    break
 
     def align(
         self,
@@ -448,7 +462,7 @@ class IcpAligner:
 
             self._seed_pose(init_pose)
             with prof.stage("iterations"):
-                self._run_gn_eager(grid)
+                self._run_gn(grid)
 
             prof.read()
             wp.synchronize()
