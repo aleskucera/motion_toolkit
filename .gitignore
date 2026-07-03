@@ -7,3 +7,23 @@ build/
 dist/
 .pytest_cache/
 .ruff_cache/
+
+# Generated outputs
+*.html
+*.png
+*.gif
+
+# Data files
+*.npy
+data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Claude Code
+.claude/
+
+# MkDocs build output
+site/

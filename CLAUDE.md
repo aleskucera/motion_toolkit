@@ -62,12 +62,21 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 ## 5. Code Style (this project)
 
-`engine/` and `planning/` are the canonical examples of everything below — mirror them.
+`engine/` and `planning/` (motion) and the perception stack (`heightmap/`, `traversability/` under `terrain_toolkit/`) are the canonical examples of everything below — mirror them.
 
 - **Type hints everywhere.** Annotate every function/method signature — parameters *and* return — including private helpers. Exception: `@wp.kernel` functions carry Warp's own array/scalar annotations; don't add Python hints there. `from __future__ import annotations` is on, so use modern forms (`tuple[float, float]`, `X | None`, `wp.array`).
 - **Formatters: black (line-length 100) + reorder-python-imports** (the conform.nvim setup; black pinned in `pyproject.toml [tool.black]`). Imports are one symbol per line, sorted — `from x import a` / `from x import b`, never `from x import a, b`. Lint with ruff. Run the formatters before committing; don't hand-format against them.
 - **Names carry the meaning.** Prefer a descriptive name that needs no comment to decode (`min_turn_radius`, `clear_margin`, `resid_tol`) over a short name plus an explanation. Keep terse names only for loop indices and math (`r, c, t`, `i, j`, `dx, dy`).
 - **Comments explain WHY, not what.** Match the existing density: short notes on rationale, units, sign conventions, and non-obvious physics/numerics — never a restatement of the code. Keep units and sign conventions explicit (e.g. `# [rad] nose-up = NEGATIVE pitch`). A trailing comment that would push its line past 100 goes on its own line *above* the code (otherwise black wraps the code around it).
+
+## 6. Device-Native by Default (this project)
+
+This is a Warp/CUDA codebase. Data-parallel work runs on-device; **host↔device copies are the dominant performance cost, and a per-frame upload→compute→readback round trip is the worst thing you can write here.** Default to device-resident `wp.array`, NOT numpy. Do not treat numpy as the baseline and device as an optimization — it is the reverse.
+
+- **Bulk data → device.** Point clouds, grids, per-point / per-cell fields, and *any new data-parallel stage* are `wp.array` + `@wp.kernel`. Never implement a compute stage in numpy, and never introduce a host↔device round trip for bulk data.
+- **numpy only at unavoidable boundaries:** parsing an incoming ROS / message payload, and small host-side *control* values — 4×4 poses, scalars, gate thresholds, counts. A pose stays numpy (16 floats driving host control flow); a cloud never does.
+- **If a stage seems to need numpy, STOP and say so before writing it.** Surface the round-trip cost and propose the device-native path — do not silently fall back to host arrays. The user has not, and does not, approve numpy for bulk data by default.
+- Mirror `icp/`, `voxel.py`, and `mapping/` (esp. `DeviceMapAccumulator`) under `terrain_toolkit/`: device-resident data + kernels are the norm here, not the exception.
 
 ---
 

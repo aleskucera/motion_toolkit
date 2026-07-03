@@ -151,6 +151,25 @@ Built in phases, each independently verifiable:
   clean wheels-only 3×3 equality solve (no chassis complementarity), which in turn
   keeps the implicit (IFT) gradient simple.
 
+## Perception stack (`terrain_toolkit`)
+
+The on-robot perception front-end lives in the same repo (package `terrain_toolkit`):
+GPU point cloud → heightmap → traversability cost map, plus GPU-native ICP
+(`icp/`) and a device-resident rolling map/localization accumulator
+(`mapping/DeviceMapAccumulator`). It feeds the planner across the
+perception→planning seam via a shared `GridMap` (`terrain_toolkit.gridmap` →
+`kinematic_helhest.perception.gridmap`).
+
+| Stage | Module | Purpose |
+|---|---|---|
+| Heightmap raster | `heightmap/` | max/mean/min/count layers + NaN-aware inpaint & smooth |
+| Geometric cost | `traversability/` | slope + signed step + roughness, obstacle inflation, temporal gate |
+| Trust masks | `confidence/` | occlusion (line-of-sight) + support-ratio masking |
+| Orchestration | `pipeline.py` | `TerrainPipeline` — points in, `TerrainMap` out |
+| Localization | `icp/`, `mapping/` | GPU-native ICP + rolling accumulated map |
+
+See [`docs/`](docs/) for the full perception reference (built with mkdocs).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
