@@ -284,7 +284,40 @@ def slalom_box_world(cell: float = 0.06):
     return scene, np.asarray(los, np.float32), np.asarray(his, np.float32), (0.0, 0.0, 0.0), np.array([15.0, 0.0])
 
 
-_WORLDS = {"lane": box_world, "narrow": narrow_lane_box_world, "slalom": slalom_box_world}
+def detour_box_world(cell: float = 0.06):
+    """A big central block sitting on the straight line to the goal, open on BOTH sides, goal
+    hidden behind it -> the robot must ROUTE AROUND it and DISCOVER the goal. Flank pillars keep
+    the forward lidar's ICP fed while it arcs around."""
+    from helhest.heightmap import Heightmap
+
+    xlim, ylim = (-2.0, 20.0), (-7.0, 7.0)
+    nx = int(round((xlim[1] - xlim[0]) / cell))
+    ny = int(round((ylim[1] - ylim[0]) / cell))
+    xs = xlim[0] + (np.arange(nx) + 0.5) * cell
+    ys = ylim[0] + (np.arange(ny) + 0.5) * cell
+    XX, YY = np.meshgrid(xs, ys)
+    H = np.zeros((ny, nx), np.float64)
+    los, his, top = [], [], 2.0
+
+    def add(cx, cy, hx, hy):
+        H[(np.abs(XX - cx) <= hx) & (np.abs(YY - cy) <= hy)] = top
+        los.append((cx - hx, cy - hy, 0.0))
+        his.append((cx + hx, cy + hy, top))
+
+    add(8.0, 0.0, 2.0, 1.8)  # the big block to drive around: x[6,10], y[-1.8,1.8]
+    for xc in np.arange(1.0, 19.0, 2.5):  # flank pillars -> ICP features along the go-around
+        for yc in (-5.0, 5.0):
+            add(xc, yc, 0.3, 0.3)
+    for xc, yc in [(12.0, -3.2), (12.0, 3.2), (14.5, -2.4), (14.5, 2.4)]:  # features past the block
+        add(xc, yc, 0.3, 0.3)
+    scene = Heightmap(H, (xlim[0], ylim[0]), cell)
+    return scene, np.asarray(los, np.float32), np.asarray(his, np.float32), (0.0, 0.0, 0.0), np.array([16.0, 0.0])
+
+
+_WORLDS = {
+    "lane": box_world, "narrow": narrow_lane_box_world,
+    "slalom": slalom_box_world, "detour": detour_box_world,
+}
 
 
 def _dilate_bool(mask: np.ndarray, k: int) -> np.ndarray:
@@ -323,6 +356,7 @@ def run_closed_loop(
     gyro_noise: float = 0.001,
     wheel_scale: float = 0.01,
     win_m: float = 8.0,
+    route_m: float = 16.0,
     lat_coarsen: int = 4,
     local_support: int = 2,
     local_max_gap_m: float = 0.4,
@@ -381,13 +415,16 @@ def run_closed_loop(
     planner = MppiGpu(plan_sim, CostParams(), robust=RobustConfig(n_slip_samples=K), n_theta=n_theta)
     planner.reset_nominal(1.5)
     kr = max(1, int(lat_coarsen))
-    rcny, rcnx, rccell = wh // kr, ww // kr, cell * kr
+    rww = rwh = int(round(route_m / cell))  # ROUTING window — larger than the plan window so the
+    rcny, rcnx, rccell = rwh // kr, rww // kr, cell * kr  # cost-to-go can see the way AROUND obstacles
     ctg = CostToGo(
         GridParams(rcnx, rcny, rccell, 0.0, 0.0),
         dynamics.robot_params(), dynamics.planning_solver(), n_theta=n_theta, device=device,
     )
     planner.cw.lattice_cap = ctg._vcap
-    sgrid = GridParams(rcnx, rcny, rccell, 0.0, 0.0).build()
+    # the routing field expressed in the PLANNING window's frame: both windows are robot-centered,
+    # so their origins differ by a CONSTANT cell offset (frame-independent -> safe in the replan graph)
+    sgrid = GridParams(rcnx, rcny, rccell, (ww // 2 - rww // 2) * cell, (wh // 2 - rwh // 2) * cell).build()
 
     STAGES = ("scan", "icp", "map", "heightmap", "costtogo", "mppi", "drive")
     prof = StageProfiler(device, STAGES, enabled=profile)
@@ -450,26 +487,28 @@ def run_closed_loop(
         half = win_m / 2.0
         xmin, ymin = ex - half, ey - half
         bounds = (xmin, ex + half, ymin, ey + half)
-        # GLOBAL rolling map (all accumulated points) -> routing / cost-to-go
-        gl = HeightMapBuilder(cell, bounds, device=device).build(map_wp)
-        gknown = (gl.count.numpy() > 0)[:wh, :ww]
-        elev_global = np.where(gknown, gl.max.numpy()[:wh, :ww], 0.0).astype(np.float32)
-        # LOCAL single-scan map (THIS scan) -> confidence(support) mask -> inpaint SMALL gaps only
+        # LOCAL single-scan map (THIS scan) -> support mask -> inpaint SMALL gaps only -> MPPI.
+        # Trust the inpaint only WITHIN local_max_gap_m of a real return; large unseen areas stay
+        # flat (optimistic) so diffusion can't invent phantom obstacles.
         ll = HeightMapBuilder(cell, bounds, device=device).build(world_corrected)
         conf = (ll.count.numpy() >= local_support)[:wh, :ww]
         hm = np.where(conf, ll.max.numpy()[:wh, :ww], np.nan).astype(np.float32)
         filled = np.nan_to_num(np.asarray(multigrid_inpaint(hm)), nan=0.0).astype(np.float32)
-        # trust the inpaint only WITHIN local_max_gap_m of a real return; large unseen
-        # areas stay flat (optimistic) so diffusion can't invent phantom obstacles
         known_local = _dilate_bool(conf, int(round(local_max_gap_m / cell)))
         elev_local = np.where(known_local, filled, 0.0).astype(np.float32)
+        # GLOBAL rolling map over the ROUTING window (route_m, all accumulated points) -> cost-to-go
+        rhalf = route_m / 2.0
+        rxmin, rymin = ex - rhalf, ey - rhalf
+        rgl = HeightMapBuilder(cell, (rxmin, ex + rhalf, rymin, ey + rhalf), device=device).build(map_wp)
+        relev = np.where(rgl.count.numpy() > 0, rgl.max.numpy(), 0.0).astype(np.float32)[:rwh, :rww]
         prof.mark(4)
 
         state_l = np.array([ex - xmin, ey - ymin, eyaw], np.float32)
         goal_l = (goal[0] - xmin, goal[1] - ymin)
         plan_sim.set_terrain(wp.array(np.ascontiguousarray(elev_local), dtype=wp.float32, device=device))
-        Hc = elev_global[: rcny * kr, : rcnx * kr].reshape(rcny, kr, rcnx, kr).max(axis=(1, 3)) if kr > 1 else elev_global
-        V = ctg.compute(wp.array(np.ascontiguousarray(Hc), dtype=wp.float32, device=device), goal_l)
+        Hc = relev[: rcny * kr, : rcnx * kr].reshape(rcny, kr, rcnx, kr).max(axis=(1, 3)) if kr > 1 else relev
+        goal_r = (goal[0] - rxmin, goal[1] - rymin)  # goal in the routing-window frame
+        V = ctg.compute(wp.array(np.ascontiguousarray(Hc), dtype=wp.float32, device=device), goal_r)
         prof.mark(5)
         planner.set_lattice(V, sgrid)
 
@@ -494,9 +533,9 @@ def run_closed_loop(
         if frame_hook is not None:
             frame_hook(dict(
                 f=f, true=(st.x, st.y, st.yaw), est=(ex, ey, eyaw), map_wp=map_wp,
-                elev=elev_local, known=known_local, elev_local=elev_local, elev_global=elev_global,
-                known_local=known_local, known_global=gknown, V=V,
-                xmin=xmin, ymin=ymin, cell=cell, ww=ww, wh=wh,
+                elev=elev_local, known=known_local, elev_local=elev_local,
+                known_local=known_local, V=V,
+                xmin=xmin, ymin=ymin, rxmin=rxmin, rymin=rymin, cell=cell, ww=ww, wh=wh,
                 kr=kr, rcnx=rcnx, rcny=rcny, rccell=rccell, goal=goal, box_lo=box_lo, box_hi=box_hi,
                 planner=planner, ctg=ctg, true_tr=list(true_tr), est_tr=list(est_tr),
                 odom_tr=list(odom_tr), outcome=outcome, pred=pred, T_wb=T_wb, scan_base=scan_base,

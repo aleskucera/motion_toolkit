@@ -23,8 +23,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pipeline_sim  # same demos/ dir when run as a script
 import warp as wp
+from matplotlib.colors import ListedColormap
 from matplotlib.patches import Rectangle
 from PIL import Image
+
+_RED = ListedColormap(["#ff2020"])  # cells the dynamic ray-carve filter removed
 
 ZMIN, ZMAX = -0.2, 2.0  # shared height colour-scale (ground → pillar top)
 HCMAP = plt.cm.viridis
@@ -117,15 +120,21 @@ class Dashboard:
         # --- global rolling map (accumulator) → routing; rasterized big, robot-centered
         ag = self.ax_global
         ag.set_facecolor(_GROUND)
+        gext = [ex - V, ex + V, ey - V, ey + V]
         if s["map_wp"] is not None and len(s["map_wp"]):
-            gl = self._HMB(0.15, (ex - V, ex + V, ey - V, ey + V), device=s["map_wp"].device).build(s["map_wp"])
-            gimg = np.where(gl.count.numpy() > 0, gl.max.numpy(), np.nan)
-            ag.imshow(gimg, origin="lower", extent=[ex - V, ex + V, ey - V, ey + V], cmap=HCMAP, vmin=ZMIN, vmax=ZMAX)
+            dev = s["map_wp"].device
+            gl = self._HMB(0.15, tuple(gext), device=dev).build(s["map_wp"])
+            gcount = gl.count.numpy()
+            ag.imshow(np.where(gcount > 0, gl.max.numpy(), np.nan), origin="lower", extent=gext, cmap=HCMAP, vmin=ZMIN, vmax=ZMAX)
+            if s.get("map_raw") is not None and len(s["map_raw"]):  # what the ray-carve filter removed
+                rc = self._HMB(0.15, tuple(gext), device=dev).build(s["map_raw"]).count.numpy()
+                carved = (rc > 0) & (gcount == 0)
+                ag.imshow(np.where(carved, 1.0, np.nan), origin="lower", extent=gext, cmap=_RED, alpha=0.95)
         if walker is not None:
             ag.add_patch(Rectangle((walker[0] - 0.35, walker[1] - 0.35), 0.7, 0.7, fill=False, ec="orange", lw=2))
         _robot(ag, ex, ey, eyaw, V * 0.12)
         big(ag)
-        ag.set_title("Global rolling map → routing")
+        ag.set_title("Global map → routing" + ("  (red = filtered out)" if walker is not None else ""))
 
         # --- cost-to-go V + best-heading flow (routing window)
         Vf = s["V"].numpy()
@@ -134,11 +143,12 @@ class Dashboard:
         heading = (tbest + 0.5) * 2.0 * np.pi / nt
         reach = Vmin < s["ctg"]._vcap * 0.9
         rc = s["rccell"]
-        rext = [xmin, xmin + Vf.shape[1] * rc, ymin, ymin + Vf.shape[0] * rc]
+        rxmin, rymin = s["rxmin"], s["rymin"]
+        rext = [rxmin, rxmin + Vf.shape[1] * rc, rymin, rymin + Vf.shape[0] * rc]
         ac = self.ax_ctg
         ac.imshow(np.where(reach, Vmin, np.nan), origin="lower", extent=rext, cmap="magma")
-        cxs = xmin + (np.arange(Vf.shape[1]) + 0.5) * rc
-        cys = ymin + (np.arange(Vf.shape[0]) + 0.5) * rc
+        cxs = rxmin + (np.arange(Vf.shape[1]) + 0.5) * rc
+        cys = rymin + (np.arange(Vf.shape[0]) + 0.5) * rc
         XX, YY = np.meshgrid(cxs, cys)
         st = max(1, Vf.shape[1] // 26)
         ac.quiver(XX[::st, ::st], YY[::st, ::st], np.where(reach, np.cos(heading), np.nan)[::st, ::st],
