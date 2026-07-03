@@ -194,6 +194,54 @@ wheels = [
 ]
 
 [[package]]
+name = "helhest-stack"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "numpy" },
+    { name = "warp-lang" },
+]
+
+[package.optional-dependencies]
+data = [
+    { name = "h5py" },
+]
+viz = [
+    { name = "glfw" },
+    { name = "matplotlib" },
+    { name = "pillow" },
+    { name = "pyopengl" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "h5py" },
+    { name = "matplotlib" },
+    { name = "pillow" },
+    { name = "plotly" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "glfw", marker = "extra == 'viz'", specifier = ">=2.6" },
+    { name = "h5py", marker = "extra == 'data'", specifier = ">=3.0" },
+    { name = "matplotlib", marker = "extra == 'viz'", specifier = ">=3.8" },
+    { name = "numpy", specifier = ">=2.4.4" },
+    { name = "pillow", marker = "extra == 'viz'", specifier = ">=10.0" },
+    { name = "pyopengl", marker = "extra == 'viz'", specifier = ">=3.1" },
+    { name = "warp-lang", specifier = ">=1.13" },
+]
+provides-extras = ["viz", "data"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "h5py", specifier = ">=3.0" },
+    { name = "matplotlib", specifier = ">=3.8" },
+    { name = "pillow", specifier = ">=10.0" },
+    { name = "plotly", specifier = ">=6.7.0" },
+]
+
+[[package]]
 name = "kiwisolver"
 version = "1.5.0"
 source = { registry = "https://pypi.org/simple" }
@@ -334,53 +382,12 @@ wheels = [
 ]
 
 [[package]]
-name = "motion-toolkit"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "numpy" },
-    { name = "warp-lang" },
-]
-
-[package.optional-dependencies]
-data = [
-    { name = "h5py" },
-]
-perception = [
-    { name = "terrain-toolkit" },
-]
-viz = [
-    { name = "glfw" },
-    { name = "matplotlib" },
-    { name = "pillow" },
-    { name = "pyopengl" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "h5py" },
-    { name = "matplotlib" },
-    { name = "pillow" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "glfw", marker = "extra == 'viz'", specifier = ">=2.6" },
-    { name = "h5py", marker = "extra == 'data'", specifier = ">=3.0" },
-    { name = "matplotlib", marker = "extra == 'viz'", specifier = ">=3.8" },
-    { name = "numpy", specifier = ">=2.0" },
-    { name = "pillow", marker = "extra == 'viz'", specifier = ">=10.0" },
-    { name = "pyopengl", marker = "extra == 'viz'", specifier = ">=3.1" },
-    { name = "terrain-toolkit", marker = "extra == 'perception'", editable = "../terrain_toolkit" },
-    { name = "warp-lang", specifier = ">=1.13" },
-]
-provides-extras = ["viz", "data", "perception"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "h5py", specifier = ">=3.0" },
-    { name = "matplotlib", specifier = ">=3.8" },
-    { name = "pillow", specifier = ">=10.0" },
+name = "narwhals"
+version = "2.23.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e8/ac/66ed1fc6e38a0c0f330627ec5c5d597990d6159b6712b82af0ad2c65f06c/narwhals-2.23.0.tar.gz", hash = "sha256:13e7ff5b4bb4a2f77b907c2e4d8a76e273dfc1323a3c997440a2f9fd26aed408", size = 656209, upload-time = "2026-07-01T11:21:53.278Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f4/4e/afc8c31605cb8be1d3bb4438c4d979daa104dab6306cd2b87abe9c3a7299/narwhals-2.23.0-py3-none-any.whl", hash = "sha256:769e7b9ab102c93d8fa019f6b4cd1a657909b04a20bf6210e5a35aae06814ae9", size = 458938, upload-time = "2026-07-01T11:21:51.677Z" },
 ]
 
 [[package]]
@@ -523,6 +530,19 @@ wheels = [
 ]
 
 [[package]]
+name = "plotly"
+version = "6.8.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "narwhals" },
+    { name = "packaging" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/94/fd/d72c292d78aadb93d1a9bcd76bf3c678271040c7cf10abe5788b33040a39/plotly-6.8.0.tar.gz", hash = "sha256:e088e7ddc68d4f70e3d66659224727a45296d71d2b8284181862d3d8f1f0d88f", size = 6915161, upload-time = "2026-06-03T18:33:40.226Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f9/14/abe5ce876ab5b66ee3c691bf537fcd43d037aea55d447aacf74630a8f31e/plotly-6.8.0-py3-none-any.whl", hash = "sha256:13c5c4a0f70b74cab1913eda0de49b826df5931708eb6f9c3010040614700ec8", size = 9902055, upload-time = "2026-06-03T18:33:34.26Z" },
+]
+
+[[package]]
 name = "pyopengl"
 version = "3.1.10"
 source = { registry = "https://pypi.org/simple" }
@@ -559,27 +579,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68a0e064b6af791aa332cf192da575fd474ed7d6f16a2/six-1.17.0.tar.gz", hash = "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81", size = 34031, upload-time = "2024-12-04T17:35:28.174Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
-]
-
-[[package]]
-name = "terrain-toolkit"
-version = "0.1.0"
-source = { editable = "../terrain_toolkit" }
-dependencies = [
-    { name = "numpy" },
-    { name = "warp-lang" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "numpy", specifier = ">=2.4.4" },
-    { name = "warp-lang", specifier = ">=1.12.1" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "matplotlib", specifier = ">=3.10.8" },
-    { name = "plotly", specifier = ">=6.7.0" },
 ]
 
 [[package]]
