@@ -1,12 +1,30 @@
-# Helhest Junior — kinematic differentiable simulator
+# helhest-stack
 
 <p align="center">
   <img src="data/trump_image.png" width="560"
        alt="Beautiful code. Wonderful code. Tremendous code. And the tests? 100%. Many people are saying this.">
 </p>
 
-A fast, differentiable, **purely kinematic** twin of the Helhest Junior for
-planning and calibration. No Newton/Ostrich, no dynamics. The robot is a rigid tripod:
+A GPU navigation stack for the **Helhest Junior** skid-steer robot, built on
+[NVIDIA Warp](https://github.com/NVIDIA/warp) and shipped as one importable
+package, `helhest`. It spans the whole on-robot loop — see, sense where you are,
+decide where to go:
+
+- **`helhest.perception`** — point cloud → heightmap → traversability cost map,
+  plus a lidar sim, outlier/dynamic-obstacle filtering, and occlusion/support
+  trust masks. ≈5.5 ms/frame (68k-point Ouster) on a laptop RTX A500.
+- **`helhest.localization`** — GPU-native ICP pose estimation over a
+  device-resident rolling map accumulator.
+- **motion** (`helhest.engine` / `planning` / `control` / `driver`) — a fast,
+  **differentiable, purely kinematic** twin of the robot plus a sampling planner
+  (GPU MPPI + orientation-aware cost-to-go routing + a terminal dock controller).
+
+Everything is **device-resident by default**: point clouds, grids, and rollouts
+live on the GPU; host↔device round trips are the exception, not the rule.
+
+## The differentiable kinematic twin (motion core)
+
+No Newton/Ostrich, no dynamics — a rigid tripod resolved kinematically:
 
 - **Controlled DOF** `(x, y, yaw)` — driven by the 3 wheels via no-slip
   differential-drive kinematics, with friction-dependent turning captured by two
@@ -23,8 +41,6 @@ gradients flow all the way to the *raw* elevation. Controls are **not**
 differentiated. Batched over many rollouts for sampling-based planning and for
 per-episode calibration.
 
-## Architecture
-
 Two simulators share a `BaseSimulator` (device structs, grid, buffer allocation):
 
 - **`ForwardSimulator`** — the planner's workhorse: one fused `rollout_kernel` over
@@ -36,16 +52,27 @@ Two simulators share a `BaseSimulator` (device structs, grid, buffer allocation)
   (`rollout_taped(loss_fn=None) → backward_from_cotangents(dL/dcontrolled, dL/dderived)`).
   CUDA-only (the dilation contact uses a shared-memory tiled arg-max).
 
-Package layout (`src/helhest/`):
+## The perception → planning seam
 
-| dir / module | role |
+Perception produces a `GridMap` — the deliberately minimal heightmap contract
+(`helhest.perception.gridmap`). The planner consumes it via
+`helhest.perception.grid_adapter` → the engine's `GridParams`, zero-copy when the
+elevation is already a `wp.array`. `helhest.localization` closes the loop by
+tracking the robot's pose (ICP) as it drives, so the map the planner routes over
+stays registered to the world.
+
+## Package layout (`src/helhest/`)
+
+| module | role |
 |---|---|
-| `engine/` | Warp runtime — `simulator.py` (the 3 sims), `step.py` (settle + IFT adjoint, step kernels), `envelope.py` (wheel dilation), `terrain.py`, `robot.py`, `rotations.py`, `linalg.py` |
-| `reference/` | numpy finite-difference oracle (verification only) |
-| `control/` | `mppi.py` (GPU MPPI), `terminal.py` (terminal dock) |
+| `perception/` | point cloud → `heightmap/` → `traversability/` cost map; trust masks (`confidence/`), `outlier/` + `dynamic/` filters, lidar `sim/`, `pipeline.py`; the planning seam (`gridmap.py` contract, `grid_adapter.py`, `terrain_lidar.py`) |
+| `localization/` | GPU ICP pose estimation (`localizer.py`, `pose_math.py`) over `perception.icp` + the rolling `perception.mapping.DeviceMapAccumulator` |
+| `engine/` | Warp runtime — `simulator.py` (the 3 sims), `step.py` (settle + IFT adjoint, step kernels), `envelope.py` (wheel dilation), `terrain.py`, `robot.py` |
 | `planning/` | `costtogo.py` (orientation-aware routing), `lattice_solver.py` |
-| `perception/` | `gridmap.py`, `lidar.py`, `rasterize.py` |
+| `control/` | `mppi.py` (GPU MPPI), `terminal.py` (terminal dock) |
 | `driver.py` | `WarpDriver` — the single driven robot (B=1, T=1) |
+| `reference/` | numpy finite-difference oracle (verification only) |
+| `viz/` | Blender rollout export/import + interactive viewers |
 | `worlds.py`, `dynamics.py` | stress scenes + canonical robot/solver params |
 
 Robot geometry/mass come from `dynamics.robot_params()` (`engine/robot.py`
@@ -62,24 +89,34 @@ or plain pip: `pip install -e ".[viz,data]"`.
 ## Run
 
 ```bash
-# closed-loop eval on the real driver (MPPI + cost-to-go routing + terminal dock)
+# --- motion: closed-loop planning on the real driver (MPPI + cost-to-go + terminal dock)
 python demos/eval.py --world pocket           # one world
 python demos/eval.py --stress                 # all stress worlds
 python demos/navigate_partial.py              # plan on a lidar-built map, fixed robot window
+python demos/navigate_partial_view.py         # same drive from both planners' viewpoints
+python demos/motor_lag_comparison.py          # first-order wheel actuator lag: tau=0 vs tau>0
 
-# timing benchmarks
-python -m benchmarks.forward                  # ForwardSimulator fused rollout (CPU+CUDA)
-python -m benchmarks.differentiable           # DifferentiableSimulator grad-step (CUDA)
-python -m benchmarks.planning                 # cost-to-go solve (CUDA)
-python -m benchmarks.control                  # MPPI replan (CUDA)
+# --- perception (all synthetic — no data files needed)
+python scripts/example.py                     # end-to-end pipeline on synthetic points
+python scripts/drive_lidar.py                 # interactive: drive an Ouster OSDome, filter moving people
+python scripts/demo_lidar.py                  # animated ray-cast lidar watching a person walk
+python scripts/demo_dynamic_filter.py         # filter a moving person out of the accumulated map
 
-# verify the engine
-python -m tests.engine.gpu_check              # forward / adjoint / VJP parity + throughput (CUDA)
-python -m tests.engine.gradients              # implicit-gradient finite-diff oracle (CPU)
+# --- localization / mapping
+python scripts/stress_icp_odom.py             # accumulating mapper vs noisy odometry
+python scripts/stress_deskew.py               # quantify + correct lidar motion skew
+
+# --- timing benchmarks (CUDA)
+python -m benchmarks.forward                  # ForwardSimulator fused rollout
+python -m benchmarks.differentiable           # DifferentiableSimulator grad-step
+python -m benchmarks.planning                 # cost-to-go solve
+python -m benchmarks.control                  # MPPI replan
+
+# --- verify the engine (parity oracles)
+python -m tests.engine.step                   # full physics vs numpy oracle (incl. motor-lag parity)
+python -m tests.engine.gpu_check              # forward / adjoint / VJP parity + throughput
+python -m tests.engine.gradients              # implicit-gradient finite-diff oracle
 ```
-
-The package is `helhest`; `engine/` is the runtime, `reference/` is the
-numpy finite-difference oracle (verification only).
 
 ## Blender visualization
 
@@ -120,7 +157,7 @@ OUT=~/clip.mp4 RES=1920x1080 ./scripts/render_dasenka.sh rollout.npz <gpu> -- \
     --robot robot.blend --wheel-left WheelL --wheel-right WheelR --wheel-rear WheelRear
 ```
 
-## Phases
+## Motion core — build phases
 
 Built in phases, each independently verifiable:
 
@@ -156,25 +193,10 @@ Built in phases, each independently verifiable:
   clean wheels-only 3×3 equality solve (no chassis complementarity), which in turn
   keeps the implicit (IFT) gradient simple.
 
-## Perception stack (`helhest.perception`)
+## Docs
 
-The on-robot perception front-end lives in `helhest.perception`:
-GPU point cloud → heightmap → traversability cost map, plus GPU-native ICP
-(`icp/`) and a device-resident rolling map accumulator
-(`mapping/DeviceMapAccumulator`). It feeds the planner across the
-perception→planning seam via a shared `GridMap` (`helhest.perception.gridmap`
-contract → `helhest.perception.grid_adapter`). ICP-based pose estimation is a
-sibling package, `helhest.localization`.
-
-| Stage | Module | Purpose |
-|---|---|---|
-| Heightmap raster | `heightmap/` | max/mean/min/count layers + NaN-aware inpaint & smooth |
-| Geometric cost | `traversability/` | slope + signed step + roughness, obstacle inflation, temporal gate |
-| Trust masks | `confidence/` | occlusion (line-of-sight) + support-ratio masking |
-| Orchestration | `pipeline.py` | `TerrainPipeline` — points in, `TerrainMap` out |
-| Localization | `icp/`, `mapping/` | GPU-native ICP + rolling accumulated map |
-
-See [`docs/`](docs/) for the full perception reference (built with mkdocs).
+`docs/` holds the perception reference (heightmap, outlier filtering,
+traversability, pipeline, performance), built with mkdocs.
 
 ## License
 
