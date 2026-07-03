@@ -16,7 +16,6 @@ from .heightmap import multigrid_inpaint
 from .icp import IcpAligner
 from .icp import IcpConfig
 from .icp import IcpResult
-from .icp import voxel_downsample
 from .mapping import DeviceMapAccumulator
 from .outlier import OutlierFilterConfig
 from .outlier import RadiusOutlierFilter
@@ -34,6 +33,7 @@ from .traversability import ObstacleInflator
 from .traversability import TemporalGate
 from .traversability import TraversabilityConfig
 from .traversability import TraversabilityCosts
+from .voxel import VoxelGrid
 
 __all__ = [
     "DeviceMapAccumulator",
@@ -67,9 +67,9 @@ __all__ = [
     "TerrainPipeline",
     "TraversabilityConfig",
     "TraversabilityCosts",
+    "VoxelGrid",
     "diffuse_inpaint",
     "frontier_from_organized",
     "gaussian_smooth",
     "multigrid_inpaint",
-    "voxel_downsample",
 ]

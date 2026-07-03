@@ -58,11 +58,6 @@ def main() -> None:
         "--voxel-target", action="store_true", help="Also voxel-downsample the target cloud."
     )
     p.add_argument(
-        "--fixed-bounds",
-        action="store_true",
-        help="Use fixed voxel bounds instead of per-call min/max.",
-    )
-    p.add_argument(
         "--no-profile",
         action="store_true",
         help="Skip per-stage profiling (avoids per-stage wp.synchronize overhead).",
@@ -102,35 +97,21 @@ def main() -> None:
     t_init = np.array([0.12, -0.06, 0.01])
     T_init = pose(R_init, t_init)
 
-    bounds = None
-    if args.fixed_bounds:
-        # Pad the target extent by 5 m so source points transformed from the
-        # noisy prior still fall inside the fixed grid.
-        pad = 5.0
-        mn = target.min(axis=0) - pad
-        mx = target.max(axis=0) + pad
-        bounds = (
-            float(mn[0]),
-            float(mx[0]),
-            float(mn[1]),
-            float(mx[1]),
-            float(mn[2]),
-            float(mx[2]),
-        )
-
     cfg = IcpConfig(
         max_iters=args.max_iters,
         max_correspondence_dist_m=0.5,
         normal_radius_m=0.3,
         voxel_size_m=args.voxel,
         voxel_target=args.voxel_target,
-        voxel_bounds_m=bounds,
     )
     aligner = IcpAligner(cfg, verbose=args.verbose_once)
+    # Upload once (the sensor boundary); the aligner is device-native thereafter.
+    source_wp = wp.array(source, dtype=wp.vec3, device=aligner.device)
+    target_wp = wp.array(target, dtype=wp.vec3, device=aligner.device)
 
     # Warmup (kernel compile + JIT caches).
     for _ in range(args.warmup):
-        aligner.align(source, target, init_pose=T_init)
+        aligner.align(source_wp, target_wp, init_pose=T_init)
     aligner.verbose = False
 
     # Timed runs.
@@ -142,7 +123,7 @@ def main() -> None:
     for _ in range(args.runs):
         wp.synchronize()
         t0 = time.perf_counter()
-        res = aligner.align(source, target, init_pose=T_init, profile=not args.no_profile)
+        res = aligner.align(source_wp, target_wp, init_pose=T_init, profile=not args.no_profile)
         wp.synchronize()
         t1 = time.perf_counter()
         total_times.append((t1 - t0) * 1000.0)

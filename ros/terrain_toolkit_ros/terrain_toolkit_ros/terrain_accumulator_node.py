@@ -25,6 +25,7 @@ from __future__ import annotations
 import numpy as np
 import rclpy
 import tf2_ros
+import warp as wp
 from geometry_msgs.msg import TransformStamped
 from message_filters import ApproximateTimeSynchronizer
 from message_filters import Subscriber
@@ -40,7 +41,7 @@ from terrain_toolkit import DynamicPointFilter
 from terrain_toolkit import IcpAligner
 from terrain_toolkit import IcpConfig
 from terrain_toolkit import TerrainMap
-from terrain_toolkit import voxel_downsample
+from terrain_toolkit import VoxelGrid
 from tf2_ros import TransformBroadcaster
 from tf2_ros import TransformException
 
@@ -123,6 +124,7 @@ class TerrainAccumulatorNode(Node):
         # Persistent map state (all in the world / map_frame). Bootstrapped on
         # the first scan; see _process.
         self.global_cloud: np.ndarray | None = None
+        self._map_voxel: VoxelGrid | None = None  # lazy; sizes to the map on first use
         self.odom_T_base_prev: np.ndarray | None = None
         self.world_T_base_prev: np.ndarray | None = None
         self._deskew_warned = False  # warn once if deskew is on but the cloud lacks times
@@ -402,9 +404,7 @@ class TerrainAccumulatorNode(Node):
         if self.odom_T_base_prev is None:
             world_T_base = odom_T_base_curr
             world_pts = transform_points_xyz(world_T_base, scan_base)
-            self.global_cloud = voxel_downsample(
-                world_pts, self.accumulation_voxel_m, device=self.pipe.device
-            )
+            self.global_cloud = self._downsample_map(world_pts)
             self._publish(world_T_base, cloud_msg.header.stamp)
             self._broadcast_map_tf(world_T_base, odom_msg)
             self.odom_T_base_prev = odom_T_base_curr
@@ -432,9 +432,7 @@ class TerrainAccumulatorNode(Node):
         # Accumulate, bound to a radius around the robot, and downsample.
         merged = np.vstack((self.global_cloud, world_pts))
         merged = crop_box(merged, world_T_base[:3, 3], self.map_max_radius_m)
-        self.global_cloud = voxel_downsample(
-            merged, self.accumulation_voxel_m, device=self.pipe.device
-        )
+        self.global_cloud = self._downsample_map(merged)
 
         self._publish(world_T_base, cloud_msg.header.stamp)
         self._broadcast_map_tf(world_T_base, odom_msg)
@@ -469,6 +467,25 @@ class TerrainAccumulatorNode(Node):
         alphas = (point_times - point_times.min()) / span
         return deskew_scan(scan_base, alphas, delta).astype(np.float32)
 
+    def _downsample_map(self, points: np.ndarray) -> np.ndarray:
+        """Voxel-downsample the accumulated map via the device-native VoxelGrid.
+
+        The map still lives on the host here, so this uploads/reads back at the
+        boundary. Keeping the map on device (DeviceMapAccumulator) would remove
+        the round trip entirely — see the accumulator device-path follow-up.
+        """
+        if len(points) == 0:
+            return points
+        if self._map_voxel is None or self._map_voxel.max_points < len(points):
+            self._map_voxel = VoxelGrid(
+                self.accumulation_voxel_m,
+                max_points=max(len(points), 400_000),
+                device=self.pipe.device,
+            )
+        pw = wp.array(np.ascontiguousarray(points, np.float32), dtype=wp.vec3, device=self.pipe.device)
+        centroids, n = self._map_voxel.downsample(pw, len(points))
+        return centroids.numpy()[:n].astype(points.dtype, copy=False)
+
     # ------------------------------------------------------------------
     # ICP registration (scan-to-submap, with divergence gate)
     # ------------------------------------------------------------------
@@ -484,7 +501,12 @@ class TerrainAccumulatorNode(Node):
             )
             return world_T_base_pred
 
-        result = self.aligner.align(scan_base, submap, init_pose=world_T_base_pred)
+        dev = self.aligner.device
+        result = self.aligner.align(
+            wp.array(scan_base, dtype=wp.vec3, device=dev),
+            wp.array(submap, dtype=wp.vec3, device=dev),
+            init_pose=world_T_base_pred,
+        )
 
         rot, trans = pose_correction_magnitude(world_T_base_pred, result.pose)
         if (

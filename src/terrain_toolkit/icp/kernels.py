@@ -151,60 +151,6 @@ def estimate_normals_kernel(
 
 
 @wp.kernel
-def voxel_accumulate_kernel(
-    points: wp.array(dtype=wp.vec3),
-    origin: wp.vec3,
-    inv_voxel: wp.float32,
-    nx: wp.int32,
-    ny: wp.int32,
-    nz: wp.int32,
-    sums: wp.array(dtype=wp.vec3),
-    counts: wp.array(dtype=wp.int32),
-    occupied: wp.array(dtype=wp.int32),
-    occ_counter: wp.array(dtype=wp.int32),
-):
-    """Assign each point to its voxel bucket and accumulate sum/count.
-
-    Records each bucket the moment its count goes 0->1 (exactly one thread wins
-    that transition), so the compact pass can visit only occupied buckets instead
-    of scanning the whole grid.
-    """
-    i = wp.tid()
-    p = points[i]
-    fx = (p[0] - origin[0]) * inv_voxel
-    fy = (p[1] - origin[1]) * inv_voxel
-    fz = (p[2] - origin[2]) * inv_voxel
-    ix = int(fx)
-    iy = int(fy)
-    iz = int(fz)
-    if ix < 0 or ix >= nx:
-        return
-    if iy < 0 or iy >= ny:
-        return
-    if iz < 0 or iz >= nz:
-        return
-    bucket = ix + iy * nx + iz * nx * ny
-    if wp.atomic_add(counts, bucket, 1) == 0:
-        occupied[wp.atomic_add(occ_counter, 0, 1)] = bucket
-    wp.atomic_add(sums, bucket, p)
-
-
-@wp.kernel
-def voxel_compact_kernel(
-    occupied: wp.array(dtype=wp.int32),
-    sums: wp.array(dtype=wp.vec3),
-    counts: wp.array(dtype=wp.int32),
-    out_points: wp.array(dtype=wp.vec3),
-):
-    """Emit one centroid per occupied bucket (indexed off `occupied`) and reset
-    that bucket to empty, leaving `sums`/`counts` zeroed for the next call."""
-    idx = occupied[wp.tid()]
-    out_points[wp.tid()] = sums[idx] / float(counts[idx])
-    sums[idx] = wp.vec3(0.0, 0.0, 0.0)
-    counts[idx] = 0
-
-
-@wp.kernel
 def transform_points_kernel(
     src: wp.array(dtype=wp.vec3),
     pose: wp.array(dtype=wp.mat44),  # device-resident current pose (target_T_source)

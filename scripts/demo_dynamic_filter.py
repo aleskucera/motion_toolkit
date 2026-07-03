@@ -33,7 +33,23 @@ from matplotlib.animation import PillowWriter  # noqa: E402
 from terrain_toolkit import DynamicFilterConfig  # noqa: E402
 from terrain_toolkit import DynamicPointFilter  # noqa: E402
 from terrain_toolkit import TerrainPipeline  # noqa: E402
-from terrain_toolkit import voxel_downsample  # noqa: E402
+from terrain_toolkit import VoxelGrid  # noqa: E402
+
+# Demo-side numpy boundary around the device-native VoxelGrid.
+_VG: dict[tuple, VoxelGrid] = {}
+
+
+def voxel_downsample(points: np.ndarray, voxel_size: float, *, device) -> np.ndarray:
+    if len(points) == 0:
+        return points
+    key = (round(voxel_size, 4), str(device))
+    vg = _VG.get(key)
+    if vg is None or vg.max_points < len(points):
+        vg = VoxelGrid(voxel_size, max_points=max(len(points), 200_000), device=device)
+        _VG[key] = vg
+    pw = wp.array(np.ascontiguousarray(points, np.float32), dtype=wp.vec3, device=device)
+    ds, n = vg.downsample(pw, len(points))
+    return ds.numpy()[:n].astype(points.dtype, copy=False)
 
 SENSOR = np.array([0.0, 0.0, 0.5])  # stationary sensor origin
 WALL_X = 10.0  # back wall distance (m)

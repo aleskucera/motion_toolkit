@@ -24,9 +24,26 @@ import warp as wp
 
 from terrain_toolkit import IcpAligner
 from terrain_toolkit import IcpConfig
-from terrain_toolkit import voxel_downsample
+from terrain_toolkit import VoxelGrid
 from terrain_toolkit.sim import GroundSpec
 from terrain_toolkit.sim import PrimitiveLidar
+
+# Sim-side numpy boundary around the device-native VoxelGrid (this harness keeps
+# its accumulated map on the host; the library itself is Warp-only).
+_VG: dict[tuple, VoxelGrid] = {}
+
+
+def voxel_downsample(points: np.ndarray, voxel_size: float, *, device) -> np.ndarray:
+    if len(points) == 0:
+        return points
+    key = (round(voxel_size, 4), str(device))
+    vg = _VG.get(key)
+    if vg is None or vg.max_points < len(points):
+        vg = VoxelGrid(voxel_size, max_points=max(len(points), 300_000), device=device)
+        _VG[key] = vg
+    pw = wp.array(np.ascontiguousarray(points, np.float32), dtype=wp.vec3, device=device)
+    ds, n = vg.downsample(pw, len(points))
+    return ds.numpy()[:n].astype(points.dtype, copy=False)
 
 # Import the node's real pose algebra directly from the ROS package (pure numpy,
 # no rclpy) so the harness exercises the same math the node ships.
@@ -156,7 +173,12 @@ def _register(
     submap = crop_box(global_cloud, world_T_base_pred[:3, 3], ICP_SUBMAP_RADIUS_M)
     if submap.shape[0] < GATE_MIN_SUBMAP:
         return world_T_base_pred, "sparse"
-    result = aligner.align(scan_base, submap, init_pose=world_T_base_pred)
+    dev = aligner.device
+    result = aligner.align(
+        wp.array(scan_base, dtype=wp.vec3, device=dev),
+        wp.array(submap, dtype=wp.vec3, device=dev),
+        init_pose=world_T_base_pred,
+    )
     rot, trans = pose_correction_magnitude(world_T_base_pred, result.pose)
     if (
         result.converged

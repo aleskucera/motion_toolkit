@@ -7,14 +7,13 @@ from dataclasses import field
 import numpy as np
 import warp as wp
 
+from ..voxel import VoxelGrid
 from .kernels import accumulate_system_kernel
 from .kernels import estimate_normals_kernel
 from .kernels import keep_going_kernel
 from .kernels import se3_update_kernel
 from .kernels import solve6x6_kernel
 from .kernels import transform_points_kernel
-from .kernels import voxel_accumulate_kernel
-from .kernels import voxel_compact_kernel
 
 
 @dataclass
@@ -31,22 +30,16 @@ class IcpConfig:
     convergence_translation_m: float = 1.0e-4
     damping: float = 1.0e-6
 
-    # Upper bound on source/target points after downsampling; the aligner
-    # preallocates its device buffers to this size and subsamples anything larger
-    # (fixed buffers are what make the GN loop CUDA-graph-capturable).
+    # Upper bound on input points per cloud. The aligner preallocates its device
+    # buffers (and the voxel hash table) to this size; the fixed buffers are what
+    # make the GN loop CUDA-graph-capturable.
     max_points: int = 120_000
 
-    # Voxel downsampling applied to source (and target if `voxel_target`) before ICP.
-    # Set to None or 0 to disable. Using the centroid per voxel gives a more
-    # uniform spatial distribution than random subsampling.
+    # Voxel downsampling applied to source (and target if `voxel_target`) before
+    # ICP. Set to None or 0 to disable. One centroid per occupied voxel gives a
+    # more uniform spatial distribution than random subsampling.
     voxel_size_m: float | None = None
     voxel_target: bool = False
-    # Optional fixed world bounds for the voxel grid: (xmin, xmax, ymin, ymax, zmin, zmax).
-    # When set, skips the per-call CPU min/max scan. Points outside are dropped.
-    voxel_bounds_m: tuple[float, float, float, float, float, float] | None = None
-
-
-_MAX_VOXEL_GRID_CELLS = 20_000_000
 
 
 class _EventTimer:
@@ -86,96 +79,6 @@ class _EventTimer:
         self._intervals.clear()
 
 
-def _voxel_grid_dims(mins: np.ndarray, maxs: np.ndarray, voxel_size: float) -> tuple[np.ndarray, int]:
-    """Per-axis cell counts and total cells for a voxel grid over [mins, maxs]."""
-    dims = np.ceil((maxs - mins) / voxel_size).astype(np.int64) + 1
-    n_vx = int(dims.prod())
-    if n_vx > _MAX_VOXEL_GRID_CELLS:
-        raise ValueError(
-            f"voxel grid has {n_vx} cells (>{_MAX_VOXEL_GRID_CELLS}); use a larger voxel_size"
-        )
-    return dims, n_vx
-
-
-def _voxel_bin(
-    points_wp: wp.array,
-    n: int,
-    min_corner: wp.vec3,
-    inv_voxel: float,
-    dims: np.ndarray,
-    sums: wp.array,
-    counts: wp.array,
-    occupied: wp.array,
-    occ_counter: wp.array,
-    out: wp.array,
-) -> int:
-    """Bin `points_wp` to one centroid per occupied voxel in caller-owned buffers.
-
-    `sums`/`counts` (len ≥ grid cells) must start zeroed and are left zeroed —
-    the compact pass resets each cell it reads, so it (and the clear) cost
-    O(occupied), not O(grid). `occupied`/`out` (len ≥ n) are scratch. Returns the
-    number of centroids written to `out`.
-    """
-    occ_counter.zero_()
-    wp.launch(
-        voxel_accumulate_kernel,
-        dim=n,
-        inputs=[points_wp, min_corner, inv_voxel, int(dims[0]), int(dims[1]), int(dims[2])],
-        outputs=[sums, counts, occupied, occ_counter],
-    )
-    wp.synchronize()
-    n_out = int(occ_counter.numpy()[0])
-    if n_out:
-        wp.launch(
-            voxel_compact_kernel,
-            dim=n_out,
-            inputs=[occupied],
-            outputs=[sums, counts, out],
-        )
-    return n_out
-
-
-def voxel_downsample(
-    points: np.ndarray,
-    voxel_size: float,
-    *,
-    device: wp.context.Device | None = None,
-) -> np.ndarray:
-    """GPU voxel downsample: return one centroid per occupied voxel."""
-    if voxel_size <= 0.0 or len(points) == 0:
-        return points
-
-    pts = np.ascontiguousarray(points, dtype=np.float32)
-    mins = pts.min(axis=0)
-    maxs = pts.max(axis=0)
-    dims, n_vx = _voxel_grid_dims(mins, maxs, voxel_size)
-
-    device = wp.get_device(device)
-    with wp.ScopedDevice(device):
-        pts_wp = wp.array(pts, dtype=wp.vec3)
-        sums = wp.zeros(n_vx, dtype=wp.vec3)
-        counts = wp.zeros(n_vx, dtype=wp.int32)
-        occupied = wp.empty(len(pts), dtype=wp.int32)
-        occ_counter = wp.zeros(1, dtype=wp.int32)
-        out = wp.empty(len(pts), dtype=wp.vec3)
-        min_corner = wp.vec3(float(mins[0]), float(mins[1]), float(mins[2]))
-        n_out = _voxel_bin(
-            pts_wp,
-            len(pts),
-            min_corner,
-            1.0 / voxel_size,
-            dims,
-            sums,
-            counts,
-            occupied,
-            occ_counter,
-            out,
-        )
-        result = out.numpy()[:n_out]
-
-    return result.astype(points.dtype, copy=False)
-
-
 @dataclass
 class IcpResult:
     pose: np.ndarray  # (4, 4) float64 — target_T_source
@@ -186,15 +89,10 @@ class IcpResult:
     timings_ms: dict[str, float] = field(default_factory=dict)
 
 
-def _hashgrid_dims(points: np.ndarray, radius: float) -> tuple[int, int, int]:
-    """Pick reasonable hash grid dimensions for the target cloud."""
-    mins = points.min(axis=0)
-    maxs = points.max(axis=0)
-    extent = np.maximum(maxs - mins, radius)
-    cells = np.ceil(extent / max(radius, 1.0e-6)).astype(int)
-    # Clamp to reasonable values.
-    cells = np.clip(cells, 8, 256)
-    return int(cells[0]), int(cells[1]), int(cells[2])
+# Hash-grid buckets per axis. Only affects query performance (the neighbor
+# search checks true distances, so it's exact for any dims); a fixed generous
+# grid avoids scanning the target extent (~4 ms of min/max) every align.
+_HASHGRID_DIM = 128
 
 
 class IcpAligner:
@@ -219,15 +117,12 @@ class IcpAligner:
         self._graph = None  # captured GN-loop graph (built lazily on the first align)
         self._capped_warned = False
 
-        # Voxel-downsample scratch buffers, grown on demand. sums/counts are kept
-        # zeroed between calls by the compact pass, so they are never re-zeroed.
-        self._vx_cells: int = 0
-        self._vx_out_capacity: int = 0
-        self._vx_sums: wp.array | None = None
-        self._vx_counts: wp.array | None = None
-        self._vx_counter: wp.array | None = None
-        self._vx_occupied: wp.array | None = None
-        self._vx_out: wp.array | None = None
+        cfg = self.config
+        self._voxel: VoxelGrid | None = None
+        if cfg.voxel_size_m is not None and cfg.voxel_size_m > 0.0:
+            self._voxel = VoxelGrid(
+                cfg.voxel_size_m, max_points=cfg.max_points, device=self.device
+            )
 
         # Device-resident GN-loop state: fixed-size buffers (max_points) plus the
         # per-iteration scalars, so the loop touches only these and is graph-ready.
@@ -251,85 +146,31 @@ class IcpAligner:
             self._keep_running = wp.zeros(1, dtype=wp.int32)
             self._converged = wp.zeros(1, dtype=wp.int32)
 
-    def _ensure_grid(self, radius: float, points: np.ndarray) -> wp.HashGrid:
-        # Dims are fixed at creation; only scan the cloud's extent the first time,
-        # not every align (that min/max over the raw cloud costs ~4 ms otherwise).
+    def _ensure_grid(self) -> wp.HashGrid:
         if self._grid is None or self._grid.device != self.device:
-            self._grid = wp.HashGrid(*_hashgrid_dims(points, radius), device=self.device)
+            self._grid = wp.HashGrid(
+                _HASHGRID_DIM, _HASHGRID_DIM, _HASHGRID_DIM, device=self.device
+            )
         return self._grid
 
-    def _voxel_bin_into_scratch(self, points: np.ndarray, voxel_size: float) -> int:
-        """Voxel-downsample into `self._vx_out` (device); return the point count.
+    def _prepare_cloud(self, points: wp.array, out: wp.array, apply_voxel: bool) -> int:
+        """Fill `out` (device) with the optionally-downsampled cloud; return count.
 
-        Unlike the module-level `voxel_downsample`, the result is left on device
-        (no cloud readback) so `align` can copy it straight into its GN buffers.
+        Fully device-resident: `points` is a `wp.array` and any downsampled result
+        is copied device→device into `out`. A cloud larger than `max_points` uses
+        its first `max_points` (rare — downsampling normally keeps it well under).
         """
-        pts = np.ascontiguousarray(points, dtype=np.float32)
-        bounds = self.config.voxel_bounds_m
-        if bounds is not None:
-            mins = np.array([bounds[0], bounds[2], bounds[4]], dtype=np.float32)
-            maxs = np.array([bounds[1], bounds[3], bounds[5]], dtype=np.float32)
-        else:
-            mins = pts.min(axis=0)
-            maxs = pts.max(axis=0)
-        dims, n_vx = _voxel_grid_dims(mins, maxs, voxel_size)
-
-        # Grow the shared scratch buffers on demand; sums/counts stay zeroed
-        # between calls (the compact pass clears each cell it reads).
-        if self._vx_cells < n_vx:
-            self._vx_sums = wp.zeros(n_vx, dtype=wp.vec3)
-            self._vx_counts = wp.zeros(n_vx, dtype=wp.int32)
-            self._vx_cells = n_vx
-        if self._vx_out_capacity < len(pts):
-            self._vx_out = wp.empty(len(pts), dtype=wp.vec3)
-            self._vx_occupied = wp.empty(len(pts), dtype=wp.int32)
-            self._vx_out_capacity = len(pts)
-        if self._vx_counter is None:
-            self._vx_counter = wp.zeros(1, dtype=wp.int32)
-
-        min_corner = wp.vec3(float(mins[0]), float(mins[1]), float(mins[2]))
-        return _voxel_bin(
-            wp.array(pts, dtype=wp.vec3),
-            len(pts),
-            min_corner,
-            1.0 / voxel_size,
-            dims,
-            self._vx_sums,
-            self._vx_counts,
-            self._vx_occupied,
-            self._vx_counter,
-            self._vx_out,
-        )
-
-    def _load_cloud(self, points: np.ndarray, out: wp.array, apply_voxel: bool) -> int:
-        """Fill `out` (device) with the optionally-downsampled, capped cloud; return count.
-
-        When voxelizing, the downsampled cloud stays on device — a device→device
-        copy into `out`, avoiding a downsample→host→re-upload round trip. Only the
-        (tiny) point count crosses back to the host.
-        """
-        if apply_voxel and len(points) > 0:
-            n = self._voxel_bin_into_scratch(points, self.config.voxel_size_m)
-            if n <= self.config.max_points:
-                wp.copy(out, self._vx_out, 0, 0, n)
-                return n
-            points = self._vx_out.numpy()[:n]  # rare: still over the cap → host cap below
-        capped = self._cap(np.ascontiguousarray(points, dtype=np.float32))
-        n = len(capped)
-        if n:
-            wp.copy(out, wp.array(capped, dtype=wp.vec3), 0, 0, n)
-        return n
-
-    def _cap(self, points: np.ndarray) -> np.ndarray:
-        """Subsample to at most `max_points` (the fixed buffers require a bound)."""
-        n = len(points)
-        if n <= self.config.max_points:
-            return points
-        if not self._capped_warned:
-            print(f"[icp] cloud of {n} pts exceeds max_points; subsampling to {self.config.max_points}")
+        mp = self.config.max_points
+        n_in = min(len(points), mp)
+        if len(points) > mp and not self._capped_warned:
+            print(f"[icp] cloud of {len(points)} pts exceeds max_points={mp}; using first {n_in}")
             self._capped_warned = True
-        idx = np.linspace(0, n - 1, self.config.max_points).astype(np.int64)
-        return points[idx]
+        if apply_voxel:
+            downsampled, n_out = self._voxel.downsample(points, n_in)
+            wp.copy(out, downsampled, 0, 0, n_out)
+            return n_out
+        wp.copy(out, points, 0, 0, n_in)
+        return n_in
 
     def _seed_pose(self, init_pose: np.ndarray | None) -> None:
         """Load the initial pose and reset the loop state into the device buffers."""
@@ -422,34 +263,38 @@ class IcpAligner:
 
     def align(
         self,
-        source: np.ndarray,
-        target: np.ndarray,
+        source: wp.array,
+        target: wp.array,
         init_pose: np.ndarray | None = None,
         *,
         profile: bool = False,
     ) -> IcpResult:
-        if source.ndim != 2 or source.shape[1] != 3:
-            raise ValueError(f"source must be (N, 3); got {source.shape}")
-        if target.ndim != 2 or target.shape[1] != 3:
-            raise ValueError(f"target must be (N, 3); got {target.shape}")
+        """Align `source` to `target`, both device `wp.array(vec3)`; return the pose.
+
+        Fully device-resident — the clouds stay on the GPU end to end (upload them
+        once at the sensor boundary). `init_pose` is a host 4x4 (the odom guess);
+        only it and the final pose cross the host boundary.
+        """
+        if not isinstance(source, wp.array) or not isinstance(target, wp.array):
+            raise TypeError("source and target must be wp.array(vec3) on the device")
 
         cfg = self.config
         grid_radius = max(cfg.max_correspondence_dist_m, cfg.normal_radius_m)
         prof = _EventTimer(self.device, profile)
 
-        voxel_on = cfg.voxel_size_m is not None and cfg.voxel_size_m > 0.0
+        voxel_on = self._voxel is not None
 
         with wp.ScopedDevice(self.device):
-            # Downsample (if enabled), cap, and load into the fixed GN buffers —
-            # device-resident, so only the point counts return to the host. The
-            # rest of each buffer is never read (kernels guard on the live count).
+            # Downsample (if enabled) and load into the fixed GN buffers, all on
+            # device; only the point counts return to the host. The rest of each
+            # buffer is never read (kernels guard on the live count).
             with prof.stage("voxel_downsample"):
-                n_src = self._load_cloud(source, self._src, voxel_on)
-                n_tgt = self._load_cloud(target, self._tgt, voxel_on and cfg.voxel_target)
+                n_src = self._prepare_cloud(source, self._src, voxel_on)
+                n_tgt = self._prepare_cloud(target, self._tgt, voxel_on and cfg.voxel_target)
                 self._n_src.fill_(n_src)
 
             with prof.stage("grid_build"):
-                grid = self._ensure_grid(grid_radius, target)
+                grid = self._ensure_grid()
                 grid.build(points=self._tgt[:n_tgt], radius=float(grid_radius))
 
             with prof.stage("normals"):

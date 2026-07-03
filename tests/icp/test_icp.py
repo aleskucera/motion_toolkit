@@ -4,6 +4,7 @@ add an odometry-like perturbation, and check that ICP recovers the true pose."""
 import argparse
 
 import numpy as np
+import warp as wp
 from terrain_toolkit import IcpAligner
 from terrain_toolkit import IcpConfig
 
@@ -88,7 +89,10 @@ def main() -> None:
     print(f"Initial guess error: rot={np.rad2deg(rot_err):.2f} deg  trans={trans_err:.3f} m")
 
     aligner = IcpAligner(IcpConfig(max_iters=args.max_iters), verbose=args.verbose)
-    result = aligner.align(source, target, init_pose=T_init)
+    # Upload the clouds once; the aligner is device-native from here.
+    source_wp = wp.array(source, dtype=wp.vec3, device=aligner.device)
+    target_wp = wp.array(target, dtype=wp.vec3, device=aligner.device)
+    result = aligner.align(source_wp, target_wp, init_pose=T_init)
 
     rot_err, trans_err = pose_diff(result.pose, T_gt)
     print(
