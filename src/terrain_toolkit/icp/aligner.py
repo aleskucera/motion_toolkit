@@ -252,9 +252,10 @@ class IcpAligner:
             self._converged = wp.zeros(1, dtype=wp.int32)
 
     def _ensure_grid(self, radius: float, points: np.ndarray) -> wp.HashGrid:
-        dims = _hashgrid_dims(points, radius)
+        # Dims are fixed at creation; only scan the cloud's extent the first time,
+        # not every align (that min/max over the raw cloud costs ~4 ms otherwise).
         if self._grid is None or self._grid.device != self.device:
-            self._grid = wp.HashGrid(*dims, device=self.device)
+            self._grid = wp.HashGrid(*_hashgrid_dims(points, radius), device=self.device)
         return self._grid
 
     def _voxel_bin_into_scratch(self, points: np.ndarray, voxel_size: float) -> int:
