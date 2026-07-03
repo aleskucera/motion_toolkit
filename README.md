@@ -1,5 +1,10 @@
 # Helhest Junior — kinematic differentiable simulator
 
+<p align="center">
+  <img src="data/trump_image.png" width="560"
+       alt="Beautiful code. Wonderful code. Tremendous code. And the tests? 100%. Many people are saying this.">
+</p>
+
 A fast, differentiable, **purely kinematic** twin of the Helhest Junior for
 planning and calibration. No Newton/Ostrich, no dynamics. The robot is a rigid tripod:
 
