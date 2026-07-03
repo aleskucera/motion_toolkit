@@ -1,15 +1,14 @@
-"""Pipeline inspector: a per-frame DASHBOARD of the full closed loop, stitched to a
-scrubable GIF — the rig for hunting good parameters and validating each stage.
+"""Pipeline inspector — a per-frame dashboard of the full closed loop → scrubable GIF.
+The rig for hunting parameters and validating each stage.
 
-Six panels (all real data):
-  GLOBAL MAP     — accumulated device voxel map (top-down) + true/odom/ICP trails + window.
-  PLANNER WINDOW — the local heightmap MPPI drives on (unknown=grey) + the MPPI nominal.
-  COST-TO-GO     — routing field: colour = min-over-heading V, arrows = best heading (flow to goal).
-  MPPI CLOUD     — a subsample of the B candidates coloured by CVaR cost (bright=low), nominal on top.
-  ICP ERROR      — ICP vs odom localization error + inlier count over time (the localization tuning view).
-  ICP SNAP       — this scan at the odom PREDICTION (red) vs after ICP (green) over the local map.
+Layout (robot-centered, dot+arrow = robot; top 4 share the z colour-scale):
+  TOP:    [ real world (ground truth) ] [ live lidar scan ] [ local single-scan map (MPPI) ] [ global rolling map (routing) ]
+  BOTTOM: [ cost-to-go V + best-heading flow ]              [ MPPI rollout cloud (by cost) + nominal ]
 
-  python demos/pipeline_inspect.py --out /tmp/inspect.gif
+Localization + the dynamic filter are read by COMPARING the real-world panel against the
+global-map panel: offset/smear = drift; walker-smear-vs-clean = the ray-carve filter.
+
+  python demos/pipeline_inspect.py --out /tmp/inspect.gif [--dynamic] [--world lane|narrow|slalom]
 """
 
 from __future__ import annotations
@@ -27,6 +26,11 @@ import warp as wp
 from matplotlib.patches import Rectangle
 from PIL import Image
 
+ZMIN, ZMAX = -0.2, 2.0  # shared height colour-scale (ground → pillar top)
+HCMAP = plt.cm.viridis
+_NORM = plt.Normalize(ZMIN, ZMAX)
+_GROUND = HCMAP(_NORM(0.0))  # colour of flat ground — used as the "continuous world" backdrop
+
 
 def _rollout_nominal(U, x, y, yaw, R, halfb, dt):
     """Planar twist rollout of the MPPI nominal wheel-speed sequence U[T,2] -> xy path."""
@@ -41,92 +45,113 @@ def _rollout_nominal(U, x, y, yaw, R, halfb, dt):
     return np.asarray(path)
 
 
-def _xform(T, pts):
-    """Apply a 4x4 pose to (N,3) points."""
-    return (T @ np.c_[pts, np.ones(len(pts))].T).T[:, :3]
+def _robot(ax, x, y, yaw, scale):
+    """Robot = a dot + a heading arrow."""
+    ax.plot(x, y, "o", color="magenta", ms=6, mec="k", zorder=6)
+    ax.arrow(x, y, scale * math.cos(yaw), scale * math.sin(yaw), color="magenta",
+             width=scale * 0.08, head_width=scale * 0.42, length_includes_head=True, zorder=6)
 
 
 class Dashboard:
-    def __init__(self, R, halfb, dt, stride):
-        self.R, self.halfb, self.dt, self.stride = R, halfb, dt, stride
+    def __init__(self, R, halfb, dt, stride, view_m):
+        self.R, self.halfb, self.dt, self.stride, self.V = R, halfb, dt, stride, view_m
         self.frames: list[Image.Image] = []
-        self.hist = {"f": [], "icp": [], "odom": [], "inl": []}
-        self.fig, self.axes = plt.subplots(2, 3, figsize=(19, 10))
+        self.fig = plt.figure(figsize=(20, 9))
+        gs = self.fig.add_gridspec(2, 4)
+        self.ax_world = self.fig.add_subplot(gs[0, 0])
+        self.ax_scan = self.fig.add_subplot(gs[0, 1])
+        self.ax_local = self.fig.add_subplot(gs[0, 2])
+        self.ax_global = self.fig.add_subplot(gs[0, 3])
+        self.ax_ctg = self.fig.add_subplot(gs[1, 0:2])
+        self.ax_mppi = self.fig.add_subplot(gs[1, 2:4])
+        from helhest.perception import HeightMapBuilder
+
+        self._HMB = HeightMapBuilder
 
     def __call__(self, s):
-        # accumulate the localization history EVERY frame (render only on stride)
-        tr = np.asarray(s["true_tr"])[-1]
-        od = np.asarray(s["odom_tr"])[-1]
-        self.hist["f"].append(s["f"])
-        self.hist["icp"].append(s["err"])
-        self.hist["odom"].append(float(np.hypot(od[0] - tr[0], od[1] - tr[1])))
-        self.hist["inl"].append(s["outcome"].num_inliers if s["outcome"] else 0)
         if s["f"] % self.stride:
             return
-
+        V = self.V
+        ex, ey, eyaw = s["est"]
         cell, ww, wh = s["cell"], s["ww"], s["wh"]
         xmin, ymin = s["xmin"], s["ymin"]
-        ex, ey, eyaw = s["est"]
         gx, gy = s["goal"]
-        ext = [0, ww * cell, 0, wh * cell]
-        rx, ry = ex - xmin, ey - ymin
-        ax = self.axes.ravel()
-        for a in ax:
+        walker = s.get("walker")
+        for a in (self.ax_world, self.ax_scan, self.ax_local, self.ax_global, self.ax_ctg, self.ax_mppi):
             a.clear()
 
-        # --- 0: global accumulated map + true/odom/ICP trails ---
+        def big(ax):
+            ax.set_xlim(ex - V, ex + V)
+            ax.set_ylim(ey - V, ey + V)
+            ax.set_aspect("equal")
+
+        # --- world (ground truth): a continuous heightmap; ground fills everywhere so it never "ends"
+        sc = s["scene"]
+        aw = self.ax_world
+        aw.set_facecolor(_GROUND)
+        aw.imshow(sc.H, origin="lower", extent=[sc.x0, sc.x0 + sc.nx * sc.cell, sc.y0, sc.y0 + sc.ny * sc.cell],
+                  cmap=HCMAP, vmin=ZMIN, vmax=ZMAX)
+        if walker is not None:
+            aw.add_patch(Rectangle((walker[0] - 0.35, walker[1] - 0.35), 0.7, 0.7, color=HCMAP(_NORM(1.8))))
+        _robot(aw, ex, ey, eyaw, V * 0.12)
+        big(aw)
+        aw.set_title("Real world (ground truth)")
+
+        # --- live lidar scan (this frame), coloured by height, same frame + scale
+        asc = self.ax_scan
+        asc.set_facecolor("#101014")
+        sw = s["scan_world"].numpy()
+        asc.scatter(sw[:, 0], sw[:, 1], c=sw[:, 2], s=2, cmap=HCMAP, vmin=ZMIN, vmax=ZMAX)
+        _robot(asc, ex, ey, eyaw, V * 0.12)
+        big(asc)
+        asc.set_title("Live lidar scan (what it sees now)")
+
+        # --- local single-scan map (inpaint + confidence) — the MPPI terrain (8 m window)
+        al = self.ax_local
+        al.set_facecolor(_GROUND)
+        wext = [xmin, xmin + ww * cell, ymin, ymin + wh * cell]
+        al.imshow(s["elev_local"], origin="lower", extent=wext, cmap=HCMAP, vmin=ZMIN, vmax=ZMAX)
+        _robot(al, ex, ey, eyaw, 0.8)
+        al.set_xlim(wext[0], wext[1])
+        al.set_ylim(wext[2], wext[3])
+        al.set_aspect("equal")
+        al.set_title("Local single-scan map → MPPI")
+
+        # --- global rolling map (accumulator) → routing; rasterized big, robot-centered
+        ag = self.ax_global
+        ag.set_facecolor(_GROUND)
         if s["map_wp"] is not None and len(s["map_wp"]):
-            p = s["map_wp"].numpy()
-            ax[0].scatter(p[:, 0], p[:, 1], c=p[:, 2], s=1.3, cmap="viridis", vmin=-0.2, vmax=2.0)
-        for key, col, lab in (("true_tr", "#2ca02c", "true"), ("odom_tr", "#d62728", "odom"), ("est_tr", "#1f77b4", "ICP")):
-            a = np.asarray(s[key])
-            ax[0].plot(a[:, 0], a[:, 1], "-", color=col, lw=1.6, label=lab)
-        ax[0].plot(ex, ey, "o", color="k", ms=6)
-        ax[0].plot(gx, gy, "*", color="red", ms=15, mec="k")
-        ax[0].add_patch(Rectangle((xmin, ymin), ww * cell, wh * cell, fill=False, ec="cyan", lw=1.2))
-        w = s.get("walker")
-        if w is not None:
-            ax[0].add_patch(Rectangle((w[0] - 0.35, w[1] - 0.35), 0.7, 0.7, fill=False, ec="orange", lw=2, label="walker (GT)"))
-        ax[0].set_aspect("equal")
-        ax[0].legend(loc="upper left", fontsize=8)
-        if w is not None:  # zoom to the walker so the FILTERED-vs-unfiltered contrast is visible
-            ax[0].set_xlim(w[0] - 4.5, w[0] + 4.5)
-            ax[0].set_ylim(-3.6, 3.6)
-            ax[0].set_title("FILTERED map near walker (cf. panel 5)")
-        else:
-            ax[0].set_title("Global map + true / odom / ICP trails")
+            gl = self._HMB(0.15, (ex - V, ex + V, ey - V, ey + V), device=s["map_wp"].device).build(s["map_wp"])
+            gimg = np.where(gl.count.numpy() > 0, gl.max.numpy(), np.nan)
+            ag.imshow(gimg, origin="lower", extent=[ex - V, ex + V, ey - V, ey + V], cmap=HCMAP, vmin=ZMIN, vmax=ZMAX)
+        if walker is not None:
+            ag.add_patch(Rectangle((walker[0] - 0.35, walker[1] - 0.35), 0.7, 0.7, fill=False, ec="orange", lw=2))
+        _robot(ag, ex, ey, eyaw, V * 0.12)
+        big(ag)
+        ag.set_title("Global rolling map → routing")
 
-        # --- 1: planner window + MPPI nominal ---
-        ax[1].imshow(s["elev"], origin="lower", extent=ext, cmap="terrain", vmin=-0.2, vmax=2.0)
-        ax[1].imshow(np.where(s["known"], np.nan, 1.0), origin="lower", extent=ext, cmap="Greys", alpha=0.35, vmin=0, vmax=1)
-        path0 = _rollout_nominal(s["planner"].nominal(), rx, ry, eyaw, self.R, self.halfb, self.dt)
-        ax[1].plot(path0[:, 0], path0[:, 1], "-", color="#ffd400", lw=2.5, label="MPPI nominal")
-        ax[1].plot(rx, ry, "o", color="k", ms=7)
-        ax[1].plot(np.clip(gx - xmin, 0, ww * cell), np.clip(gy - ymin, 0, wh * cell), "*", color="red", ms=15, mec="k")
-        ax[1].set_aspect("equal")
-        ax[1].legend(loc="upper left", fontsize=8)
-        ax[1].set_title("Planner window (unknown=grey) + nominal")
-
-        # --- 2: cost-to-go field + best-heading flow ---
-        V = s["V"].numpy()
-        nt = V.shape[2]
-        Vmin, tbest = V.min(axis=2), V.argmin(axis=2)
+        # --- cost-to-go V + best-heading flow (routing window)
+        Vf = s["V"].numpy()
+        nt = Vf.shape[2]
+        Vmin, tbest = Vf.min(axis=2), Vf.argmin(axis=2)
         heading = (tbest + 0.5) * 2.0 * np.pi / nt
         reach = Vmin < s["ctg"]._vcap * 0.9
-        rcell = s["rccell"]
-        rext = [0, V.shape[1] * rcell, 0, V.shape[0] * rcell]
-        ax[2].imshow(np.where(reach, Vmin, np.nan), origin="lower", extent=rext, cmap="magma")
-        cxs = (np.arange(V.shape[1]) + 0.5) * rcell
-        cys = (np.arange(V.shape[0]) + 0.5) * rcell
+        rc = s["rccell"]
+        rext = [xmin, xmin + Vf.shape[1] * rc, ymin, ymin + Vf.shape[0] * rc]
+        ac = self.ax_ctg
+        ac.imshow(np.where(reach, Vmin, np.nan), origin="lower", extent=rext, cmap="magma")
+        cxs = xmin + (np.arange(Vf.shape[1]) + 0.5) * rc
+        cys = ymin + (np.arange(Vf.shape[0]) + 0.5) * rc
         XX, YY = np.meshgrid(cxs, cys)
-        st = max(1, V.shape[1] // 22)
-        ax[2].quiver(XX[::st, ::st], YY[::st, ::st], np.where(reach, np.cos(heading), np.nan)[::st, ::st],
-                     np.where(reach, np.sin(heading), np.nan)[::st, ::st], color="cyan", scale=30, width=0.004)
-        ax[2].plot(np.clip(gx - xmin, 0, rext[1]), np.clip(gy - ymin, 0, rext[3]), "*", color="lime", ms=15, mec="k")
-        ax[2].set_aspect("equal")
-        ax[2].set_title("Cost-to-go V (colour) + best-heading flow")
+        st = max(1, Vf.shape[1] // 26)
+        ac.quiver(XX[::st, ::st], YY[::st, ::st], np.where(reach, np.cos(heading), np.nan)[::st, ::st],
+                  np.where(reach, np.sin(heading), np.nan)[::st, ::st], color="cyan", scale=32, width=0.003)
+        ac.plot(np.clip(gx, rext[0], rext[1]), np.clip(gy, rext[2], rext[3]), "*", color="lime", ms=17, mec="k")
+        _robot(ac, ex, ey, eyaw, 0.8)
+        ac.set_aspect("equal")
+        ac.set_title("Cost-to-go V (colour) + best-heading flow → goal")
 
-        # --- 3: MPPI rollout cloud (candidates coloured by CVaR cost) ---
+        # --- MPPI rollout cloud (candidates by CVaR cost) + nominal, in the 8 m window
         pl = s["planner"]
         ctrl = pl.sim.controlled.numpy()  # [T+1, B, 3] window-local
         Jc = pl.J_cand.numpy()
@@ -134,69 +159,24 @@ class Dashboard:
         fin = Jc[np.isfinite(Jc)]
         lo, hi = (np.percentile(fin, [2, 92]) if len(fin) else (0.0, 1.0))
         norm = plt.Normalize(lo, max(hi, lo + 1e-6))
-        cmap = plt.cm.viridis_r
-        ax[3].imshow(np.where(s["elev"] > 0.5, 1.0, np.nan), origin="lower", extent=ext, cmap="Greys", alpha=0.5, vmin=0, vmax=1)
-        order = np.argsort(-np.nan_to_num(Jc, nan=lo))
-        for b in order[:: max(1, n_cand // 220)]:
-            pth = ctrl[:, b * n_scen, :2]
-            col = cmap(norm(Jc[b])) if np.isfinite(Jc[b]) else (0.6, 0.6, 0.6, 0.15)
-            ax[3].plot(pth[:, 0], pth[:, 1], "-", color=col, lw=0.7, alpha=0.55)
-        ax[3].plot(path0[:, 0], path0[:, 1], "-", color="#ff2d95", lw=2.4, label="nominal")
-        ax[3].plot(rx, ry, "o", color="k", ms=7)
-        ax[3].set_xlim(0, ww * cell)
-        ax[3].set_ylim(0, wh * cell)
-        ax[3].set_aspect("equal")
-        ax[3].legend(loc="upper left", fontsize=8)
-        ax[3].set_title(f"MPPI cloud ({n_cand} candidates, bright=low cost)")
+        am = self.ax_mppi
+        am.set_facecolor(_GROUND)
+        am.imshow(np.where(s["elev_local"] > 0.5, 1.0, np.nan), origin="lower", extent=wext, cmap="Greys", alpha=0.55, vmin=0, vmax=1)
+        rx, ry = ex - xmin, ey - ymin
+        for b in np.argsort(-np.nan_to_num(Jc, nan=lo))[:: max(1, n_cand // 240)]:
+            p = ctrl[:, b * n_scen, :2] + np.array([xmin, ymin])  # window-local -> world
+            col = plt.cm.viridis_r(norm(Jc[b])) if np.isfinite(Jc[b]) else (0.6, 0.6, 0.6, 0.15)
+            am.plot(p[:, 0], p[:, 1], "-", color=col, lw=0.7, alpha=0.55)
+        path0 = _rollout_nominal(pl.nominal(), rx, ry, eyaw, self.R, self.halfb, self.dt) + np.array([xmin, ymin])
+        am.plot(path0[:, 0], path0[:, 1], "-", color="#ff2d95", lw=2.6, label="nominal")
+        _robot(am, ex, ey, eyaw, 0.8)
+        am.set_xlim(wext[0], wext[1])
+        am.set_ylim(wext[2], wext[3])
+        am.set_aspect("equal")
+        am.legend(loc="upper left", fontsize=8)
+        am.set_title(f"MPPI cloud ({n_cand} candidates, bright=low cost) + nominal")
 
-        # --- 4: ICP vs odom error + inliers over time ---
-        h = self.hist
-        ax[4].plot(h["f"], h["odom"], "-", color="#d62728", lw=1.4, label="odom-only err")
-        ax[4].plot(h["f"], h["icp"], "-", color="#1f77b4", lw=1.8, label="ICP err")
-        ax[4].set_xlabel("frame")
-        ax[4].set_ylabel("localization error (m)")
-        ax[4].legend(loc="upper left", fontsize=8)
-        axr = ax[4].twinx()
-        axr.plot(h["f"], h["inl"], "-", color="#999", lw=1.0, alpha=0.7)
-        axr.set_ylabel("ICP inliers", color="#999")
-        ax[4].set_title("ICP vs odom error  +  inliers (grey)")
-
-        # --- 5: UNfiltered map (dynamic smear) if dynamic; else ICP snap ---
-        if s.get("map_raw") is not None:
-            pr = s["map_raw"].numpy()
-            ax[5].scatter(pr[:, 0], pr[:, 1], c=pr[:, 2], s=1.3, cmap="viridis", vmin=-0.2, vmax=2.0)
-            if w is not None:
-                ax[5].add_patch(Rectangle((w[0] - 0.35, w[1] - 0.35), 0.7, 0.7, fill=False, ec="orange", lw=2, label="walker (GT)"))
-            ax[5].plot(ex, ey, "o", color="k", ms=6)
-            ax[5].legend(loc="upper left", fontsize=8)
-            ax[5].set_aspect("equal")
-            ax[5].set_xlim(w[0] - 4.5, w[0] + 4.5)
-            ax[5].set_ylim(-3.6, 3.6)
-            ax[5].set_title("UNfiltered map near walker — smear (cf. panel 0)")
-            self._finish(s)
-            return
-        ax[5].set_title("ICP: scan @ odom-pred (red) vs after ICP (green)")
-        if s["pred"] is not None and s["map_wp"] is not None:
-            base = s["scan_base"].numpy()
-            base = base[:: max(1, len(base) // 4000)]
-            mp = s["map_wp"].numpy()
-            m = (np.abs(mp[:, 0] - ex) < 3.5) & (np.abs(mp[:, 1] - ey) < 3.5)
-            ax[5].scatter(mp[m, 0], mp[m, 1], s=2, color="#bbb", label="map")
-            pp = _xform(s["pred"], base)
-            cp = _xform(s["T_wb"], base)
-            ax[5].scatter(pp[:, 0], pp[:, 1], s=2, color="#d62728", alpha=0.5, label="scan @ pred")
-            ax[5].scatter(cp[:, 0], cp[:, 1], s=2, color="#2ca02c", alpha=0.5, label="scan @ ICP")
-            oc = s["outcome"]
-            ax[5].set_title(f"ICP snap — inliers {oc.num_inliers}, Δ {oc.correction_trans_m*100:.1f} cm, {oc.status}")
-            ax[5].legend(loc="upper left", fontsize=7, markerscale=3)
-            ax[5].set_xlim(ex - 3.5, ex + 3.5)
-            ax[5].set_ylim(ey - 3.5, ey + 3.5)
-            ax[5].set_aspect("equal")
-
-        self._finish(s)
-
-    def _finish(self, s):
-        self.fig.suptitle(f"frame {s['f']}   ICP-err {s['err']:.2f} m   contacts {s['contacts']}", fontsize=14)
+        self.fig.suptitle(f"frame {s['f']}   loc-err {s['err']:.2f} m   contacts {s['contacts']}", fontsize=15)
         self.fig.tight_layout()
         self.fig.canvas.draw()
         self.frames.append(Image.fromarray(np.asarray(self.fig.canvas.buffer_rgba())).convert("RGB"))
@@ -216,18 +196,18 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--world", choices=list(pipeline_sim._WORLDS), default="lane")
     ap.add_argument("--max-frames", type=int, default=340)
-    ap.add_argument("--stride", type=int, default=4, help="render every Nth frame")
+    ap.add_argument("--stride", type=int, default=4)
     ap.add_argument("--fps", type=int, default=12)
-    ap.add_argument("--dynamic", action="store_true", help="add a moving obstacle + show the ray-carve filter (panel 5 = unfiltered)")
+    ap.add_argument("--view-m", type=float, default=12.0, help="half-extent of the big robot-centered panels (m)")
+    ap.add_argument("--dynamic", action="store_true", help="add a moving obstacle (compare world vs global map)")
     ap.add_argument("--out", default="/tmp/pipeline_inspect.gif")
     args = ap.parse_args()
     wp.init()
 
     rp = dynamics.robot_params()
-    dash = Dashboard(rp.wheel_radius, rp.half_track, dynamics.planning_solver().dt, args.stride)
+    dash = Dashboard(rp.wheel_radius, rp.half_track, dynamics.planning_solver().dt, args.stride, args.view_m)
     res = pipeline_sim.run_closed_loop(
-        device=args.device, world=args.world, max_frames=args.max_frames, frame_hook=dash,
-        dynamic=args.dynamic,
+        device=args.device, world=args.world, max_frames=args.max_frames, frame_hook=dash, dynamic=args.dynamic,
     )
     print(f"reached={res['reached']} frames={res['frames']} contacts={res['contacts']}")
     dash.save(args.out, args.fps)

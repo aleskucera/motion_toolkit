@@ -484,6 +484,7 @@ def run_closed_loop(
                 odom_tr=list(odom_tr), outcome=outcome, pred=pred, T_wb=T_wb, scan_base=scan_base,
                 contacts=contacts, err=err[-1] if err else 0.0,
                 map_raw=(map_raw if dynamic else None), walker=walker,
+                scene=scene, scan_world=world_corrected,
             ))
 
     return dict(
