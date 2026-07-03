@@ -1,0 +1,48 @@
+# tmuxinator project for the terrain_toolkit_ros demo.
+#
+# Symlinked into ~/.config/tmuxinator/terrain-demo.yml so it can be launched
+# from anywhere with:
+#
+#   tmuxinator start terrain-demo             # use defaults
+#   BAG=/path/to/bag PROFILE=ouster \
+#       tmuxinator start terrain-demo         # override bag / launch profile
+#
+# Three panes — bag (paused; hit <space> to play), terrain_toolkit_ros node,
+# and rviz2 with the preconfigured terrain_demo.rviz.
+#
+# Each pane runs inside the helhest Apptainer container via exec.sh. The
+# workspace overlay is picked up by sourcing dev-shell.sh through the
+# symlinked path (~/projects/ws/src/terrain_toolkit), since dev-shell.sh
+# locates the workspace via <repo>/../.. .
+
+<%
+  home    = ENV['HOME']
+  exec_sh = "#{home}/projects/helhest-singularity/exec.sh"
+  ws_repo = "#{home}/projects/ws/src/terrain_toolkit"
+  bag     = ENV['BAG']     || "#{home}/projects/terrain_toolkit/data/helhest_2026_04_21-19_00"
+  profile = ENV['PROFILE'] || 'livox'
+%>
+
+name: terrain-demo
+root: <%= ws_repo %>
+
+windows:
+  - demo:
+      layout: main-vertical
+      panes:
+        - bag:
+          - <%= exec_sh %> bash -c 'source /opt/ros/jazzy/setup.bash && ros2 bag play "<%= bag %>" --clock --start-paused; exec bash'
+        - node:
+          - <%= exec_sh %> bash -c 'source "<%= ws_repo %>/ros/dev-shell.sh" && ros2 launch terrain_toolkit_ros <%= profile %>.launch.py; exec bash'
+        - rviz:
+          - <%= exec_sh %> bash -c 'source "<%= ws_repo %>/ros/dev-shell.sh" && rviz2 -d "$(ros2 pkg prefix terrain_toolkit_ros)/share/terrain_toolkit_ros/rviz/terrain_demo.rviz"; exec bash'
+  # Scratch shell — same Apptainer + ROS env, ready for `ros2 topic ...`,
+  # python3 imports of terrain_toolkit, etc.
+  - shell:
+      panes:
+        - <%= exec_sh %> bash -c 'source "<%= ws_repo %>/ros/dev-shell.sh"; exec bash'
+  # rqt_reconfigure GUI for live parameter tuning of the running node.
+  # Sliders for every float / int range, checkboxes for bools.
+  - rqt:
+      panes:
+        - <%= exec_sh %> bash -c 'source /opt/ros/jazzy/setup.bash && ros2 run rqt_reconfigure rqt_reconfigure; exec bash'
