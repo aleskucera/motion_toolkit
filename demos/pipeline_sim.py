@@ -311,6 +311,7 @@ def run_closed_loop(
     wheel_scale: float = 0.01,
     win_m: float = 8.0,
     lat_coarsen: int = 4,
+    local_support: int = 2,
     K: int = 8,
     n_theta: int = 24,
     B: int = 4096,
@@ -335,6 +336,7 @@ def run_closed_loop(
     from helhest.engine import ForwardSimulator
     from helhest.engine import GridParams
     from helhest.perception import HeightMapBuilder
+    from helhest.perception import multigrid_inpaint
     from helhest.planning.costtogo import CostToGo
     from helhest.profiling import StageProfiler
 
@@ -433,16 +435,22 @@ def run_closed_loop(
 
         half = win_m / 2.0
         xmin, ymin = ex - half, ey - half
-        builder = HeightMapBuilder(cell, (xmin, ex + half, ymin, ey + half), device=device)
-        layers = builder.build(map_wp)
-        known = layers.count.numpy() > 0
-        elev = np.where(known, layers.max.numpy(), 0.0).astype(np.float32)[:wh, :ww]
+        bounds = (xmin, ex + half, ymin, ey + half)
+        # GLOBAL rolling map (all accumulated points) -> routing / cost-to-go
+        gl = HeightMapBuilder(cell, bounds, device=device).build(map_wp)
+        gknown = (gl.count.numpy() > 0)[:wh, :ww]
+        elev_global = np.where(gknown, gl.max.numpy()[:wh, :ww], 0.0).astype(np.float32)
+        # LOCAL single-scan map (THIS scan) -> confidence(support) mask -> inpaint -> MPPI
+        ll = HeightMapBuilder(cell, bounds, device=device).build(world_corrected)
+        conf = (ll.count.numpy() >= local_support)[:wh, :ww]
+        hm = np.where(conf, ll.max.numpy()[:wh, :ww], np.nan).astype(np.float32)
+        elev_local = np.nan_to_num(np.asarray(multigrid_inpaint(hm)), nan=0.0).astype(np.float32)
         prof.mark(4)
 
         state_l = np.array([ex - xmin, ey - ymin, eyaw], np.float32)
         goal_l = (goal[0] - xmin, goal[1] - ymin)
-        plan_sim.set_terrain(wp.array(np.ascontiguousarray(elev), dtype=wp.float32, device=device))
-        Hc = elev[: rcny * kr, : rcnx * kr].reshape(rcny, kr, rcnx, kr).max(axis=(1, 3)) if kr > 1 else elev
+        plan_sim.set_terrain(wp.array(np.ascontiguousarray(elev_local), dtype=wp.float32, device=device))
+        Hc = elev_global[: rcny * kr, : rcnx * kr].reshape(rcny, kr, rcnx, kr).max(axis=(1, 3)) if kr > 1 else elev_global
         V = ctg.compute(wp.array(np.ascontiguousarray(Hc), dtype=wp.float32, device=device), goal_l)
         prof.mark(5)
         planner.set_lattice(V, sgrid)
@@ -468,7 +476,9 @@ def run_closed_loop(
         if frame_hook is not None:
             frame_hook(dict(
                 f=f, true=(st.x, st.y, st.yaw), est=(ex, ey, eyaw), map_wp=map_wp,
-                elev=elev, known=known, V=V, xmin=xmin, ymin=ymin, cell=cell, ww=ww, wh=wh,
+                elev=elev_local, known=conf, elev_local=elev_local, elev_global=elev_global,
+                known_local=conf, known_global=gknown, V=V,
+                xmin=xmin, ymin=ymin, cell=cell, ww=ww, wh=wh,
                 kr=kr, rcnx=rcnx, rcny=rcny, rccell=rccell, goal=goal, box_lo=box_lo, box_hi=box_hi,
                 planner=planner, ctg=ctg, true_tr=list(true_tr), est_tr=list(est_tr),
                 odom_tr=list(odom_tr), outcome=outcome, pred=pred, T_wb=T_wb, scan_base=scan_base,
