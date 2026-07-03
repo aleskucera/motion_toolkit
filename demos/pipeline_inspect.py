@@ -56,14 +56,10 @@ class Dashboard:
     def __init__(self, R, halfb, dt, stride, view_m):
         self.R, self.halfb, self.dt, self.stride, self.V = R, halfb, dt, stride, view_m
         self.frames: list[Image.Image] = []
-        self.fig = plt.figure(figsize=(20, 9))
-        gs = self.fig.add_gridspec(2, 4)
-        self.ax_world = self.fig.add_subplot(gs[0, 0])
-        self.ax_scan = self.fig.add_subplot(gs[0, 1])
-        self.ax_local = self.fig.add_subplot(gs[0, 2])
-        self.ax_global = self.fig.add_subplot(gs[0, 3])
-        self.ax_ctg = self.fig.add_subplot(gs[1, 0:2])
-        self.ax_mppi = self.fig.add_subplot(gs[1, 2:4])
+        self.fig, axes = plt.subplots(2, 3, figsize=(18, 11))
+        # top: perception (truth / raw scan / local map) ; bottom: planning (global map / cost-to-go / MPPI)
+        (self.ax_world, self.ax_scan, self.ax_local) = axes[0]
+        (self.ax_global, self.ax_ctg, self.ax_mppi) = axes[1]
         from helhest.perception import HeightMapBuilder
 
         self._HMB = HeightMapBuilder
