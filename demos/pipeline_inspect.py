@@ -84,9 +84,17 @@ class Dashboard:
         ax[0].plot(ex, ey, "o", color="k", ms=6)
         ax[0].plot(gx, gy, "*", color="red", ms=15, mec="k")
         ax[0].add_patch(Rectangle((xmin, ymin), ww * cell, wh * cell, fill=False, ec="cyan", lw=1.2))
+        w = s.get("walker")
+        if w is not None:
+            ax[0].add_patch(Rectangle((w[0] - 0.35, w[1] - 0.35), 0.7, 0.7, fill=False, ec="orange", lw=2, label="walker (GT)"))
         ax[0].set_aspect("equal")
         ax[0].legend(loc="upper left", fontsize=8)
-        ax[0].set_title("Global map + true / odom / ICP trails")
+        if w is not None:  # zoom to the walker so the FILTERED-vs-unfiltered contrast is visible
+            ax[0].set_xlim(w[0] - 4.5, w[0] + 4.5)
+            ax[0].set_ylim(-3.6, 3.6)
+            ax[0].set_title("FILTERED map near walker (cf. panel 5)")
+        else:
+            ax[0].set_title("Global map + true / odom / ICP trails")
 
         # --- 1: planner window + MPPI nominal ---
         ax[1].imshow(s["elev"], origin="lower", extent=ext, cmap="terrain", vmin=-0.2, vmax=2.0)
@@ -153,7 +161,20 @@ class Dashboard:
         axr.set_ylabel("ICP inliers", color="#999")
         ax[4].set_title("ICP vs odom error  +  inliers (grey)")
 
-        # --- 5: ICP snap — scan at odom prediction (red) vs after ICP (green) over local map ---
+        # --- 5: UNfiltered map (dynamic smear) if dynamic; else ICP snap ---
+        if s.get("map_raw") is not None:
+            pr = s["map_raw"].numpy()
+            ax[5].scatter(pr[:, 0], pr[:, 1], c=pr[:, 2], s=1.3, cmap="viridis", vmin=-0.2, vmax=2.0)
+            if w is not None:
+                ax[5].add_patch(Rectangle((w[0] - 0.35, w[1] - 0.35), 0.7, 0.7, fill=False, ec="orange", lw=2, label="walker (GT)"))
+            ax[5].plot(ex, ey, "o", color="k", ms=6)
+            ax[5].legend(loc="upper left", fontsize=8)
+            ax[5].set_aspect("equal")
+            ax[5].set_xlim(w[0] - 4.5, w[0] + 4.5)
+            ax[5].set_ylim(-3.6, 3.6)
+            ax[5].set_title("UNfiltered map near walker — smear (cf. panel 0)")
+            self._finish(s)
+            return
         ax[5].set_title("ICP: scan @ odom-pred (red) vs after ICP (green)")
         if s["pred"] is not None and s["map_wp"] is not None:
             base = s["scan_base"].numpy()
@@ -172,6 +193,9 @@ class Dashboard:
             ax[5].set_ylim(ey - 3.5, ey + 3.5)
             ax[5].set_aspect("equal")
 
+        self._finish(s)
+
+    def _finish(self, s):
         self.fig.suptitle(f"frame {s['f']}   ICP-err {s['err']:.2f} m   contacts {s['contacts']}", fontsize=14)
         self.fig.tight_layout()
         self.fig.canvas.draw()
@@ -194,6 +218,7 @@ def main():
     ap.add_argument("--max-frames", type=int, default=340)
     ap.add_argument("--stride", type=int, default=4, help="render every Nth frame")
     ap.add_argument("--fps", type=int, default=12)
+    ap.add_argument("--dynamic", action="store_true", help="add a moving obstacle + show the ray-carve filter (panel 5 = unfiltered)")
     ap.add_argument("--out", default="/tmp/pipeline_inspect.gif")
     args = ap.parse_args()
     wp.init()
@@ -202,6 +227,7 @@ def main():
     dash = Dashboard(rp.wheel_radius, rp.half_track, dynamics.planning_solver().dt, args.stride)
     res = pipeline_sim.run_closed_loop(
         device=args.device, world=args.world, max_frames=args.max_frames, frame_hook=dash,
+        dynamic=args.dynamic,
     )
     print(f"reached={res['reached']} frames={res['frames']} contacts={res['contacts']}")
     dash.save(args.out, args.fps)

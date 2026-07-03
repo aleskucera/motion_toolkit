@@ -113,12 +113,13 @@ def pillar_field() -> tuple[np.ndarray, np.ndarray]:
 
 
 def _scan_base(lidar, x, y, yaw, box_lo, box_hi, seed, device):
-    """Cast from the true sensor pose; return the valid returns in the BASE frame."""
+    """Cast from the true sensor pose; return (valid returns in the BASE frame, free-space
+    frontier in the WORLD frame). The frontier feeds the dynamic ray-carve filter."""
     origin = np.array([x, y, SENSOR_Z], np.float32)
-    pts_wp, valid_wp, _ = lidar.scan(origin, float(yaw), box_lo, box_hi, seed=seed, return_device=True)
+    pts_wp, valid_wp, free_wp = lidar.scan(origin, float(yaw), box_lo, box_hi, seed=seed, return_device=True)
     world_pts = pts_wp.numpy()[valid_wp.numpy().astype(bool)]  # sensor boundary: host once
     base = (invert_pose(se2_to_mat(x, y, yaw)) @ np.c_[world_pts, np.ones(len(world_pts))].T).T[:, :3]
-    return wp.array(np.ascontiguousarray(base, np.float32), dtype=wp.vec3, device=device)
+    return wp.array(np.ascontiguousarray(base, np.float32), dtype=wp.vec3, device=device), free_wp
 
 
 def run(
@@ -168,7 +169,7 @@ def run(
         wheel[k] = mat_to_se2(T_wheel)
         gyro[k] = mat_to_se2(T_gyro)
 
-        scan_base = _scan_base(lidar, true[k, 0], true[k, 1], true[k, 2], box_lo, box_hi, k + 1, device)
+        scan_base, _ = _scan_base(lidar, true[k, 0], true[k, 1], true[k, 2], box_lo, box_hi, k + 1, device)
         if not localizer.initialized:
             localizer.bootstrap(T_gyro, T_true)
             T_wb = T_true
@@ -286,6 +287,15 @@ def slalom_box_world(cell: float = 0.06):
 _WORLDS = {"lane": box_world, "narrow": narrow_lane_box_world, "slalom": slalom_box_world}
 
 
+def _walker_box(f: int, dt: float):
+    """A person-sized box sweeping across the lane -> a moving obstacle for the dynamic filter."""
+    x, y = 7.0, 1.3 * np.sin(0.9 * f * dt)
+    half, top = 0.35, 1.8
+    lo = np.array([[x - half, y - half, 0.0]], np.float32)
+    hi = np.array([[x + half, y + half, top]], np.float32)
+    return lo, hi, (x, y)
+
+
 def run_closed_loop(
     device: str = "cuda",
     world: str = "lane",
@@ -309,6 +319,7 @@ def run_closed_loop(
     seed: int = 0,
     profile: bool = False,
     frame_hook=None,
+    dynamic: bool = False,
 ) -> dict:
     """Stage 2: full pipeline closed on the ESTIMATED pose (odom heading from `heading`).
     `profile=True` times each stage with CUDA events (helhest.profiling.StageProfiler)."""
@@ -340,6 +351,12 @@ def run_closed_loop(
     acc = DeviceMapAccumulator(MAP_VOXEL, MAP_RADIUS, device=device)
     aligner = IcpAligner(IcpConfig(max_iters=30, max_correspondence_dist_m=0.5), device=device)
     localizer = Localizer(aligner, LocalizerConfig())
+    if dynamic:  # moving obstacle + ray-carve filter + a parallel UNfiltered map (before/after)
+        from helhest.perception import DynamicPointFilter
+
+        filt = DynamicPointFilter.from_sensor(sensor, margin_m=0.3, margin_rel=0.03, az_bins=720, el_bins=180, device=device)
+        acc_raw = DeviceMapAccumulator(MAP_VOXEL, MAP_RADIUS, device=device)
+        map_raw = None
 
     ww = wh = int(round(win_m / cell))
     win_grid = GridParams(ww, wh, cell, 0.0, 0.0)
@@ -382,7 +399,12 @@ def run_closed_loop(
 
         t0 = _time.perf_counter()
         prof.mark(0)
-        scan_base = _scan_base(lidar, st.x, st.y, st.yaw, box_lo, box_hi, f + 1, device)
+        if dynamic:
+            wlo, whi, walker = _walker_box(f, dt)
+            blo, bhi = np.vstack([box_lo, wlo]), np.vstack([box_hi, whi])
+        else:
+            blo, bhi, walker = box_lo, box_hi, None
+        scan_base, free_wp = _scan_base(lidar, st.x, st.y, st.yaw, blo, bhi, f + 1, device)
         prof.mark(1)
         outcome, pred = None, None
         if not localizer.initialized:
@@ -400,7 +422,13 @@ def run_closed_loop(
 
         world_corrected = transform_points(scan_base, len(scan_base), T_wb)
         valid = wp.full(len(scan_base), 1, dtype=wp.int32, device=device)
-        map_wp = acc.step(map_wp, None, world_corrected, valid, (ex, ey))
+        carve = None
+        if dynamic and map_wp is not None:
+            free_est = transform_points(free_wp, len(free_wp), T_wb @ invert_pose(T_true))
+            carve = filt.carve(map_wp, free_est, np.array([ex, ey, SENSOR_Z], np.float32))
+        map_wp = acc.step(map_wp, carve, world_corrected, valid, (ex, ey))
+        if dynamic:
+            map_raw = acc_raw.step(map_raw, None, world_corrected, valid, (ex, ey))
         prof.mark(3)
 
         half = win_m / 2.0
@@ -445,6 +473,7 @@ def run_closed_loop(
                 planner=planner, ctg=ctg, true_tr=list(true_tr), est_tr=list(est_tr),
                 odom_tr=list(odom_tr), outcome=outcome, pred=pred, T_wb=T_wb, scan_base=scan_base,
                 contacts=contacts, err=err[-1] if err else 0.0,
+                map_raw=(map_raw if dynamic else None), walker=walker,
             ))
 
     return dict(
