@@ -1,5 +1,5 @@
 """GridMap: the shared heightmap representation between the perception producer
-(helhest.perception) and a planning consumer (e.g. motion_toolkit).
+(helhest.perception) and a planning consumer (helhest.planning).
 
 Deliberately minimal -- just the elevation grid + its world placement + an optional
 validity mask. The richer multi-layer `TerrainMap`/`TerrainMapGPU` stay helhest.perception's

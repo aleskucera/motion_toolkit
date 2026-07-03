@@ -3,7 +3,7 @@
 Models an Ouster OSDome (Rev7) mounted FRONT-facing: a 180° hemisphere of
 128 uniform beams pointing along the robot's heading, with the datasheet's real
 min/max range (0.5-45 m) and distance-dependent range precision. Real-time
-glfw + legacy OpenGL (same stack as motion_toolkit's viewer, which works on
+glfw + legacy OpenGL (same stack as helhest's viewer, which works on
 Wayland where open3d's GL viewer fails).
 
 Two people walk around an OUTDOOR scene (open sky, no ceiling). Toggle the

@@ -1,15 +1,12 @@
-"""helhest.perception real-sensor front-end -- a drop-in replacement for lidar_scan.
+"""Real-sensor front-end -- a drop-in replacement for lidar_scan.
 
-Swaps the synthetic 2.5D horizon sweep for helhest.perception's 3D ray-cast: an Ouster OSDome
-(the same sensor as helhest.perception's scripts/drive_lidar.py) casts against a per-cell AABB
+Swaps the synthetic 2.5D horizon sweep for a real 3D ray-cast: an Ouster OSDome
+(the same sensor as scripts/drive_lidar.py) casts against a per-cell AABB
 decomposition of the world (faithful for ANY heightmap, walls or bumpy terrain), and the
 returned point cloud is rasterized to the SAME (obs[ny,nx], known[ny,nx]) grid the perception
 pipeline consumes. Frame convention is the shared min-corner / cell-center one (see
 perception/rasterize.py, engine/terrain.py), so the output drops straight into MultiScanMap /
 crop_window / drift_scan with no shift.
-
-helhest.perception is an OPTIONAL dependency (the `perception` extra) -- only import this module
-when you actually want the real front-end.
 """
 
 from __future__ import annotations
@@ -192,9 +189,9 @@ class TerrainInpaintMap:
 class TerrainAccumMap:
     """Rolling accumulated map -- helhest.perception's DeviceMapAccumulator (perception + mapping)
     feeding the SAME inpaint + confidence pipeline as TerrainInpaintMap. A drop-in for MultiScanMap
-    (exposes `.elev`/`.known` and `.integrate`), so motion_toolkit's routing path (crop_window ->
-    cost-to-go) is unchanged. With this, helhest.perception owns BOTH maps (local single-scan and this
-    global accumulated one); motion_toolkit owns crop / routing / control.
+    (exposes `.elev`/`.known` and `.integrate`), so the planner's routing path (crop_window ->
+    cost-to-go) is unchanged. With this, perception owns BOTH maps (local single-scan and this
+    global accumulated one); the planner owns crop / routing / control.
 
     The map is ROLLING like a real sensor: only points within `radius_m` of the robot are kept
     (voxel-thinned to `voxel_m`), so terrain the robot drove far past is forgotten."""

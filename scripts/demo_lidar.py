@@ -9,7 +9,7 @@ The point of this demo is to eyeball the sensor model itself (beam structure,
 occlusion) before it feeds anything else. Top-down view (x right, y up), colored
 by height, so the shadow wedge behind the person is obvious.
 
-Headless (Agg backend) → GIF, matching motion_toolkit's matplotlib + pillow viz.
+Headless (Agg backend) → GIF, matching helhest's matplotlib + pillow viz.
 
 Run: python scripts/demo_lidar.py [out.gif]
 """

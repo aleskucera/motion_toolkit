@@ -11,7 +11,7 @@ LiDAR scan (nearest surface per bearing), then accumulate it two ways:
     stays clean.
 
 Renders a 2x2 animation (accumulated cloud + elevation heightmap, OFF vs ON) to a
-GIF. Headless (Agg backend), matching motion_toolkit's viz stack (matplotlib +
+GIF. Headless (Agg backend), matching helhest's viz stack (matplotlib +
 pillow).
 
 Run: python scripts/demo_dynamic_filter.py [out.gif]

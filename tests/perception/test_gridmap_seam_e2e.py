@@ -1,5 +1,5 @@
-"""End-to-end seam test: a motion_toolkit world -> point cloud -> helhest.perception pipeline ->
-GridMap -> grid_params_from -> the motion_toolkit ENGINE settles on it.
+"""End-to-end seam test: a helhest world -> point cloud -> helhest.perception pipeline ->
+GridMap -> grid_params_from -> the helhest ENGINE settles on it.
 
 Proves the whole chain: a helhest.perception-produced heightmap drives the planner's engine with
 the frames aligned. The check that ties it down: the engine's settle on the helhest.perception-
