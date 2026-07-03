@@ -308,6 +308,7 @@ def run_closed_loop(
     dock_radius: float = 1.2,
     seed: int = 0,
     profile: bool = False,
+    frame_hook=None,
 ) -> dict:
     """Stage 2: full pipeline closed on the ESTIMATED pose (odom heading from `heading`).
     `profile=True` times each stage with CUDA events (helhest.profiling.StageProfiler)."""
@@ -432,6 +433,15 @@ def run_closed_loop(
             frame_ms.append((_time.perf_counter() - t0) * 1000.0)
         if drv.clear < 0.05:
             contacts += 1
+
+        if frame_hook is not None:
+            frame_hook(dict(
+                f=f, true=(st.x, st.y, st.yaw), est=(ex, ey, eyaw), map_wp=map_wp,
+                elev=elev, known=known, V=V, xmin=xmin, ymin=ymin, cell=cell, ww=ww, wh=wh,
+                kr=kr, rcnx=rcnx, rcny=rcny, rccell=rccell, goal=goal, box_lo=box_lo, box_hi=box_hi,
+                planner=planner, ctg=ctg, true_tr=list(true_tr), est_tr=list(est_tr),
+                contacts=contacts, err=err[-1] if err else 0.0,
+            ))
 
     return dict(
         true=np.asarray(true_tr), est=np.asarray(est_tr), err=np.asarray(err),
