@@ -362,7 +362,7 @@ def run_closed_loop(
 
     map_wp: wp.array | None = None
     T_odom = se2_to_mat(*start)
-    true_tr, est_tr, err = [], [], []
+    true_tr, est_tr, odom_tr, err = [], [], [], []
     contacts, reached, f, prev = 0, False, 0, start
 
     for f in range(max_frames):
@@ -384,14 +384,17 @@ def run_closed_loop(
         prof.mark(0)
         scan_base = _scan_base(lidar, st.x, st.y, st.yaw, box_lo, box_hi, f + 1, device)
         prof.mark(1)
+        outcome, pred = None, None
         if not localizer.initialized:
             localizer.bootstrap(T_odom, T_true)
             T_wb = T_true
         else:
             pred, _ = localizer.predict(T_odom)
-            T_wb = localizer.update(scan_base, pred, map_wp, T_odom).pose
+            outcome = localizer.update(scan_base, pred, map_wp, T_odom)
+            T_wb = outcome.pose
         ex, ey, eyaw = mat_to_se2(T_wb)
         est_tr.append((ex, ey))
+        odom_tr.append(mat_to_se2(T_odom)[:2])
         err.append(float(np.hypot(ex - st.x, ey - st.y)))
         prof.mark(2)
 
@@ -440,6 +443,7 @@ def run_closed_loop(
                 elev=elev, known=known, V=V, xmin=xmin, ymin=ymin, cell=cell, ww=ww, wh=wh,
                 kr=kr, rcnx=rcnx, rcny=rcny, rccell=rccell, goal=goal, box_lo=box_lo, box_hi=box_hi,
                 planner=planner, ctg=ctg, true_tr=list(true_tr), est_tr=list(est_tr),
+                odom_tr=list(odom_tr), outcome=outcome, pred=pred, T_wb=T_wb, scan_base=scan_base,
                 contacts=contacts, err=err[-1] if err else 0.0,
             ))
 
