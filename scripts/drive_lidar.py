@@ -32,12 +32,12 @@ import math
 
 import numpy as np
 import warp as wp
-from helhest.terrain import DeviceMapAccumulator
-from helhest.terrain import DynamicPointFilter
-from helhest.terrain.sim import GroundSpec
-from helhest.terrain.sim import make_osdome_lidar
-from helhest.terrain.sim import osdome_sensor_config
-from helhest.terrain.sim.ouster import OSDOME_MAX_RANGE_M
+from helhest.perception import DeviceMapAccumulator
+from helhest.perception import DynamicPointFilter
+from helhest.perception.sim import GroundSpec
+from helhest.perception.sim import make_osdome_lidar
+from helhest.perception.sim import osdome_sensor_config
+from helhest.perception.sim.ouster import OSDOME_MAX_RANGE_M
 
 WIN_W, WIN_H = 1280, 800
 GROUND = 60.0  # half-extent of the (open) ground plane — past the 45 m max range

@@ -20,7 +20,7 @@ setup(
     zip_safe=True,
     maintainer="Ales Kucera",
     maintainer_email="kuceral4@fel.cvut.cz",
-    description="ROS 2 Kilted wrapper for the helhest.terrain library.",
+    description="ROS 2 Kilted wrapper for the helhest.perception library.",
     license="Apache-2.0",
     tests_require=["pytest"],
     entry_points={

@@ -30,10 +30,10 @@ import numpy as np  # noqa: E402
 import warp as wp  # noqa: E402
 from matplotlib.animation import FuncAnimation  # noqa: E402
 from matplotlib.animation import PillowWriter  # noqa: E402
-from helhest.terrain import DynamicFilterConfig  # noqa: E402
-from helhest.terrain import DynamicPointFilter  # noqa: E402
-from helhest.terrain import TerrainPipeline  # noqa: E402
-from helhest.terrain import VoxelGrid  # noqa: E402
+from helhest.perception import DynamicFilterConfig  # noqa: E402
+from helhest.perception import DynamicPointFilter  # noqa: E402
+from helhest.perception import TerrainPipeline  # noqa: E402
+from helhest.perception import VoxelGrid  # noqa: E402
 
 # Demo-side numpy boundary around the device-native VoxelGrid.
 _VG: dict[tuple, VoxelGrid] = {}

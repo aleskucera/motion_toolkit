@@ -26,8 +26,8 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 from matplotlib.animation import FuncAnimation  # noqa: E402
 from matplotlib.animation import PillowWriter  # noqa: E402
-from helhest.terrain.sim import GroundSpec  # noqa: E402
-from helhest.terrain.sim import PrimitiveLidar  # noqa: E402
+from helhest.perception.sim import GroundSpec  # noqa: E402
+from helhest.perception.sim import PrimitiveLidar  # noqa: E402
 
 SENSOR = np.array([0.0, 0.0, 0.5])  # stationary sensor origin
 GROUND_X = (1.0, 10.0)  # ground extent in x (m)

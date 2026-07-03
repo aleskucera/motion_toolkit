@@ -1,25 +1,33 @@
-"""Consumer side of the perception->planning seam: adapt a helhest.terrain `GridMap`
-(the shared heightmap contract) onto the engine's `GridParams`.
+"""GridMap: the shared heightmap representation between the perception producer
+(helhest.perception) and a planning consumer (e.g. motion_toolkit).
 
-The import of `GridMap` is type-only -- the shim duck-types the instance at runtime, so
-motion_toolkit keeps helhest.terrain an OPTIONAL dependency (you only ever hold a GridMap
-when helhest.terrain produced one). The elevation/valid arrays pass through untouched
-(`gm.elevation` is fed straight to `ForwardSimulator.set_terrain`, zero-copy if it is a wp.array).
+Deliberately minimal -- just the elevation grid + its world placement + an optional
+validity mask. The richer multi-layer `TerrainMap`/`TerrainMapGPU` stay helhest.perception's
+own output; `GridMap` is the thin contract that crosses the package boundary, so the frame
+convention is asserted in exactly one place (see test_gridmap.py for the round-trip guard).
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
 
-from ..engine import GridParams
-
-if TYPE_CHECKING:
-    from helhest.terrain import GridMap
+import numpy as np
+import warp as wp
 
 
-def grid_params_from(gm: GridMap) -> GridParams:
-    """`GridMap` -> engine `GridParams`. Both use the min-corner / cell-center convention
-    (origin = min corner; cell i center at origin + (i+0.5)*cell), so origin and cell pass
-    straight through; dims come from `elevation.shape == (ny, nx)`."""
-    ny, nx = gm.elevation.shape
-    return GridParams(nx, ny, gm.cell, gm.origin[0], gm.origin[1])
+@dataclass
+class GridMap:
+    """Heightmap on a regular grid.
+
+    Layout: `elevation[ny, nx]`, row = y (outer), col = x (inner). The grid `origin` is the
+    MIN corner; world coords are cell-CENTERED:
+        x = origin[0] + (col + 0.5) * cell,  y = origin[1] + (row + 0.5) * cell.
+    `elevation` is host (np.ndarray) or device (wp.array) -- a device array lets a downstream
+    Warp consumer read it zero-copy. `valid` is an optional same-shape bool mask
+    (False = unobserved / occluded; None = every cell valid).
+    """
+
+    elevation: np.ndarray | wp.array
+    origin: tuple[float, float]  # world (x, y) of the min corner
+    cell: float  # meters per cell
+    valid: np.ndarray | wp.array | None = None

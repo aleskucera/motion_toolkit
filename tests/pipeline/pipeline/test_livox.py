@@ -3,8 +3,8 @@ import argparse
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from helhest.terrain import gaussian_smooth
-from helhest.terrain import HeightMapBuilder
+from helhest.perception import gaussian_smooth
+from helhest.perception import HeightMapBuilder
 
 
 def parse_args() -> argparse.Namespace:

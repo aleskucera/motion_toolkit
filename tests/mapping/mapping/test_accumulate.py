@@ -11,9 +11,9 @@ from __future__ import annotations
 
 import numpy as np
 import warp as wp
-from helhest.terrain import DeviceMapAccumulator
-from helhest.terrain import DynamicFilterConfig
-from helhest.terrain import DynamicPointFilter
+from helhest.perception import DeviceMapAccumulator
+from helhest.perception import DynamicFilterConfig
+from helhest.perception import DynamicPointFilter
 
 VOX = 0.15
 RADIUS = 25.0

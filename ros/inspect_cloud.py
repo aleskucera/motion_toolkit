@@ -2,7 +2,7 @@
 
 Run inside the apptainer + sourced dev-shell:
 
-    python3 ~/projects/helhest.terrain/ros/inspect_cloud.py
+    python3 ~/projects/helhest.perception/ros/inspect_cloud.py
 """
 
 import struct

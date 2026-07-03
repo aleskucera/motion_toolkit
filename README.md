@@ -31,7 +31,7 @@ Two simulators share a `BaseSimulator` (device structs, grid, buffer allocation)
   (`rollout_taped(loss_fn=None) → backward_from_cotangents(dL/dcontrolled, dL/dderived)`).
   CUDA-only (the dilation contact uses a shared-memory tiled arg-max).
 
-Package layout (`src/kinematic_helhest/`):
+Package layout (`src/helhest/`):
 
 | dir / module | role |
 |---|---|
@@ -73,7 +73,7 @@ python -m tests.engine.gpu_check              # forward / adjoint / VJP parity +
 python -m tests.engine.gradients              # implicit-gradient finite-diff oracle (CPU)
 ```
 
-The package is `kinematic_helhest`; `engine/` is the runtime, `reference/` is the
+The package is `helhest`; `engine/` is the runtime, `reference/` is the
 numpy finite-difference oracle (verification only).
 
 ## Blender visualization
@@ -83,17 +83,17 @@ heightmap becomes a mesh and the robot's 6-DOF pose + per-wheel spin are keyfram
 
 ```bash
 # 1. run a rollout and write the .npz (a straight climb up the ramp scene)
-python -m kinematic_helhest.viz.blender_export rollout.npz
+python -m helhest.viz.blender_export rollout.npz
 
 # 2a. build the scene (box+cylinder proxy robot) and open it in Blender
-blender --python src/kinematic_helhest/viz/blender_import.py -- --data rollout.npz
+blender --python src/helhest/viz/blender_import.py -- --data rollout.npz
 
 # 2b. headless render straight to MP4 (PNG sequence if Blender lacks FFMPEG)
-blender --background --python src/kinematic_helhest/viz/blender_import.py -- \
+blender --background --python src/helhest/viz/blender_import.py -- \
     --data rollout.npz --render out.mp4
 
 # 2c. drive your own rigged model (a .blend with separate wheel objects)
-blender --python src/kinematic_helhest/viz/blender_import.py -- --data rollout.npz \
+blender --python src/helhest/viz/blender_import.py -- --data rollout.npz \
     --robot robot.blend \
     --wheel-left WheelL --wheel-right WheelR --wheel-rear WheelRear
 ```
@@ -151,14 +151,15 @@ Built in phases, each independently verifiable:
   clean wheels-only 3×3 equality solve (no chassis complementarity), which in turn
   keeps the implicit (IFT) gradient simple.
 
-## Perception stack (`terrain_toolkit`)
+## Perception stack (`helhest.perception`)
 
-The on-robot perception front-end lives in the same repo (package `terrain_toolkit`):
+The on-robot perception front-end lives in `helhest.perception`:
 GPU point cloud → heightmap → traversability cost map, plus GPU-native ICP
-(`icp/`) and a device-resident rolling map/localization accumulator
+(`icp/`) and a device-resident rolling map accumulator
 (`mapping/DeviceMapAccumulator`). It feeds the planner across the
-perception→planning seam via a shared `GridMap` (`terrain_toolkit.gridmap` →
-`kinematic_helhest.perception.gridmap`).
+perception→planning seam via a shared `GridMap` (`helhest.perception.gridmap`
+contract → `helhest.perception.grid_adapter`). ICP-based pose estimation is a
+sibling package, `helhest.localization`.
 
 | Stage | Module | Purpose |
 |---|---|---|

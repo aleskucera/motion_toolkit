@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import numpy as np
 import warp as wp
-from helhest.terrain import GridMap
-from helhest.terrain import TerrainPipeline
+from helhest.perception import GridMap
+from helhest.perception import TerrainPipeline
 
 BOUNDS = (0.0, 4.0, 0.0, 2.0)  # asymmetric: nx=40, ny=20 -> a transpose changes the shape
 RESOLUTION = 0.1

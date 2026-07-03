@@ -2,7 +2,7 @@ import time
 
 import numpy as np
 import warp as wp
-from helhest.terrain import HeightMapBuilder
+from helhest.perception import HeightMapBuilder
 
 from test_synthetic import make_synthetic_cloud
 

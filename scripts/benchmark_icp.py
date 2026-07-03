@@ -9,8 +9,8 @@ import time
 
 import numpy as np
 import warp as wp
-from helhest.terrain import IcpAligner
-from helhest.terrain import IcpConfig
+from helhest.perception import IcpAligner
+from helhest.perception import IcpConfig
 
 
 def rpy_to_R(roll: float, pitch: float, yaw: float) -> np.ndarray:

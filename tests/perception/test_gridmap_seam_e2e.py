@@ -1,8 +1,8 @@
-"""End-to-end seam test: a motion_toolkit world -> point cloud -> helhest.terrain pipeline ->
+"""End-to-end seam test: a motion_toolkit world -> point cloud -> helhest.perception pipeline ->
 GridMap -> grid_params_from -> the motion_toolkit ENGINE settles on it.
 
-Proves the whole chain: a helhest.terrain-produced heightmap drives the planner's engine with
-the frames aligned. The check that ties it down: the engine's settle on the helhest.terrain-
+Proves the whole chain: a helhest.perception-produced heightmap drives the planner's engine with
+the frames aligned. The check that ties it down: the engine's settle on the helhest.perception-
 sourced terrain matches its settle on the world's native terrain (same z/pitch/roll).
 
 Run: python tests/perception/test_gridmap_seam_e2e.py   (CPU)
@@ -15,8 +15,8 @@ import warp as wp
 from helhest import dynamics
 from helhest import worlds as W
 from helhest.engine import ForwardSimulator
-from helhest.perception.gridmap import grid_params_from
-from helhest.terrain import TerrainPipeline
+from helhest.perception.grid_adapter import grid_params_from
+from helhest.perception import TerrainPipeline
 
 DEVICE = "cpu"
 
@@ -48,7 +48,7 @@ def main() -> None:
     scene = builder()
     H0 = np.ascontiguousarray(scene.H, np.float32)
 
-    # world -> point cloud -> helhest.terrain pipeline -> GridMap
+    # world -> point cloud -> helhest.perception pipeline -> GridMap
     pts = cloud_from_heightmap(H0, scene.x0, scene.y0, scene.cell)
     pipe = TerrainPipeline(
         resolution=scene.cell,
@@ -71,7 +71,7 @@ def main() -> None:
     assert np.isclose(gp.cell_size, scene.cell) and np.isclose(gp.origin_x, scene.x0)
     assert np.isclose(gp.origin_y, scene.y0)
 
-    # 2) the elevation survives the trip through helhest.terrain (cell-center points, max primary)
+    # 2) the elevation survives the trip through helhest.perception (cell-center points, max primary)
     elev_err = float(np.abs(np.asarray(gm.elevation) - H0).max())
     assert elev_err < 1e-3, elev_err
 

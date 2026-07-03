@@ -3,9 +3,9 @@ import argparse
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from helhest.terrain import FilterConfig
-from helhest.terrain import TerrainPipeline
-from helhest.terrain import TraversabilityConfig
+from helhest.perception import FilterConfig
+from helhest.perception import TerrainPipeline
+from helhest.perception import TraversabilityConfig
 
 
 def parse_args() -> argparse.Namespace:
@@ -111,7 +111,7 @@ def main() -> None:
     fig.add_trace(
         go.Surface(x=x, y=y, z=primary_layer, colorscale="Viridis", showscale=False), row=1, col=2
     )
-    from helhest.terrain import multigrid_inpaint
+    from helhest.perception import multigrid_inpaint
 
     inpainted = multigrid_inpaint(
         primary_layer,

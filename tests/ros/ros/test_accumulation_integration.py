@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import numpy as np
 import warp as wp
-from helhest.terrain import TerrainPipeline
+from helhest.perception import TerrainPipeline
 
 X_RANGE = 4.0  # window half-extent in x -> nx = 80
 Y_RANGE = 2.0  # window half-extent in y -> ny = 40 (asymmetric: catches a transpose)

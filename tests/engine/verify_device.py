@@ -1,7 +1,7 @@
 """Phase-1 verification: device terrain ingest + on-device wheel envelope.
 
 Three checks (CPU by default; pass --device cuda for the GPU path):
-  1. cell-center alignment — a cell-center raster (helhest.terrain-style) sampled
+  1. cell-center alignment — a cell-center raster (helhest.perception-style) sampled
      at known world points matches the analytic plane with the grid origin set to
      the bounds min corner directly (one convention end-to-end, no half-cell shift);
   2. on-device `engine.envelope.wheel_envelope` == numpy `heightmap.wheel_envelope`
@@ -79,7 +79,7 @@ def _sample(elevation, g, xs, ys, device):
 
 
 def check_alignment(device):
-    """Cell-center raster (helhest.terrain-style) of a tilted plane f = a*x + b*y.
+    """Cell-center raster (helhest.perception-style) of a tilted plane f = a*x + b*y.
     The engine sampler uses the cell-center convention, so the grid origin is the
     bounds min corner directly -- no half-cell shift -- and bilinear (exact for a
     plane) recovers f at arbitrary world points."""

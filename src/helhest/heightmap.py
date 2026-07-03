@@ -2,7 +2,7 @@
 
 A heightmap is a regular grid H[ny, nx] of heights with a world origin (x0, y0)
 and uniform cell size. Values sit at CELL CENTERS: H[i,j] is the height at world
-(x0 + (j+0.5)*cell, y0 + (i+0.5)*cell) -- matching helhest.terrain's raster, so a
+(x0 + (j+0.5)*cell, y0 + (i+0.5)*cell) -- matching helhest.perception's raster, so a
 device grid handed over from perception needs no half-cell shift. World->grid:
 col = (x-x0)/cell - 0.5, row = (y-y0)/cell - 0.5.
 

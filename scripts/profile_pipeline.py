@@ -12,19 +12,19 @@ import time
 
 import numpy as np
 import warp as wp
-from helhest.terrain.heightmap import gaussian_smooth
-from helhest.terrain.heightmap import HeightMapBuilder
-from helhest.terrain.heightmap import multigrid_inpaint
-from helhest.terrain.outlier import OutlierFilterConfig
-from helhest.terrain.outlier import RadiusOutlierFilter
-from helhest.terrain.outlier import RadiusOutlierFilterConfig
-from helhest.terrain.outlier import StatisticalOutlierFilter
-from helhest.terrain.traversability import FilterConfig
-from helhest.terrain.traversability import GeometricTraversabilityAnalyzer
-from helhest.terrain.traversability import ObstacleInflator
-from helhest.terrain.traversability import SupportRatioMask
-from helhest.terrain.traversability import TemporalGate
-from helhest.terrain.traversability import TraversabilityConfig
+from helhest.perception.heightmap import gaussian_smooth
+from helhest.perception.heightmap import HeightMapBuilder
+from helhest.perception.heightmap import multigrid_inpaint
+from helhest.perception.outlier import OutlierFilterConfig
+from helhest.perception.outlier import RadiusOutlierFilter
+from helhest.perception.outlier import RadiusOutlierFilterConfig
+from helhest.perception.outlier import StatisticalOutlierFilter
+from helhest.perception.traversability import FilterConfig
+from helhest.perception.traversability import GeometricTraversabilityAnalyzer
+from helhest.perception.traversability import ObstacleInflator
+from helhest.perception.traversability import SupportRatioMask
+from helhest.perception.traversability import TemporalGate
+from helhest.perception.traversability import TraversabilityConfig
 
 
 def parse_args() -> argparse.Namespace:

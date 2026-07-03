@@ -1,14 +1,14 @@
-"""helhest.terrain real-sensor front-end -- a drop-in replacement for lidar_scan.
+"""helhest.perception real-sensor front-end -- a drop-in replacement for lidar_scan.
 
-Swaps the synthetic 2.5D horizon sweep for helhest.terrain's 3D ray-cast: an Ouster OSDome
-(the same sensor as helhest.terrain's scripts/drive_lidar.py) casts against a per-cell AABB
+Swaps the synthetic 2.5D horizon sweep for helhest.perception's 3D ray-cast: an Ouster OSDome
+(the same sensor as helhest.perception's scripts/drive_lidar.py) casts against a per-cell AABB
 decomposition of the world (faithful for ANY heightmap, walls or bumpy terrain), and the
 returned point cloud is rasterized to the SAME (obs[ny,nx], known[ny,nx]) grid the perception
 pipeline consumes. Frame convention is the shared min-corner / cell-center one (see
 perception/rasterize.py, engine/terrain.py), so the output drops straight into MultiScanMap /
 crop_window / drift_scan with no shift.
 
-helhest.terrain is an OPTIONAL dependency (the `perception` extra) -- only import this module
+helhest.perception is an OPTIONAL dependency (the `perception` extra) -- only import this module
 when you actually want the real front-end.
 """
 
@@ -18,9 +18,9 @@ import dataclasses
 
 import numpy as np
 import warp as wp
-from helhest.terrain.sim import GroundSpec
-from helhest.terrain.sim import make_osdome_lidar
-from helhest.terrain.sim import osdome_sensor_config
+from helhest.perception.sim import GroundSpec
+from helhest.perception.sim import make_osdome_lidar
+from helhest.perception.sim import osdome_sensor_config
 
 from ..heightmap import Heightmap
 from .rasterize import rasterize
@@ -32,7 +32,7 @@ class TerrainLidar:
     Same call shape as lidar_scan (one scan from a world pose), so a caller swaps the two with a
     single branch. The sensor is an Ouster OSDome (Rev7), front-facing -- a 180deg hemisphere of
     `channels` uniform beams along the heading, with the datasheet range window (0.5-45 m) and
-    distance-dependent range precision -- matching helhest.terrain's drive_lidar.py. Pass
+    distance-dependent range precision -- matching helhest.perception's drive_lidar.py. Pass
     `max_range_m` to clamp the datasheet 45 m to something tighter for small worlds."""
 
     def __init__(
@@ -97,7 +97,7 @@ class TerrainLidar:
 
 
 class TerrainInpaintMap:
-    """Dense (elev, known) map from recent scan points via helhest.terrain's inpaint + the two
+    """Dense (elev, known) map from recent scan points via helhest.perception's inpaint + the two
     `confidence/` masks. A drop-in for MultiScanMap (exposes `.elev`/`.known`, so crop_window and
     the viz read it unchanged).
 
@@ -129,11 +129,11 @@ class TerrainInpaintMap:
         obstacle_height_m: float = 0.25,  # 'height-split' threshold: keep untrusted cells above this
         device: str = "cuda",
     ) -> None:
-        from helhest.terrain.confidence import OcclusionConfig
-        from helhest.terrain.confidence import SupportConfig
-        from helhest.terrain.confidence import SupportRatioMask
-        from helhest.terrain.pipeline import TerrainPipeline
-        from helhest.terrain.traversability import TraversabilityConfig
+        from helhest.perception.confidence import OcclusionConfig
+        from helhest.perception.confidence import SupportConfig
+        from helhest.perception.confidence import SupportRatioMask
+        from helhest.perception.pipeline import TerrainPipeline
+        from helhest.perception.traversability import TraversabilityConfig
 
         ny, nx = scene.H.shape
         self.ny, self.nx = ny, nx
@@ -190,10 +190,10 @@ class TerrainInpaintMap:
 
 
 class TerrainAccumMap:
-    """Rolling accumulated map -- helhest.terrain's DeviceMapAccumulator (perception + mapping)
+    """Rolling accumulated map -- helhest.perception's DeviceMapAccumulator (perception + mapping)
     feeding the SAME inpaint + confidence pipeline as TerrainInpaintMap. A drop-in for MultiScanMap
     (exposes `.elev`/`.known` and `.integrate`), so motion_toolkit's routing path (crop_window ->
-    cost-to-go) is unchanged. With this, helhest.terrain owns BOTH maps (local single-scan and this
+    cost-to-go) is unchanged. With this, helhest.perception owns BOTH maps (local single-scan and this
     global accumulated one); motion_toolkit owns crop / routing / control.
 
     The map is ROLLING like a real sensor: only points within `radius_m` of the robot are kept
@@ -208,7 +208,7 @@ class TerrainAccumMap:
         device: str = "cuda",
         **inpaint_kwargs: object,
     ) -> None:
-        from helhest.terrain import DeviceMapAccumulator
+        from helhest.perception import DeviceMapAccumulator
 
         # The accumulated cloud is voxel-thinned, so per-cell measurement density is a poor trust
         # signal (every cell looks thinly supported) -- disable the support mask here and let

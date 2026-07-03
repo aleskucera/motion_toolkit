@@ -12,8 +12,8 @@ Both windows step in lockstep (same robot/sim); only the cameras are independent
 global map (window 1) smears while the local rollouts (window 2) stay on true geometry. In each window:
 mouse-drag orbits, scroll zooms, ESC/Q quits.
 
-Perception is helhest.terrain's real OSDome 3D lidar; the local planning map (window 2) is dense
-via helhest.terrain inpaint + confidence masks (occlusion & support).
+Perception is helhest.perception's real OSDome 3D lidar; the local planning map (window 2) is dense
+via helhest.perception inpaint + confidence masks (occlusion & support).
 
   python demos/navigate_partial_view.py --world pocket
   python demos/navigate_partial_view.py --world pocket --drift 0.04
@@ -222,7 +222,7 @@ def run(
     builder, start, goal = W.WORLDS[world]
     scene = builder()
     mu = W.matching_friction(scene)
-    # perception front-end: helhest.terrain's real OSDome 3D ray-cast, rasterized for the global
+    # perception front-end: helhest.perception's real OSDome 3D ray-cast, rasterized for the global
     # routing map, and inpaint + confidence masks (occlusion & support) for the local planning map.
     from helhest.perception.terrain_lidar import TerrainAccumMap
     from helhest.perception.terrain_lidar import TerrainInpaintMap
@@ -260,7 +260,7 @@ def run(
     sgrid = GridParams(
         rcnx, rcny, rccell, (ww // 2 - rww // 2) * cell, (wh // 2 - rwh // 2) * cell
     ).build()
-    # GLOBAL routing map: helhest.terrain rolling accumulator (25 m radius) -> inpaint + occlusion
+    # GLOBAL routing map: helhest.perception rolling accumulator (25 m radius) -> inpaint + occlusion
     mm = TerrainAccumMap(scene, radius_m=25.0, device=device)
     local = inpaint_map  # LOCAL map the MPPI plans on (rebuilt per frame from the current scan)
     rng = np.random.default_rng(0)

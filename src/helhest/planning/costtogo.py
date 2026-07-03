@@ -20,7 +20,7 @@ e.g. 1.0 : 0.5, not a second gain).
 
 This is the settle-based feasibility PRODUCER: it settles the robot at every pose to make the per-pose
 blocked / graded-tilt fields, then hands them to the LatticeValueSolver (lattice_solver.py) that does
-the forward-arc value iteration. (The solver was vendored from helhest.terrain.)
+the forward-arc value iteration. (The solver was vendored from helhest.perception.)
 """
 
 from __future__ import annotations

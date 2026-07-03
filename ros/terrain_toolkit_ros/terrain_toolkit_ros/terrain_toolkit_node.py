@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-ROS 2 Kilted interface node for the helhest.terrain library.
+ROS 2 Kilted interface node for the helhest.perception library.
 
 Subscribes to a LiDAR PointCloud2, transforms it into the robot frame, runs the
-helhest.terrain pipeline, and republishes the resulting grid as a PointCloud2
+helhest.perception pipeline, and republishes the resulting grid as a PointCloud2
 with one float32 PointField per TerrainMap layer.
 """
 
@@ -18,7 +18,7 @@ from rcl_interfaces.msg import ParameterDescriptor
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2
-from helhest.terrain import TerrainMap
+from helhest.perception import TerrainMap
 from tf2_ros import TransformException
 
 from ._pipeline_common import build_pipeline
@@ -31,10 +31,10 @@ from ._pipeline_common import read_pipeline_parameters
 
 
 class TerrainToolkitNode(Node):
-    """Bridge a LiDAR PointCloud2 topic to the helhest.terrain pipeline."""
+    """Bridge a LiDAR PointCloud2 topic to the helhest.perception pipeline."""
 
     def __init__(self) -> None:
-        super().__init__("helhest.terrain")
+        super().__init__("helhest.perception")
 
         self._declare_parameters()
         p = self._read_parameters()
@@ -296,7 +296,7 @@ class TerrainToolkitNode(Node):
                 footprint_plane=footprint_plane,
             )
         except Exception as exc:
-            self.get_logger().error(f"helhest.terrain error: {exc}")
+            self.get_logger().error(f"helhest.perception error: {exc}")
             return
 
         out_cloud = grid_to_cloud(
