@@ -287,6 +287,19 @@ def slalom_box_world(cell: float = 0.06):
 _WORLDS = {"lane": box_world, "narrow": narrow_lane_box_world, "slalom": slalom_box_world}
 
 
+def _dilate_bool(mask: np.ndarray, k: int) -> np.ndarray:
+    """Grow a boolean mask by k cells (4-neighbour) — the reach we trust the inpaint over."""
+    out = mask.copy()
+    for _ in range(max(0, k)):
+        n = out.copy()
+        n[1:, :] |= out[:-1, :]
+        n[:-1, :] |= out[1:, :]
+        n[:, 1:] |= out[:, :-1]
+        n[:, :-1] |= out[:, 1:]
+        out = n
+    return out
+
+
 def _walker_box(f: int, dt: float):
     """A person-sized box sweeping across the lane -> a moving obstacle for the dynamic filter."""
     x, y = 7.0, 1.3 * np.sin(0.9 * f * dt)
@@ -312,6 +325,7 @@ def run_closed_loop(
     win_m: float = 8.0,
     lat_coarsen: int = 4,
     local_support: int = 2,
+    local_max_gap_m: float = 0.4,
     K: int = 8,
     n_theta: int = 24,
     B: int = 4096,
@@ -440,11 +454,15 @@ def run_closed_loop(
         gl = HeightMapBuilder(cell, bounds, device=device).build(map_wp)
         gknown = (gl.count.numpy() > 0)[:wh, :ww]
         elev_global = np.where(gknown, gl.max.numpy()[:wh, :ww], 0.0).astype(np.float32)
-        # LOCAL single-scan map (THIS scan) -> confidence(support) mask -> inpaint -> MPPI
+        # LOCAL single-scan map (THIS scan) -> confidence(support) mask -> inpaint SMALL gaps only
         ll = HeightMapBuilder(cell, bounds, device=device).build(world_corrected)
         conf = (ll.count.numpy() >= local_support)[:wh, :ww]
         hm = np.where(conf, ll.max.numpy()[:wh, :ww], np.nan).astype(np.float32)
-        elev_local = np.nan_to_num(np.asarray(multigrid_inpaint(hm)), nan=0.0).astype(np.float32)
+        filled = np.nan_to_num(np.asarray(multigrid_inpaint(hm)), nan=0.0).astype(np.float32)
+        # trust the inpaint only WITHIN local_max_gap_m of a real return; large unseen
+        # areas stay flat (optimistic) so diffusion can't invent phantom obstacles
+        known_local = _dilate_bool(conf, int(round(local_max_gap_m / cell)))
+        elev_local = np.where(known_local, filled, 0.0).astype(np.float32)
         prof.mark(4)
 
         state_l = np.array([ex - xmin, ey - ymin, eyaw], np.float32)
@@ -476,8 +494,8 @@ def run_closed_loop(
         if frame_hook is not None:
             frame_hook(dict(
                 f=f, true=(st.x, st.y, st.yaw), est=(ex, ey, eyaw), map_wp=map_wp,
-                elev=elev_local, known=conf, elev_local=elev_local, elev_global=elev_global,
-                known_local=conf, known_global=gknown, V=V,
+                elev=elev_local, known=known_local, elev_local=elev_local, elev_global=elev_global,
+                known_local=known_local, known_global=gknown, V=V,
                 xmin=xmin, ymin=ymin, cell=cell, ww=ww, wh=wh,
                 kr=kr, rcnx=rcnx, rcny=rcny, rccell=rccell, goal=goal, box_lo=box_lo, box_hi=box_hi,
                 planner=planner, ctg=ctg, true_tr=list(true_tr), est_tr=list(est_tr),

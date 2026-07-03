@@ -107,11 +107,12 @@ class Dashboard:
         al.set_facecolor(_GROUND)
         wext = [xmin, xmin + ww * cell, ymin, ymin + wh * cell]
         al.imshow(s["elev_local"], origin="lower", extent=wext, cmap=HCMAP, vmin=ZMIN, vmax=ZMAX)
+        al.imshow(np.where(s["known_local"], np.nan, 1.0), origin="lower", extent=wext, cmap="Greys", alpha=0.5, vmin=0, vmax=1)
         _robot(al, ex, ey, eyaw, 0.8)
         al.set_xlim(wext[0], wext[1])
         al.set_ylim(wext[2], wext[3])
         al.set_aspect("equal")
-        al.set_title("Local single-scan map → MPPI")
+        al.set_title("Local single-scan map → MPPI (grey = unknown)")
 
         # --- global rolling map (accumulator) → routing; rasterized big, robot-centered
         ag = self.ax_global
