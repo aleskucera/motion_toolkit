@@ -24,60 +24,27 @@ import warp as wp
 
 from kinematic_helhest.engine import ForwardSimulator
 
-XY_THRES = wp.float32(0.3)
-ANG_THRES = wp.float32(wp.pi / 8.0)
+XY_THRES = 0.3
+ANG_THRES = wp.pi / 8.0
 
 
-@wp.func
-def _wrap_angle(diff: wp.float32) -> wp.float32:
-    """Wrap angle difference to (-pi, pi)."""
-    return diff - wp.floor((diff + wp.pi) / (2.0 * wp.pi)) * (2.0 * wp.pi)
+def get_l2_error(controlled: wp.array, estimate: wp.array) -> float:
+    # controlled is [T+1, B] vec3; .list() flattens row-major, so index 1 = (t=1, b=0)
+    pred = controlled.list()[1]  # wp.vec3 — predicted pose after one step, batch 0
+    est = estimate.list()[0]     # wp.vec3
+    diff = pred - est
+    dpsi = diff[2] - wp.floor((diff[2] + wp.pi) / (2.0 * wp.pi)) * (2.0 * wp.pi)
+    return float(wp.sqrt(diff[0] * diff[0] + diff[1] * diff[1] + dpsi * dpsi))
 
 
-@wp.func
-def calculate_l2_error(
-    controlled: wp.array2d(dtype=wp.vec3),
-    estimate: wp.array(dtype=wp.vec3),
-) -> wp.float32:
-    pred = controlled[1, 0]
-    est = estimate[0]
-    dx = pred[0] - est[0]
-    dy = pred[1] - est[1]
-    dpsi = _wrap_angle(pred[2] - est[2])
-    return wp.sqrt(dx * dx + dy * dy + dpsi * dpsi)
-
-
-@wp.func
-def calculate_confidence(
-    controlled: wp.array2d(dtype=wp.vec3),
-    estimate: wp.array(dtype=wp.vec3),
-) -> wp.float32:
-    pred = controlled[1, 0]
-    est = estimate[0]
+def get_max_confidence(controlled: wp.array, estimate: wp.array) -> float:
+    pred = controlled.list()[1]  # wp.vec3
+    est = estimate.list()[0]     # wp.vec3
     dxy = wp.length(wp.vec2(pred[0] - est[0], pred[1] - est[1]))
-    dpsi = wp.abs(_wrap_angle(pred[2] - est[2]))
-    # exponential decay: 1.0 at zero error, 0.1 at threshold
-    dxy_conf = wp.exp(wp.log(wp.float32(0.1)) / XY_THRES * dxy)
-    dpsi_conf = wp.exp(wp.log(wp.float32(0.1)) / ANG_THRES * dpsi)
-    return wp.max(dxy_conf, dpsi_conf)
-
-
-@wp.kernel
-def _l2_kernel(
-    controlled: wp.array2d(dtype=wp.vec3),
-    estimate: wp.array(dtype=wp.vec3),
-    result: wp.array(dtype=wp.float32),
-):
-    result[0] = calculate_l2_error(controlled, estimate)
-
-
-@wp.kernel
-def _confidence_kernel(
-    controlled: wp.array2d(dtype=wp.vec3),
-    estimate: wp.array(dtype=wp.vec3),
-    result: wp.array(dtype=wp.float32),
-):
-    result[0] = calculate_confidence(controlled, estimate)
+    dpsi_raw = pred[2] - est[2]
+    dpsi = wp.abs(dpsi_raw - wp.floor((dpsi_raw + wp.pi) / (2.0 * wp.pi)) * (2.0 * wp.pi))
+    # 0.1 ** (err / threshold) = 1.0 at zero error, 0.1 at threshold
+    return float(wp.max(wp.pow(0.1, dxy / XY_THRES), wp.pow(0.1, dpsi / ANG_THRES)))
 
 
 def verify_state(
@@ -86,7 +53,7 @@ def verify_state(
     omega: wp.array,
     estimate: wp.array,
     verif_type: str, # l2 or confidence
-) -> wp.array:
+) -> float:
     """L2 distance between the Warp-predicted planar pose and `estimate`.
 
     Advances `current_pose` one timestep via the ForwardSimulator (terrain must
@@ -108,13 +75,8 @@ def verify_state(
     
     # Step:
     sim.rollout_launch()
-    
-    kernels = {"l2": _l2_kernel, "confidence": _confidence_kernel}
-    assert verif_type in kernels, f"verif_type must be 'l2' or 'confidence', got {verif_type!r}"
-
-    result = wp.zeros(1, dtype=wp.float32, device=sim.device)
-    wp.launch(kernels[verif_type], dim=1, inputs=[sim.controlled, estimate], outputs=[result], device=sim.device)
-    return result
+    helpers = {"l2": get_l2_error, "confidence": get_max_confidence}
+    return helpers[verif_type](sim.controlled, estimate)
 
 
 #------------------------------------------
@@ -152,10 +114,10 @@ if __name__ == "__main__":
 
     # after dt seconds of straight driving on flat ground: x ≈ v * dt, y = 0, yaw = 0
     x_pred = v * solver.dt
-    estimate_near = wp.array([wp.vec3(x_pred, 0.0, 0.0)], dtype=wp.vec3, device=DEVICE)
+    estimate_near = wp.array([wp.vec3(x_pred, 0.1, 0.1)], dtype=wp.vec3, device=DEVICE)
     estimate_far = wp.array([wp.vec3(0.5, 0.2, 0.3)], dtype=wp.vec3, device=DEVICE)
 
-    for mode in ("l2", "confidence"):
-        near = verify_state(sim, current_pose, omega, estimate_near, mode)
-        far = verify_state(sim, current_pose, omega, estimate_far, mode)
-        print(f"[{mode:10}] estimate ≈ predicted: {near.numpy()[0]:.4f}   wrong estimate: {far.numpy()[0]:.4f}")
+    mode = "confidence"
+    near = verify_state(sim, current_pose, omega, estimate_near, mode)
+    far = verify_state(sim, current_pose, omega, estimate_far, mode)
+    print(f"[{mode}].  estimate ≈ predicted: {near:.4f}   wrong estimate: {far:.4f}")
