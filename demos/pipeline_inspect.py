@@ -207,6 +207,9 @@ def main():
     ap.add_argument("--fps", type=int, default=12)
     ap.add_argument("--view-m", type=float, default=12.0, help="half-extent of the big robot-centered panels (m)")
     ap.add_argument("--dynamic", action="store_true", help="add a moving obstacle (compare world vs global map)")
+    ap.add_argument("--robust-margin-m", type=float, default=0.0, help="cost-to-go safety tube: lateral (m)")
+    ap.add_argument("--robust-margin-deg", type=float, default=0.0, help="cost-to-go safety tube: heading (deg)")
+    ap.add_argument("--exec-slip", type=float, default=0.0, help="reality wheel slip: driver keeps uniform[x,1] per wheel")
     ap.add_argument("--out", default="/tmp/pipeline_inspect.gif")
     args = ap.parse_args()
     wp.init()
@@ -214,6 +217,7 @@ def main():
     dash = Dashboard(args.stride, args.view_m)
     res = pipeline_sim.run_closed_loop(
         device=args.device, world=args.world, max_frames=args.max_frames, frame_hook=dash, dynamic=args.dynamic,
+        robust_margin_m=args.robust_margin_m, robust_margin_deg=args.robust_margin_deg, exec_slip=args.exec_slip,
     )
     print(f"reached={res['reached']} frames={res['frames']} contacts={res['contacts']}")
     dash.save(args.out, args.fps)
