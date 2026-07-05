@@ -12,7 +12,6 @@ Kernels (all suffixed _kernel):
   _minmax/_bisect_*/_count_below/_elite_u   CEM reweight (top-k elite mean) of U, on device
   _bump_seed/_reset_minmax     device-side RNG counter + reduction resets (graph-safe)
 """
-
 from dataclasses import dataclass
 
 import numpy as np
@@ -107,7 +106,14 @@ class CostParams:  # host-side cost weights -- what you tune; build() -> the dev
 
 
 @wp.func
-def _bilinear(field: wp.array3d(dtype=float), yi: int, xi: int, fx: float, fy: float, t: int):
+def _bilinear(
+    field: wp.array3d(dtype=float),
+    yi: int,
+    xi: int,
+    fx: float,
+    fy: float,
+    t: int,
+):
     """Bilinear read of the heading-t slice field[:, :, t] at the fractional cell (yi + fy, xi + fx)."""
     return (
         (1.0 - fx) * (1.0 - fy) * field[yi, xi, t]
@@ -119,7 +125,12 @@ def _bilinear(field: wp.array3d(dtype=float), yi: int, xi: int, fx: float, fy: f
 
 @wp.func
 def sample_lattice(
-    field: wp.array3d(dtype=float), grid: Grid, n_theta: int, x: float, y: float, yaw: float
+    field: wp.array3d(dtype=float),
+    grid: Grid,
+    n_theta: int,
+    x: float,
+    y: float,
+    yaw: float,
 ):
     """Trilinear sample of the orientation-aware cost-to-go V(x, y, theta): bilinear in (x, y),
     linear in the (wrapped) heading. Misaligned poses read high/inf, so MPPI's rollouts prefer an
@@ -143,7 +154,11 @@ def sample_lattice(
 
 
 @wp.func
-def _knot_bracket(t: int, horizon: int, n_knots: int):
+def _knot_bracket(
+    t: int,
+    horizon: int,
+    n_knots: int,
+):
     """n_knots control knots evenly spaced over the horizon: the two bracketing step t and the
     interpolation fraction between them. Deterministic -> threads sharing a knot agree."""
     knot_spacing = float(horizon - 1) / float(n_knots - 1)
