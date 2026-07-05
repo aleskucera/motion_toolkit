@@ -89,6 +89,34 @@ def _feasibility_kernel(
 
 
 @wp.kernel
+def _erode_feasible_kernel(
+    blocked: wp.array3d(dtype=wp.float32),
+    dr: int,
+    dc: int,
+    dt: int,
+    robust: wp.array3d(dtype=wp.float32),
+):
+    """Robust feasibility: a pose is blocked if ANY pose within the (y, x, theta) tube is blocked --
+    i.e. erode the feasible set by the disturbance the closed loop can't correct before the next
+    replan. Orientation-aware: the theta window (which WRAPS) blocks a cell where a small slip-heading
+    error would tip the robot, so the margin is heading-dependent, not a fixed radial inflation. This
+    is a max-pool (dilation of `blocked`); dr=dc=dt=0 copies `blocked` (a no-op)."""
+    r, c, t = wp.tid()
+    ny = blocked.shape[0]
+    nx = blocked.shape[1]
+    nth = blocked.shape[2]
+    hit = float(0.0)
+    for i in range(-dr, dr + 1):
+        rr = wp.clamp(r + i, 0, ny - 1)
+        for j in range(-dc, dc + 1):
+            cc = wp.clamp(c + j, 0, nx - 1)
+            for k in range(-dt, dt + 1):
+                tt = (t + k + nth) % nth  # heading wraps
+                hit = wp.max(hit, blocked[rr, cc, tt])
+    robust[r, c, t] = hit
+
+
+@wp.kernel
 def _goal_cell_kernel(
     goal_xy: wp.array(dtype=wp.float32),  # [2] world (x, y)
     xmin: wp.float32,
@@ -111,6 +139,8 @@ class CostToGo:
         n_theta: int = 24,
         step: float = 0.3,
         flatness_weight: float = 2.0,  # planner strength: how much detour to trade for flat ground
+        robust_margin_m: float = 0.0,  # lateral disturbance tube -> erode the feasible set by this
+        robust_margin_deg: float = 0.0,  # heading disturbance tube (orientation-aware erosion)
         profile: bool = False,  # opt-in per-stage CUDA-event timing (tiny event nodes + per-call sync)
         device: wp.Device | str | None = None,
     ) -> None:
@@ -120,6 +150,11 @@ class CostToGo:
         self.robot = robot_params.build(self.device)
         self.grid = grid_params.build()
         self.bounds = grid_params.bounds  # (xmin, xmax, ymin, ymax) the solver takes
+        # robust-feasibility tube in lattice cells / theta-bins (0 -> no erosion = plain feasibility)
+        self._mr = int(round(robust_margin_m / self.grid.cell_size))
+        self._mc = self._mr
+        self._mt = int(round(robust_margin_deg / (360.0 / n_theta)))
+        self._eroded = self._mr > 0 or self._mt > 0
 
         self._vcap = (
             1.5
@@ -166,6 +201,7 @@ class CostToGo:
             device=self.device,
         )
         self.blocked = wp.zeros_like(self.V)
+        self.robust_blocked = wp.zeros_like(self.V)  # blocked after the disturbance-tube erosion
         self.graded_tilt = wp.zeros_like(self.V)
 
         self._elev_in = wp.zeros((ny, nx), dtype=wp.float32, device=self.device)
@@ -205,6 +241,15 @@ class CostToGo:
             device=self.device,
         )
         self._prof.mark(2)  # feasibility done
+        if self._eroded:  # erode the feasible set by the disturbance tube (robust feasibility)
+            wp.launch(
+                _erode_feasible_kernel,
+                dim=self.V.shape,
+                inputs=[self.blocked, self._mr, self._mc, self._mt],
+                outputs=[self.robust_blocked],
+                device=self.device,
+            )
+        feas = self.robust_blocked if self._eroded else self.blocked
         wp.launch(
             _goal_cell_kernel,
             dim=1,
@@ -220,7 +265,7 @@ class CostToGo:
             device=self.device,
         )
         result = self.solver._record_solve(
-            self.blocked, self.graded_tilt, self._goal_rc, self.flatness_weight, capture
+            feas, self.graded_tilt, self._goal_rc, self.flatness_weight, capture
         )
         self._prof.mark(3)  # value iteration done (goal cell + solve)
         wp.launch(

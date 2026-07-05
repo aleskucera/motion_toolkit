@@ -391,6 +391,11 @@ def run_closed_loop(
     gyro_bias_dps: float = 0.3,
     gyro_noise: float = 0.001,
     wheel_scale: float = 0.01,
+    exec_slip: float = 0.0,  # reality wheel slip: each step the driver keeps uniform[exec_slip,1] of
+    #                          each commanded wheel speed (0 = perfect execution). The plan->real
+    #                          disturbance the CVaR-robust planner (K>1) is meant to absorb.
+    robust_margin_m: float = 0.0,  # erode the cost-to-go feasible set by a disturbance tube (lateral
+    robust_margin_deg: float = 0.0,  # + heading) -> the robot routes with a wider, heading-aware berth
     win_m: float = 8.0,
     route_m: float = 16.0,
     lat_coarsen: int = 4,
@@ -430,6 +435,7 @@ def run_closed_loop(
     cell = scene.cell
     mu = W.matching_friction(scene)
     drv = WarpDriver(scene, mu, init_pose=tuple(start), device=device)  # REALITY
+    slip_rng = np.random.default_rng(seed + 7777)  # reality wheel slip (independent of odom noise)
 
     sensor = osdome_sensor_config(columns=columns)
     ground = GroundSpec(z=0.0, x_range=(-GROUND, GROUND), y_range=(-GROUND, GROUND))
@@ -455,7 +461,8 @@ def run_closed_loop(
     rcny, rcnx, rccell = rwh // kr, rww // kr, cell * kr  # cost-to-go can see the way AROUND obstacles
     ctg = CostToGo(
         GridParams(rcnx, rcny, rccell, 0.0, 0.0),
-        dynamics.robot_params(), dynamics.planning_solver(), n_theta=n_theta, device=device,
+        dynamics.robot_params(), dynamics.planning_solver(), n_theta=n_theta,
+        robust_margin_m=robust_margin_m, robust_margin_deg=robust_margin_deg, device=device,
     )
     planner.cw.lattice_cap = ctg._vcap
     # the routing field expressed in the PLANNING window's frame: both windows are robot-centered,
@@ -560,6 +567,9 @@ def run_closed_loop(
             planner.replan(state_l, goal_l, 3)
             u = planner.nominal()
             cmd = np.array([u[0, 0], u[0, 1], 0.5 * (u[0, 0] + u[0, 1])], np.float32)
+        if exec_slip > 0.0:  # reality doesn't execute the command perfectly -> per-wheel slip
+            sL, sR = slip_rng.uniform(exec_slip, 1.0, 2)
+            cmd = np.array([cmd[0] * sL, cmd[1] * sR, 0.5 * (cmd[0] * sL + cmd[1] * sR)], np.float32)
         prof.mark(6)
         drv.step(cmd)
         prof.mark(7)
