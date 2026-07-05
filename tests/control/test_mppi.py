@@ -18,6 +18,8 @@ sync burden. So instead:
 Run:  python -m tests.control.test_mppi
 """
 
+import math
+
 import numpy as np
 import warp as wp
 from helhest import friction
@@ -284,6 +286,73 @@ def selftest_cvar(device="cuda"):
     print(f"cvar  {'OK' if ok else 'REVIEW'}")
 
 
+_WALL = (2.7, 3.1, -0.5, 0.5)  # xmin, xmax, ymin, ymax -- a thin wall ON the start->goal line
+_SCN = dict(x0=0.0, x1=6.0, y0=-2.0, y1=2.0, cell=0.08, start=(0.5, 0.0, 0.0), goal=(5.5, 0.0),
+            T=28, ncand=192, refine=3)
+
+
+def _wall_clearance(device, K, beta, seed):
+    """Plan ONE MPPI solve to round the wall under (K slip scenarios, cvar_beta=beta); roll the
+    committed nominal and return its closest approach to the wall (m). Bigger = wider berth."""
+    s = _SCN
+    nx = int(round((s["x1"] - s["x0"]) / s["cell"]))
+    ny = int(round((s["y1"] - s["y0"]) / s["cell"]))
+    xs = s["x0"] + (np.arange(nx) + 0.5) * s["cell"]
+    ys = s["y0"] + (np.arange(ny) + 0.5) * s["cell"]
+    XX, YY = np.meshgrid(xs, ys)
+    xmin, xmax, ymin, ymax = _WALL
+    H = np.zeros((ny, nx), np.float32)
+    H[(XX >= xmin) & (XX <= xmax) & (YY >= ymin) & (YY <= ymax)] = 2.0
+
+    sim = ForwardSimulator(
+        RobotParams(),
+        SolverParams(dt=0.1, k_turn=2.0, newton_iters=12),
+        GridParams(nx, ny, s["cell"], s["x0"], s["y0"]),
+        s["ncand"] * K,
+        s["T"],
+        device,
+    )
+    sim.set_terrain(wp.array(np.ascontiguousarray(H), dtype=wp.float32, device=device))
+    sim.set_uniform_friction(0.8)
+    pl = mg.MppiGpu(sim, mg.CostParams(), robust=mg.RobustConfig(n_slip_samples=K, cvar_beta=beta), seed=seed)
+    pl.reset_nominal(1.5)
+    # goal pull = pure straight-line (a SATURATED constant lattice arms explore_fallback), so obstacle
+    # avoidance comes only from the settle/infeasible term -- the thing wheel slip actually perturbs.
+    pl.cw.lattice_cap = 50.0
+    pl.set_lattice(wp.full((ny, nx, pl.n_theta), 100.0, dtype=float, device=device))
+    pl.replan(np.asarray(s["start"], np.float32), s["goal"], s["refine"])
+
+    U = pl.nominal()
+    tw = np.zeros((s["T"], sim.batch_size, 3), np.float32)
+    tw[:, :, 0], tw[:, :, 1] = U[:, 0:1], U[:, 1:2]
+    tw[:, :, 2] = 0.5 * (U[:, 0:1] + U[:, 1:2])
+    path = sim.rollout(tw, s["start"])[0][:, 0, :2]  # settled nominal path
+
+    def d(px, py):
+        return math.hypot(max(xmin - px, 0.0, px - xmax), max(ymin - py, 0.0, py - ymax))
+
+    return min(d(px, py) for px, py in path)
+
+
+def selftest_cvar_behavior(device="cuda"):
+    """BEHAVIORAL: does CVaR robustness actually keep the nominal FURTHER from an obstacle? A thin
+    wall straddles the line start->goal, so the robot must round it and the cheapest round hugs the
+    corner. Both risk knobs must WIDEN the berth: (1) a tighter worst-case tail (small beta) vs the
+    average (beta=1) at fixed K, and (2) worst-of-K (beta small -> m_tail=1) with more slip samples.
+    Statistical -> compare MEANS over paired seeds with a margin the sweep showed clears the noise."""
+    seeds = [0, 1, 2]
+    worst = float(np.mean([_wall_clearance(device, 8, 0.25, s) for s in seeds]))  # tail-focused
+    avg = float(np.mean([_wall_clearance(device, 8, 1.0, s) for s in seeds]))  # expectation (beta=1)
+    beta_ok = worst > avg + 0.03
+    print(f"  beta @K=8: worst-case(0.25)={worst:.3f}  vs  average(1.0)={avg:.3f}  d={worst - avg:+.3f}")
+
+    k1 = float(np.mean([_wall_clearance(device, 1, 0.1, s) for s in seeds]))  # K=1 -> no slip (non-robust)
+    k8 = float(np.mean([_wall_clearance(device, 8, 0.1, s) for s in seeds]))  # worst-of-8 slips
+    k_ok = k8 > k1 + 0.005
+    print(f"  K  @beta=.1 (worst-of-K): K=8={k8:.3f}  vs  K=1 non-robust={k1:.3f}  d={k8 - k1:+.3f}")
+    print(f"cvar behavior  {'OK' if (beta_ok and k_ok) else 'REVIEW'}")
+
+
 def selftest_reweight_parity(device="cuda", B=2048, T=70, elite_frac=0.1):
     """GPU CEM (bisection top-k threshold -> elite mean) vs an EXACT numpy top-k mean. Different
     algorithm, same spec -- a genuine oracle, not a transcription."""
@@ -337,4 +406,5 @@ if __name__ == "__main__":
     selftest_out_of_bounds(dev)
     selftest_sample_lattice(dev)
     selftest_cvar(dev)
+    selftest_cvar_behavior(dev)
     selftest_reweight_parity(dev)
