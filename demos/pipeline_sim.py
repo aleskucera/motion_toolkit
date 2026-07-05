@@ -314,9 +314,45 @@ def detour_box_world(cell: float = 0.06):
     return scene, np.asarray(los, np.float32), np.asarray(his, np.float32), (0.0, 0.0, 0.0), np.array([16.0, 0.0])
 
 
+def u_trap_world(cell: float = 0.06):
+    """A concave U-wall whose CLOSED back faces the goal and whose MOUTH faces the start: driving
+    straight at the goal leads INTO the pocket (a local minimum), so the robot must discover the trap
+    and route back out + around an arm. The adversarial test for the routing horizon (route_m): a
+    short window dead-ends in the pocket; a long-enough one sees the way around."""
+    from helhest.heightmap import Heightmap
+
+    xlim, ylim = (-3.0, 19.0), (-8.0, 8.0)
+    nx = int(round((xlim[1] - xlim[0]) / cell))
+    ny = int(round((ylim[1] - ylim[0]) / cell))
+    xs = xlim[0] + (np.arange(nx) + 0.5) * cell
+    ys = ylim[0] + (np.arange(ny) + 0.5) * cell
+    XX, YY = np.meshgrid(xs, ys)
+    H = np.zeros((ny, nx), np.float64)
+    los, his, top = [], [], 2.0
+
+    def add(cx, cy, hx, hy):
+        H[(np.abs(XX - cx) <= hx) & (np.abs(YY - cy) <= hy)] = top
+        los.append((cx - hx, cy - hy, 0.0))
+        his.append((cx + hx, cy + hy, top))
+
+    # the U: closed back wall (faces the goal) joined by two arms reaching back toward the start; the
+    # mouth (open side, ~4.8 m wide) faces the start, so a goal-ward run drives into the pocket x[2,8].
+    add(8.0, 0.0, 0.3, 2.7)  # back wall  x[7.7,8.3], y[-2.7,2.7]
+    add(5.0, 2.7, 3.0, 0.3)  # top arm    x[2,8],     y[2.4,3.0]
+    add(5.0, -2.7, 3.0, 0.3)  # bottom arm x[2,8],    y[-3.0,-2.4]
+    for xc in np.arange(0.0, 17.0, 2.5):  # flank pillar rows -> ICP features + bound the go-around
+        for yc in (-6.0, 6.0):
+            add(xc, yc, 0.3, 0.3)
+    for xc, yc in [(11.0, -2.5), (11.0, 2.5), (13.0, 0.0)]:  # features past the trap, near the goal
+        add(xc, yc, 0.3, 0.3)
+    scene = Heightmap(H, (xlim[0], ylim[0]), cell)
+    return scene, np.asarray(los, np.float32), np.asarray(his, np.float32), (0.0, 0.0, 0.0), np.array([14.0, 0.0])
+
+
 _WORLDS = {
     "lane": box_world, "narrow": narrow_lane_box_world,
     "slalom": slalom_box_world, "detour": detour_box_world,
+    "utrap": u_trap_world,
 }
 
 
