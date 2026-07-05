@@ -202,6 +202,88 @@ def selftest_sample_lattice(device="cuda"):
     print(f"sample_lattice  {'OK' if max(ex, et) < 1e-4 else 'REVIEW'}")
 
 
+def selftest_effort_smoothness(device="cuda"):
+    """effort = sum wL^2 + wR^2; smoothness = sum of squared step-to-step CHANGES. A VARYING control
+    exercises smoothness -- the constant control in cost_assembly leaves it exactly 0, so this is its
+    only real coverage."""
+    B, T = 1, 4
+    sim = _build_sim(device, B, T)
+    rp = RobotParams()
+    poses = np.zeros((T + 1, B, 3), np.float32)
+    poses[..., 0], poses[..., 1] = 2.0, 2.0
+    tilts = np.zeros((T + 1, B, 3), np.float32)
+    clear = np.full((T, B), rp.clear_margin + 1.0, np.float32)  # no violations
+    resid = np.zeros((T, B), np.float32)
+    wl = np.array([0.0, 1.0, 2.0, 3.0], np.float32)  # a ramp -> nonzero, constant step change
+    wr = np.array([0.0, 0.5, 0.0, 0.5], np.float32)  # alternating -> nonzero, varying change
+    ctrl = np.zeros((T, B, 3), np.float32)
+    ctrl[:, 0, 0], ctrl[:, 0, 1] = wl, wr
+
+    J = _launch_cost(device, sim, poses, tilts, clear, resid, ctrl, _LAT_CONST, [3.0, 1.0], _cw(), T, B)
+
+    eff = float((wl**2 + wr**2).sum())
+    smooth = float((np.diff(wl) ** 2 + np.diff(wr) ** 2).sum())
+    exp = (
+        (_W["goal_terminal"] + _W["goal_running"]) * _LAT_CONST**2
+        + _W["effort"] * eff
+        + _W["smoothness"] * smooth
+    )
+    rel = abs(J[0] - exp) / abs(exp)
+    print(f"  effort/smoothness: J={J[0]:.4f} expected={exp:.4f} (eff={eff:.1f} smooth={smooth:.1f}) rel={rel:.2e}")
+    print(f"effort/smoothness  {'OK' if rel < 1e-4 else 'REVIEW'}")
+
+
+def selftest_out_of_bounds(device="cuda"):
+    """Poses past the soft-wall margin (edge = 0.4 m inside the grid border) accrue depth-past-margin,
+    summed over the horizon. out_of_bounds is 0 in every other test, so this is the term's only
+    coverage."""
+    B, T = 1, 4
+    sim = _build_sim(device, B, T)
+    rp = RobotParams()
+    g = sim.grid
+    edge, d, oob_w = 0.4, 0.5, 50.0  # edge is hard-coded in the kernel; d = depth past the low-x wall
+    x_lo = g.origin_x + edge
+    y_lo = g.origin_y + edge
+    y_hi = g.origin_y + g.cells_y * g.cell_size - edge
+    poses = np.zeros((T + 1, B, 3), np.float32)
+    poses[..., 0] = x_lo - d  # d past the low-x wall
+    poses[..., 1] = 0.5 * (y_lo + y_hi)  # centered in y -> only the x wall contributes
+    tilts = np.zeros((T + 1, B, 3), np.float32)
+    clear = np.full((T, B), rp.clear_margin + 1.0, np.float32)  # no violations
+    resid = np.zeros((T, B), np.float32)
+    ctrl = np.zeros((T, B, 3), np.float32)  # no effort/smoothness
+
+    J = _launch_cost(
+        device, sim, poses, tilts, clear, resid, ctrl, _LAT_CONST, [3.0, 1.0],
+        _cw(out_of_bounds=oob_w), T, B,
+    )
+    oob = (T + 1) * d  # each of the T+1 poses is d past the wall
+    exp = (_W["goal_terminal"] + _W["goal_running"]) * _LAT_CONST**2 + oob_w * oob
+    rel = abs(J[0] - exp) / abs(exp)
+    print(f"  out_of_bounds: J={J[0]:.3f} expected={exp:.3f} rel={rel:.2e}")
+    print(f"out_of_bounds  {'OK' if rel < 1e-4 else 'REVIEW'}")
+
+
+def selftest_cvar(device="cuda"):
+    """Robust eval (n_slip > 1): each candidate's cost is the CVaR = mean of its WORST m_tail slip
+    scenarios (higher J = worse). Fabricated per-scenario J -> _cvar_kernel -> vs the numpy tail
+    mean. Covers the whole robustness feature, which was previously untested (n_scen=1 skips it)."""
+    n_cand, n_scen = 8, 5
+    rng = np.random.default_rng(3)
+    J = rng.uniform(0.0, 100.0, n_cand * n_scen).astype(np.float32)  # distinct -> no tie ambiguity
+    blocks = J.reshape(n_cand, n_scen)
+    ok = True
+    for m_tail in (1, 2, n_scen):  # worst-only, worst-2, and the full mean (m_tail == n_scen)
+        Jd = wp.array(J, dtype=float, device=device)
+        Jc = wp.zeros(n_cand, dtype=float, device=device)
+        wp.launch(mg._cvar_kernel, n_cand, inputs=[Jd, n_scen, m_tail], outputs=[Jc], device=device)
+        exp = np.sort(blocks, axis=1)[:, -m_tail:].mean(1)  # mean of the m_tail largest (= worst)
+        err = float(np.abs(Jc.numpy() - exp).max())
+        ok = ok and err < 1e-4
+        print(f"  CVaR n_scen={n_scen} m_tail={m_tail}: max|err|={err:.2e}")
+    print(f"cvar  {'OK' if ok else 'REVIEW'}")
+
+
 def selftest_reweight_parity(device="cuda", B=2048, T=70, elite_frac=0.1):
     """GPU CEM (bisection top-k threshold -> elite mean) vs an EXACT numpy top-k mean. Different
     algorithm, same spec -- a genuine oracle, not a transcription."""
@@ -251,5 +333,8 @@ if __name__ == "__main__":
     print(f"device: {dev}")
     selftest_cost_assembly(dev)
     selftest_fallback(dev)
+    selftest_effort_smoothness(dev)
+    selftest_out_of_bounds(dev)
     selftest_sample_lattice(dev)
+    selftest_cvar(dev)
     selftest_reweight_parity(dev)
