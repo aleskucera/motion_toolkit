@@ -36,8 +36,14 @@ def evaluate(
     B=4096,
     T=70,
     record=False,
+    record_fan=False,
+    fan_n=80,
+    fan_pts=20,
+    fan_every=2,
 ):
     import time
+
+    record = record or record_fan  # the fan viz also needs the pose track
 
     builder, start, goal = W.WORLDS[world]
     scene = builder()
@@ -76,6 +82,42 @@ def evaluate(
     planner.set_lattice(V, cgrid.build())
     drv = WarpDriver(scene, mu, init_pose=tuple(start), device=device)
 
+    ctg = None
+    if record_fan:  # the routing field is static here (full-scene plan, fixed goal): capture once
+        ctg = dict(
+            Vmin=V.numpy().min(axis=2).astype(np.float32),
+            vcap=float(clat._vcap),
+            cnx=cnx,
+            cny=cny,
+            ccell=ccell,
+            cx0=scene.x0,
+            cy0=scene.y0,
+        )
+
+    fans = []  # per-replan rollout snapshots for the Blender MPPI viz (record_fan=True)
+
+    def _snap_fan():
+        ctr = planner.sim.controlled.numpy()  # [T+1, B, 3] = (x, y, yaw), world coords
+        zz = planner.sim.derived.numpy()[..., 0]  # [T+1, B] settled height
+        J = planner.J_cand.numpy()  # [n_cand] per-candidate CVaR cost
+        ns, ncand, t1 = planner.n_slip, planner.n_cand, ctr.shape[0]
+        ci = np.linspace(0, ncand - 1, min(fan_n, ncand)).astype(int)  # subsample candidates
+        r0 = ci * ns  # scenario-0 (un-slipped) rollout of each candidate
+        ti = np.linspace(0, t1 - 1, min(fan_pts, t1)).astype(int)  # decimate along the path
+        paths = np.stack([ctr[ti][:, r0, 0], ctr[ti][:, r0, 1], zz[ti][:, r0]], -1).transpose(
+            1, 0, 2
+        )  # [n, P, 3]
+        best = int(np.argmin(J)) * ns  # lowest-cost candidate -> highlighted plan
+        nom = np.stack([ctr[ti][:, best, 0], ctr[ti][:, best, 1], zz[ti][:, best]], -1)  # [P, 3]
+        fans.append(
+            dict(
+                frame=f,
+                paths=paths.astype(np.float32),
+                cost=J[ci].astype(np.float32),
+                nominal=nom.astype(np.float32),
+            )
+        )
+
     contacts, closest, reached, f = 0, 99.0, False, 0
     poses, cmds = [], []  # trajectory recording (record=True): pose per frame, cmd per step
     for f in range(max_frames):
@@ -95,6 +137,8 @@ def evaluate(
             planner.replan(state, goal, 3)  # MPPI + cost-to-go routing
             u = planner.nominal()
             cmd = np.array([u[0, 0], u[0, 1], 0.5 * (u[0, 0] + u[0, 1])], np.float32)
+            if record_fan and f % fan_every == 0:
+                _snap_fan()
         if record:
             cmds.append(tuple(float(c) for c in cmd))
         drv.step(cmd)
@@ -107,6 +151,8 @@ def evaluate(
             p = st.place
             poses.append((st.x, st.y, p["z"], st.yaw, p["pitch"], p["roll"], st.valid))
         result.update(poses=poses, cmds=cmds, scene=scene, dt=dynamics.DT)
+    if record_fan:
+        result.update(fans=fans, ctg=ctg)
     return result
 
 

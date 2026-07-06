@@ -19,7 +19,6 @@ With no ``--robot`` the script builds a box+cylinder proxy from the exported geo
 constants, so it runs standalone. Frame convention matches the sim: X-forward, Y-left,
 Z-up, meters/radians; wheels spin about body Y by default (``--wheel-axis``).
 """
-
 from __future__ import annotations
 
 import argparse
@@ -262,6 +261,129 @@ def setup_render(data: dict, terrain: bpy.types.Object, out_path: str, res: str,
         print("note: Blender built without FFMPEG; wrote a PNG sequence instead of MP4")
 
 
+# --------------------------------------------------------------------------- #
+# MPPI visualization: cost-to-go ground heatmap + cost-colored rollout fan
+# --------------------------------------------------------------------------- #
+def _vcolor_material(name: str, emissive: bool, strength: float = 2.5) -> bpy.types.Material:
+    """Material driven by the mesh's 'cost' color attribute (emissive fan, or lit ground)."""
+    mat = bpy.data.materials.new(name)
+    mat.use_nodes = True
+    nt = mat.node_tree
+    vc = nt.nodes.new("ShaderNodeVertexColor")
+    vc.layer_name = "cost"
+    if emissive:
+        nt.nodes.remove(nt.nodes.get("Principled BSDF"))
+        emi = nt.nodes.new("ShaderNodeEmission")
+        emi.inputs["Strength"].default_value = strength
+        nt.links.new(vc.outputs["Color"], emi.inputs["Color"])
+        nt.links.new(emi.outputs["Emission"], nt.nodes["Material Output"].inputs["Surface"])
+    else:
+        nt.links.new(vc.outputs["Color"], nt.nodes["Principled BSDF"].inputs["Base Color"])
+    return mat
+
+
+def _emission_material(
+    name: str, rgb: tuple[float, float, float], strength: float
+) -> bpy.types.Material:
+    mat = bpy.data.materials.new(name)
+    mat.use_nodes = True
+    nt = mat.node_tree
+    nt.nodes.remove(nt.nodes.get("Principled BSDF"))
+    emi = nt.nodes.new("ShaderNodeEmission")
+    emi.inputs["Color"].default_value = (*rgb, 1.0)
+    emi.inputs["Strength"].default_value = strength
+    nt.links.new(emi.outputs["Emission"], nt.nodes["Material Output"].inputs["Surface"])
+    return mat
+
+
+def _ribbon(path: np.ndarray, width: float, zoff: float) -> tuple[list, list]:
+    """A flat horizontal strip along `path` [P,3], width `width`, lifted by `zoff`."""
+    d = np.gradient(path[:, :2], axis=0)  # tangent in the ground plane
+    verts, faces = [], []
+    for i in range(len(path)):
+        tx, ty = d[i]
+        n = np.hypot(tx, ty)
+        perp = np.array([ty, -tx, 0.0]) / n if n > 1e-9 else np.array([0.0, 1.0, 0.0])
+        p = path[i] + (0.0, 0.0, zoff)
+        verts.append(tuple(p + perp * (width / 2)))
+        verts.append(tuple(p - perp * (width / 2)))
+    for j in range(len(path) - 1):
+        a = 2 * j
+        faces.append((a, a + 1, a + 3, a + 2))
+    return verts, faces
+
+
+def _fan_mesh(
+    paths: np.ndarray, colors: np.ndarray, width: float, zoff: float, name: str, mat
+) -> bpy.types.Object:
+    """One mesh holding all rollout ribbons of a snapshot, per-ribbon color in a 'cost' attribute."""
+    allv, allf, allc, off = [], [], [], 0
+    for k in range(len(paths)):
+        v, f = _ribbon(paths[k], width, zoff)
+        allv += v
+        allf += [(a + off, b + off, c + off, d + off) for (a, b, c, d) in f]
+        allc += [tuple(colors[k])] * len(v)
+        off += len(v)
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata(allv, [], allf)
+    mesh.update()
+    ca = mesh.color_attributes.new(name="cost", type="FLOAT_COLOR", domain="POINT")
+    for i, c in enumerate(allc):
+        ca.data[i].color = (c[0], c[1], c[2], 1.0)
+    obj = bpy.data.objects.new(name, mesh)
+    obj.data.materials.append(mat)
+    bpy.context.collection.objects.link(obj)
+    return obj
+
+
+def _key_visible(obj: bpy.types.Object, start: int, end: int) -> None:
+    """Keyframe `obj` hidden everywhere except the Blender-frame interval [start, end)."""
+
+    def setk(frame: int, hidden: bool) -> None:
+        obj.hide_viewport = obj.hide_render = hidden
+        obj.keyframe_insert("hide_viewport", frame=frame)
+        obj.keyframe_insert("hide_render", frame=frame)
+
+    if start > 1:
+        setk(start - 1, True)
+    setk(start, False)
+    setk(end, True)
+
+
+def apply_ctg_ground(terrain: bpy.types.Object, data: dict) -> None:
+    """Color the terrain by the cost-to-go field (viridis, dark = unreachable)."""
+    rgb = np.asarray(data["ctg_rgb"], np.float64).reshape(-1, 3)  # row*nx+col = terrain vert order
+    mesh = terrain.data
+    ca = mesh.color_attributes.new(name="cost", type="FLOAT_COLOR", domain="POINT")
+    for i, c in enumerate(rgb):
+        ca.data[i].color = (c[0], c[1], c[2], 1.0)
+    mesh.materials.clear()
+    mesh.materials.append(_vcolor_material("ctg_ground", emissive=False))
+
+
+def build_fan(data: dict, step: int) -> None:
+    """Per-replan rollout fan (cost-colored ribbons) + highlighted nominal, visibility-keyframed."""
+    fan_frame, fan_xyz, fan_rgb, nom = (
+        data["fan_frame"],
+        data["fan_xyz"],
+        data["fan_rgb"],
+        data["nominal_xyz"],
+    )
+    fan_mat = _vcolor_material("fan", emissive=False)  # matte, quiet sample cloud (no glow)
+    nom_mat = _emission_material("nominal", (0.15, 0.98, 1.0), 6.0)  # the ONE glowing line = plan
+    n = len(fan_frame)
+    for i in range(n):
+        bf = 1 + int(fan_frame[i]) * step
+        bf_next = 1 + int(fan_frame[i + 1]) * step if i + 1 < n else bf + step * 3
+        paths, cols = fan_xyz[i][::3], fan_rgb[i][::3]  # thin the cloud so it doesn't overwhelm
+        fo = _fan_mesh(paths, cols, 0.04, 0.03, f"fan_{i:04d}", fan_mat)
+        no = _fan_mesh(
+            nom[i][None], np.array([[0.15, 0.98, 1.0]]), 0.16, 0.11, f"nom_{i:04d}", nom_mat
+        )
+        _key_visible(fo, bf, bf_next)
+        _key_visible(no, bf, bf_next)
+
+
 def save_blend(path: str) -> None:
     """Pack external data (model textures) into the file so it's portable, then save."""
     try:
@@ -289,6 +411,11 @@ def main() -> None:
     else:
         root, wheels = build_proxy_robot(data)
     last = animate(root, wheels, data, args.wheel_axis, dt, args.fps)
+
+    if "ctg_rgb" in data:  # MPPI viz: cost-to-go ground + rollout fan (present in --fan exports)
+        apply_ctg_ground(terrain, data)
+    if "fan_xyz" in data:
+        build_fan(data, max(1, round(args.fps * dt)))
 
     scene = bpy.context.scene
     scene.frame_start, scene.frame_end = 1, last

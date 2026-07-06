@@ -15,7 +15,6 @@ Frame 0 is the settled start pose (no motion yet); frame k+1 is the pose after a
 ``target_wheel_omega[k]``. Wheel spin is the running integral ``cumsum(target_wheel_omega) * dt`` [rad],
 ordered (left, right, rear) to match the engine's wheel order.
 """
-
 from __future__ import annotations
 
 import sys
@@ -96,10 +95,19 @@ def collect_rollout(
     return {"pos": pos, "euler": euler, "quat": quat, "wheel_spin": spin, "valid": valid}
 
 
-def write_npz(path: str, frames: dict[str, np.ndarray], hm: heightmap.Heightmap, dt: float) -> None:
-    """Bundle per-frame state + terrain + robot geometry into one ``.npz`` for Blender."""
-    np.savez_compressed(
-        path,
+def write_npz(
+    path: str,
+    frames: dict[str, np.ndarray],
+    hm: heightmap.Heightmap,
+    dt: float,
+    extra: dict[str, np.ndarray] | None = None,
+) -> None:
+    """Bundle per-frame state + terrain + robot geometry into one ``.npz`` for Blender.
+
+    `extra` merges in optional arrays (e.g. the MPPI fan / cost-to-go overlay) that
+    blender_import.py reads only if present.
+    """
+    arrays = dict(
         dt=np.float32(dt),
         pos=frames["pos"].astype(np.float32),
         quat=frames["quat"].astype(np.float32),
@@ -115,6 +123,9 @@ def write_npz(path: str, frames: dict[str, np.ndarray], hm: heightmap.Heightmap,
         wheel_width=np.float32(WHEEL_WIDTH),
         chassis_boxes=np.asarray(CHASSIS_BOXES, np.float32),
     )
+    if extra:
+        arrays.update(extra)
+    np.savez_compressed(path, **arrays)
 
 
 def demo(out_path: str) -> None:
