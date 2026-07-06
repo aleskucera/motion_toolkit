@@ -27,7 +27,7 @@ from ..profiling import StageProfiler
 def _n_bisect(n_cand: int) -> int:
     """Device-side bisection steps for the CEM elite threshold tau. Each step halves the search
     interval, so n steps resolve tau to (jmax - jmin) / 2^n of the cost range. We want that finer
-    than the spacing between candidate costs (~(jmax - jmin) / n_cand) so #{J_cand <= tau} lands on
+    than the spacing between candidate costs (~(jmax - jmin) / n_cand) so #{J <= tau} lands on
     target_k -> ceil(log2(n_cand)) bits + 5 (~32x margin). A FIXED count (not data-dependent) is what
     keeps the refine CUDA-graph-capturable -- a host sort/partition would need a readback + sync."""
     return int(np.ceil(np.log2(max(2, n_cand)))) + 5
@@ -44,16 +44,6 @@ class SamplingConfig:
     wmax: float = 4.0
     wide_frac: float = 0.25  # fraction of candidates drawn from the WIDE global-search prior
     elite_frac: float = 0.02  # CEM top-k elite fraction
-
-
-@dataclass
-class RobustConfig:
-    """MppiGpu config: CVaR-over-wheel-slip robustness (option F). n_slip_samples=1 -> plain MPPI."""
-
-    n_slip_samples: int = 1  # wheel-slip realizations each candidate is rolled out under
-    # CVaR tail fraction (the candidate's cost = mean of its worst cvar_beta * n_slip_samples)
-    cvar_beta: float = 0.5
-    slip_lo: float = 0.6  # slip-retention lower bound for the sampled realizations
 
 
 @wp.struct
@@ -178,18 +168,14 @@ def _sample_target_wheel_omega_kernel(
     wmax: float,
     n_wide: int,
     n_knots: int,
-    n_scen: int,  # slip scenarios per candidate (= n_slip; 1 = non-robust)
-    slip: wp.array2d(dtype=float),  # [n_scen, 2] wheel-speed retention; scenario 0 = (1, 1)
     seed: wp.array(dtype=int),
     target_wheel_omega: wp.array2d(dtype=wp.vec3),
 ):
-    # rollout r = candidate b * n_scen + scenario k: all scenarios of a candidate share the SAME
-    # sampled control (noise keyed on b), then scenario k scales the wheels by its slip. So the cost
-    # sees how each candidate holds up across the disturbance. n_scen=1 -> b=r, slip=(1,1) (today).
+    # one rollout per candidate: b = r. Candidate 0 keeps the nominal; the next n_wide draw from the
+    # WIDE global-search prior; the rest jitter around the nominal (NARROW local refine).
     t, r = wp.tid()
-    n_cand = target_wheel_omega.shape[1] // n_scen
-    b = r // n_scen
-    k = r % n_scen
+    n_cand = target_wheel_omega.shape[1]
+    b = r
     horizon = target_wheel_omega.shape[0]
     knot_lo, knot_hi, frac = _knot_bracket(t, horizon, n_knots)
     wheel_l = U[t, 0]
@@ -225,10 +211,8 @@ def _sample_target_wheel_omega_kernel(
         jitter = wp.rand_init(seed[0] + 9176, t * n_cand + b)
         wheel_l += sigma * wp.randn(jitter)
         wheel_r += sigma * wp.randn(jitter)
-    # apply scenario k's wheel slip, then clamp to the forward-arc box (wmin >= 0 -> no reverse)
-    target_wheel_omega[t, r] = wp.vec3(
-        wp.clamp(wheel_l * slip[k, 0], wmin, wmax), wp.clamp(wheel_r * slip[k, 1], wmin, wmax), 0.0
-    )
+    # clamp to the forward-arc box (wmin >= 0 -> no reverse)
+    target_wheel_omega[t, r] = wp.vec3(wp.clamp(wheel_l, wmin, wmax), wp.clamp(wheel_r, wmin, wmax), 0.0)
 
 
 @wp.kernel
@@ -320,27 +304,6 @@ def _cost_kernel(
     )
 
 
-# --- Robust eval (option F as risk-aware planning): each candidate is rolled out under n_scen slip
-# scenarios; CVaR(J) = mean of its worst m_tail scenarios is the candidate's cost. A path that
-# hugs an obstacle is cheap nominally but its slip fan high-centers -> bad CVaR, so clearance
-# falls out of robustness (no margin set). n_scen=1 -> J_cand = J (today's behaviour). ---
-@wp.kernel
-def _cvar_kernel(J: wp.array(dtype=float), n_scen: int, m_tail: int, J_cand: wp.array(dtype=float)):
-    b = wp.tid()  # candidate
-    base = b * n_scen
-    acc = float(0.0)
-    for i in range(n_scen):
-        ci = J[base + i]
-        worse = int(0)  # scenarios strictly worse (ties broken by index) -> a clean worst-m set
-        for j in range(n_scen):
-            cj = J[base + j]
-            if cj > ci or (cj == ci and j < i):
-                worse += 1
-        if worse < m_tail:
-            acc += ci
-    J_cand[b] = acc / float(m_tail)
-
-
 # --- CEM reweight (option B): elite = top-k lowest-cost candidates; U = their mean. Rank-based,
 # so the validity penalty can't blow up the weighting (invalid samples just don't make the
 # elite). The top-k threshold tau is found by device-side BISECTION (a host partition would
@@ -406,11 +369,10 @@ def _bisect_step_kernel(
 
 @wp.kernel
 def _elite_u_kernel(
-    J_cand: wp.array(dtype=float),
+    J: wp.array(dtype=float),
     tau: wp.array(dtype=float),
     count: wp.array(dtype=float),
     target_wheel_omega: wp.array2d(dtype=wp.vec3),
-    n_scen: int,
     wmin: float,
     wmax: float,
     n_cand: int,
@@ -419,10 +381,8 @@ def _elite_u_kernel(
     t, wheel = wp.tid()  # (timestep, wheel: 0=L, 1=R)
     elite_sum = float(0.0)
     for b in range(n_cand):
-        if J_cand[b] <= tau[0]:  # elite candidate
-            elite_sum += target_wheel_omega[t, b * n_scen][
-                wheel
-            ]  # scenario 0 = the un-slipped control
+        if J[b] <= tau[0]:  # elite candidate
+            elite_sum += target_wheel_omega[t, b][wheel]
     U[t, wheel] = wp.clamp(elite_sum / count[0], wmin, wmax)  # unweighted elite mean (forward arcs)
 
 
@@ -445,31 +405,21 @@ class MppiGpu:
         sim: ForwardSimulator,
         cost: CostParams,  # cost weights (host) -> built into the device CostWeights struct
         sampling: SamplingConfig = SamplingConfig(),  # noise / wheel-speed box / elite fraction
-        robust: RobustConfig = RobustConfig(),  # CVaR over wheel-slip scenarios
         n_theta: int = 16,
         seed: int = 0,
         profile: bool = False,
     ):
         sampling = sampling or SamplingConfig()
-        robust = robust or RobustConfig()
 
         self.sim = sim
         self.device = sim.device
 
         self.n_rollouts, self.horizon = sim.batch_size, sim.n_steps
 
-        # robust eval (option F): the rollouts are n_cand candidates x n_slip slip scenarios.
-        # n_slip=1 is non-robust (one scenario, no slip) -> identical to plain MPPI.
-        self.n_slip = int(robust.n_slip_samples)
-        if self.n_rollouts % self.n_slip != 0:
-            raise ValueError(
-                f"sim.batch_size ({self.n_rollouts}) must be divisible by n_slip_samples ({self.n_slip})"
-            )
-        self.n_cand = self.n_rollouts // self.n_slip
+        # one rollout per candidate (plain MPPI)
+        self.n_cand = self.n_rollouts
         self.n_bisect = _n_bisect(self.n_cand)  # CEM threshold bisection steps (scales with n_cand)
-        # CVaR = mean of each candidate's worst m_tail slip scenarios
-        self.m_tail = max(1, int(round(robust.cvar_beta * self.n_slip)))
-        self.sampling, self.robust = sampling, robust  # keep the configs; read fields through them
+        self.sampling = sampling
         self.n_wide = int(sampling.wide_frac * self.n_cand)  # candidates drawn from the WIDE prior
 
         # CEM elite count (over candidates)
@@ -479,17 +429,9 @@ class MppiGpu:
         # clear_margin, resid_tol) are read straight from sim.robot in the cost kernel -- not copied here.
 
         self.robot = sim.robot
-        # scenario 0 = no slip; the rest sample the disturbance
-        slip = np.ones((self.n_slip, 2), np.float32)
-        if self.n_slip > 1:
-            rng = np.random.default_rng(int(seed) + 4242)
-            slip[1:] = rng.uniform(robust.slip_lo, 1.0, (self.n_slip - 1, 2)).astype(np.float32)
-
         with wp.ScopedDevice(self.device):
-            self.slip = wp.array(slip, dtype=wp.float32)
             self.U = wp.zeros((self.horizon, 2), dtype=wp.float32)
-            self.J = wp.zeros(self.n_rollouts, dtype=wp.float32)  # cost per scenario-rollout
-            self.J_cand = wp.zeros(self.n_cand, dtype=wp.float32)  # CVaR cost per candidate
+            self.J = wp.zeros(self.n_rollouts, dtype=wp.float32)  # cost per candidate rollout
             self.jmin = wp.zeros(1, dtype=wp.float32)  # CEM bisection scalars
             self.jmax = wp.zeros(1, dtype=wp.float32)
             self.tau_lo = wp.zeros(1, dtype=wp.float32)
@@ -559,8 +501,6 @@ class MppiGpu:
                 self.sampling.wmax,
                 self.n_wide,
                 self.sampling.n_knots,
-                self.n_slip,
-                self.slip,
                 self.seed,
             ],
             outputs=[self.sim.target_wheel_omega],
@@ -590,25 +530,12 @@ class MppiGpu:
             device=self.device,
         )
         self._prof.mark(3)  # cost done
-        # robust eval: reduce each candidate's slip-scenario costs to its CVaR (n_slip=1 -> J_cand = J)
-        wp.launch(
-            _cvar_kernel,
-            self.n_cand,
-            inputs=[
-                self.J,
-                self.n_slip,
-                self.m_tail,
-            ],
-            outputs=[self.J_cand],
-            device=self.device,
-        )
         self._cem_reweight()
-        self._prof.mark(4)  # reweight (CVaR + CEM) done
+        self._prof.mark(4)  # reweight (CEM) done
 
     def _cem_reweight(self):
-        """Top-k elite mean -> U over CANDIDATES (cost = J_cand, the CVaR): find the threshold
-        tau by device-side bisection (#{J_cand <= tau} ~= target_k), then average the elite
-        candidates' un-slipped controls (scenario-0 column)."""
+        """Top-k elite mean -> U over candidates (cost = J): find the threshold tau by device-side
+        bisection (#{J <= tau} ~= target_k), then average the elite candidates' controls."""
 
         wp.launch(
             _reset_minmax_kernel,
@@ -619,7 +546,7 @@ class MppiGpu:
         wp.launch(
             _minmax_kernel,
             self.n_cand,
-            inputs=[self.J_cand, self.jmin, self.jmax],
+            inputs=[self.J, self.jmin, self.jmax],
             device=self.device,
         )
         wp.launch(
@@ -639,7 +566,7 @@ class MppiGpu:
             wp.launch(
                 _count_below_kernel,
                 self.n_cand,
-                inputs=[self.J_cand, self.tau, self.count],
+                inputs=[self.J, self.tau, self.count],
                 device=self.device,
             )
             wp.launch(
@@ -651,7 +578,7 @@ class MppiGpu:
         wp.launch(
             _count_below_kernel,
             self.n_cand,
-            inputs=[self.J_cand, self.tau, self.count],
+            inputs=[self.J, self.tau, self.count],
             device=self.device,
         )  # final elite count
 
@@ -659,11 +586,10 @@ class MppiGpu:
             _elite_u_kernel,
             (self.horizon, 2),
             inputs=[
-                self.J_cand,
+                self.J,
                 self.tau,
                 self.count,
                 self.sim.target_wheel_omega,
-                self.n_slip,
                 self.sampling.wmin,
                 self.sampling.wmax,
                 self.n_cand,

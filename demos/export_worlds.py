@@ -97,7 +97,6 @@ def main() -> None:
     ap.add_argument("--out", default="/tmp/worlds", help="output directory for the .npz files")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--fan", action="store_true", help="also record the MPPI fan + cost-to-go")
-    ap.add_argument("--K", type=int, default=8, help="CVaR robust scenarios (1 = off)")
     ap.add_argument("--dock-radius", type=float, default=1.5)
     ap.add_argument("--lat-coarsen", type=int, default=1)
     args = ap.parse_args()
@@ -106,7 +105,7 @@ def main() -> None:
         ap.error("pass --world <name> or --all")
     wp.init()
     os.makedirs(args.out, exist_ok=True)
-    kw = dict(K=args.K, dock_radius=args.dock_radius, lat_coarsen=args.lat_coarsen)
+    kw = dict(dock_radius=args.dock_radius, lat_coarsen=args.lat_coarsen)
     names = list(W.WORLDS) if args.all else [args.world]
     for name in names:
         export_world(name, args.out, args.device, args.fan, **kw)

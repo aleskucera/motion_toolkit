@@ -1,13 +1,13 @@
 """Closed-loop evaluation on the REAL robot (WarpDriver) -- the canonical eval harness.
 
 The offline mppi.plan() loop rolls the planner's OWN sim forward to "execute", so it never exhibits
-the plan->real gap that CVaR and the terminal dock are designed for -- which makes it the wrong test
-for them (CVaR even hurts there). This harness drives the actual WarpDriver with MPPI + cost-to-go
-routing + the terminal dock, exactly as navigate_live does but headless, and reports per world:
-reach / frames / closest approach / wall-contact frames. This is the loop that matches reality.
+the plan->real gap that the terminal dock is designed for -- which makes it the wrong test for it.
+This harness drives the actual WarpDriver with MPPI + cost-to-go routing + the terminal dock, exactly
+as navigate_live does but headless, and reports per world: reach / frames / closest approach /
+wall-contact frames. This is the loop that matches reality.
 
   python demos/eval.py --world pocket
-  python demos/eval.py --stress [--K 8] [--dock-radius 1.5]
+  python demos/eval.py --stress [--dock-radius 1.5]
 """
 
 import argparse
@@ -18,7 +18,6 @@ from helhest import dynamics
 from helhest import worlds as W
 from helhest.control.mppi import CostParams
 from helhest.control.mppi import MppiGpu
-from helhest.control.mppi import RobustConfig
 from helhest.control.terminal import dock_control
 from helhest.driver import WarpDriver
 from helhest.engine import ForwardSimulator
@@ -28,7 +27,6 @@ from helhest.engine import GridParams
 def evaluate(
     world,
     device="cuda",
-    K=8,
     dock_radius=1.5,
     n_theta=24,
     lat_coarsen=1,
@@ -58,7 +56,7 @@ def evaluate(
     )
     plan_sim.set_friction(mu)
     planner = MppiGpu(
-        plan_sim, CostParams(), robust=RobustConfig(n_slip_samples=K), n_theta=n_theta
+        plan_sim, CostParams(), n_theta=n_theta
     )
     planner.reset_nominal(1.5)
     # routing field, optionally coarse (k>1): max-pool the terrain (keeps thin walls), solve low-res
@@ -99,15 +97,15 @@ def evaluate(
     def _snap_fan():
         ctr = planner.sim.controlled.numpy()  # [T+1, B, 3] = (x, y, yaw), world coords
         zz = planner.sim.derived.numpy()[..., 0]  # [T+1, B] settled height
-        J = planner.J_cand.numpy()  # [n_cand] per-candidate CVaR cost
-        ns, ncand, t1 = planner.n_slip, planner.n_cand, ctr.shape[0]
+        J = planner.J.numpy()  # [n_cand] per-candidate cost
+        ncand, t1 = planner.n_cand, ctr.shape[0]
         ci = np.linspace(0, ncand - 1, min(fan_n, ncand)).astype(int)  # subsample candidates
-        r0 = ci * ns  # scenario-0 (un-slipped) rollout of each candidate
+        r0 = ci  # each candidate is a rollout
         ti = np.linspace(0, t1 - 1, min(fan_pts, t1)).astype(int)  # decimate along the path
         paths = np.stack([ctr[ti][:, r0, 0], ctr[ti][:, r0, 1], zz[ti][:, r0]], -1).transpose(
             1, 0, 2
         )  # [n, P, 3]
-        best = int(np.argmin(J)) * ns  # lowest-cost candidate -> highlighted plan
+        best = int(np.argmin(J))  # lowest-cost candidate -> highlighted plan
         nom = np.stack([ctr[ti][:, best, 0], ctr[ti][:, best, 1], zz[ti][:, best]], -1)  # [P, 3]
         fans.append(
             dict(
@@ -172,7 +170,6 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--world", default=None, choices=list(W.WORLDS))
     ap.add_argument("--stress", action="store_true")
-    ap.add_argument("--K", type=int, default=8, help="CVaR robust scenarios (1 = off)")
     ap.add_argument(
         "--dock-radius", type=float, default=1.5, help="terminal-dock handoff radius (0 = off)"
     )
@@ -185,7 +182,7 @@ def main():
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     wp.init()
-    kw = dict(K=args.K, dock_radius=args.dock_radius, lat_coarsen=args.lat_coarsen)
+    kw = dict(dock_radius=args.dock_radius, lat_coarsen=args.lat_coarsen)
     if args.world and not args.stress:
         print(evaluate(args.world, device=args.device, **kw))
     else:

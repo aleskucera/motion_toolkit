@@ -14,7 +14,6 @@ sync burden. So instead:
                     straight-line pull cap^2 + explore_fallback*||pose-goal||^2.
   * cost terms    : ANALYTIC -- effort + smoothness + out-of-bounds, with the goal field ZEROED so
                     the tiny (2e-3) weights aren't drowned below float32 tolerance.
-  * cvar          : the CVaR reduction (mean of a candidate's worst m_tail slip scenarios).
   * robust margin : BEHAVIORAL (deterministic) -- the CostToGo disturbance-tube keeps the routable
                     region, and thus the trajectory, >= the requested margin off obstacles.
   * reweight      : the GPU bisection top-k elite mean vs an EXACT numpy top-k (a different
@@ -244,26 +243,6 @@ def selftest_cost_terms(device="cuda"):
     print(f"cost terms  {'OK' if rel < 1e-4 else 'REVIEW'}")
 
 
-def selftest_cvar(device="cuda"):
-    """Robust eval (n_slip > 1): each candidate's cost is the CVaR = mean of its WORST m_tail slip
-    scenarios (higher J = worse). Fabricated per-scenario J -> _cvar_kernel -> vs the numpy tail
-    mean. Covers the whole robustness feature, which was previously untested (n_scen=1 skips it)."""
-    n_cand, n_scen = 8, 5
-    rng = np.random.default_rng(3)
-    J = rng.uniform(0.0, 100.0, n_cand * n_scen).astype(np.float32)  # distinct -> no tie ambiguity
-    blocks = J.reshape(n_cand, n_scen)
-    ok = True
-    for m_tail in (1, 2, n_scen):  # worst-only, worst-2, and the full mean (m_tail == n_scen)
-        Jd = wp.array(J, dtype=float, device=device)
-        Jc = wp.zeros(n_cand, dtype=float, device=device)
-        wp.launch(mg._cvar_kernel, n_cand, inputs=[Jd, n_scen, m_tail], outputs=[Jc], device=device)
-        exp = np.sort(blocks, axis=1)[:, -m_tail:].mean(1)  # mean of the m_tail largest (= worst)
-        err = float(np.abs(Jc.numpy() - exp).max())
-        ok = ok and err < 1e-4
-        print(f"  CVaR n_scen={n_scen} m_tail={m_tail}: max|err|={err:.2e}")
-    print(f"cvar  {'OK' if ok else 'REVIEW'}")
-
-
 def selftest_robust_margin(device="cuda"):
     """BEHAVIORAL: the robust_margin tube must keep the PLAN a calibrated distance off obstacles.
     Erosion blocks every cell within the tube of an infeasible pose, so the routing V is reachable
@@ -328,7 +307,7 @@ def selftest_reweight_parity(device="cuda", B=2048, T=70, elite_frac=0.1):
     wp.launch(mg._reset_minmax_kernel, 1, inputs=[jmin, jmax, count], device=device)
     wp.launch(mg._minmax_kernel, B, inputs=[Jd, jmin, jmax], device=device)
     wp.launch(mg._bisect_init_kernel, 1, inputs=[jmin, jmax, lo, hi, tau, count], device=device)
-    for _ in range(mg._n_bisect(B)):  # n_scen=1 -> n_cand == B
+    for _ in range(mg._n_bisect(B)):  # n_cand == B
         wp.launch(mg._count_below_kernel, B, inputs=[Jd, tau, count], device=device)
         wp.launch(
             mg._bisect_step_kernel, 1, inputs=[count, float(target_k), lo, hi, tau], device=device
@@ -337,9 +316,9 @@ def selftest_reweight_parity(device="cuda", B=2048, T=70, elite_frac=0.1):
     wp.launch(
         mg._elite_u_kernel,
         (T, 2),
-        inputs=[Jd, tau, count, target_wheel_omega, 1, -_WMAX, _WMAX, B, Ud],
+        inputs=[Jd, tau, count, target_wheel_omega, -_WMAX, _WMAX, B, Ud],
         device=device,
-    )  # n_scen=1
+    )
     U_gpu = Ud.numpy()
 
     n_gpu = int((J <= float(tau.numpy()[0])).sum())
@@ -356,6 +335,5 @@ if __name__ == "__main__":
     selftest_fallback(dev)
     selftest_cost_terms(dev)
     selftest_sample_lattice(dev)
-    selftest_cvar(dev)
     selftest_robust_margin(dev)
     selftest_reweight_parity(dev)

@@ -29,7 +29,6 @@ from helhest import dynamics
 from helhest import worlds as W
 from helhest.control.mppi import CostParams
 from helhest.control.mppi import MppiGpu
-from helhest.control.mppi import RobustConfig
 from helhest.control.terminal import dock_control
 from helhest.driver import WarpDriver
 from helhest.engine import ForwardSimulator
@@ -199,7 +198,6 @@ def _cbs(cam, ms):
 
 def run(
     world="pocket",
-    K=8,
     dock_radius=1.5,
     lat_coarsen=4,
     win_m=9.0,
@@ -246,7 +244,7 @@ def run(
         dynamics.robot_params(), dynamics.planning_solver(), win_grid, 4096, 70, device
     )
     plan_sim.set_uniform_friction(0.8)
-    planner = MppiGpu(plan_sim, CostParams(), robust=RobustConfig(n_slip_samples=K), n_theta=24)
+    planner = MppiGpu(plan_sim, CostParams(), n_theta=24)
     planner.reset_nominal(1.5)
     rww = rwh = int(round(max(route_m, win_m) / cell))
     kr = max(1, int(lat_coarsen))
@@ -385,10 +383,7 @@ def run(
                 ).any(
                     0
                 )  # per-rollout validity
-                elite = (
-                    np.argsort(planner.J_cand.numpy())[: max(8, int(0.02 * planner.n_cand))]
-                    * planner.n_slip
-                )
+                elite = np.argsort(planner.J.numpy())[: max(8, int(0.02 * planner.n_cand))]
                 fan = dict(
                     ctr=planner.sim.controlled.numpy(),
                     z=der[..., 0],
@@ -498,7 +493,6 @@ def run(
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--world", default="pocket", choices=list(W.WORLDS))
-    ap.add_argument("--K", type=int, default=8)
     ap.add_argument("--dock-radius", type=float, default=1.5)
     ap.add_argument("--lat-coarsen", type=int, default=4)
     ap.add_argument("--win-m", type=float, default=9.0)
@@ -538,7 +532,6 @@ def main():
     args = ap.parse_args()
     run(
         world=args.world,
-        K=args.K,
         dock_radius=args.dock_radius,
         lat_coarsen=args.lat_coarsen,
         win_m=args.win_m,

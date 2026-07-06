@@ -393,7 +393,7 @@ def run_closed_loop(
     wheel_scale: float = 0.01,
     exec_slip: float = 0.0,  # reality wheel slip: each step the driver keeps uniform[exec_slip,1] of
     #                          each commanded wheel speed (0 = perfect execution). The plan->real
-    #                          disturbance the CVaR-robust planner (K>1) is meant to absorb.
+    #                          disturbance the robust-margin tube is meant to absorb.
     robust_margin_m: float = 0.0,  # erode the cost-to-go feasible set by a disturbance tube (lateral
     robust_margin_deg: float = 0.0,  # + heading) -> the robot routes with a wider, heading-aware berth
     win_m: float = 8.0,
@@ -401,7 +401,6 @@ def run_closed_loop(
     lat_coarsen: int = 4,
     local_support: int = 2,
     local_max_gap_m: float = 0.4,
-    K: int = 8,
     n_theta: int = 24,
     B: int = 4096,
     T: int = 70,
@@ -419,7 +418,6 @@ def run_closed_loop(
     from helhest import worlds as W
     from helhest.control.mppi import CostParams
     from helhest.control.mppi import MppiGpu
-    from helhest.control.mppi import RobustConfig
     from helhest.control.terminal import dock_control
     from helhest.driver import WarpDriver
     from helhest.engine import ForwardSimulator
@@ -454,7 +452,7 @@ def run_closed_loop(
     win_grid = GridParams(ww, wh, cell, 0.0, 0.0)
     plan_sim = ForwardSimulator(dynamics.robot_params(), dynamics.planning_solver(), win_grid, B, T, device)
     plan_sim.set_uniform_friction(0.8)
-    planner = MppiGpu(plan_sim, CostParams(), robust=RobustConfig(n_slip_samples=K), n_theta=n_theta)
+    planner = MppiGpu(plan_sim, CostParams(), n_theta=n_theta)
     planner.reset_nominal(1.5)
     kr = max(1, int(lat_coarsen))
     rww = rwh = int(round(route_m / cell))  # ROUTING window — larger than the plan window so the

@@ -20,7 +20,6 @@ from helhest import dynamics
 from helhest import worlds as W
 from helhest.control.mppi import CostParams
 from helhest.control.mppi import MppiGpu
-from helhest.control.mppi import RobustConfig
 from helhest.control.terminal import dock_control
 from helhest.driver import WarpDriver
 from helhest.engine import ForwardSimulator
@@ -35,7 +34,6 @@ from helhest.planning.costtogo import CostToGo
 def navigate(
     world,
     device="cuda",
-    K=8,
     dock_radius=1.5,
     n_theta=24,
     lat_coarsen=4,
@@ -65,7 +63,7 @@ def navigate(
     )
     plan_sim.set_uniform_friction(0.8)
     planner = MppiGpu(
-        plan_sim, CostParams(), robust=RobustConfig(n_slip_samples=K), n_theta=n_theta
+        plan_sim, CostParams(), n_theta=n_theta
     )
     planner.reset_nominal(1.5)
 
@@ -245,7 +243,6 @@ def _viz(world, res, out):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--world", default="pocket", choices=list(W.WORLDS))
-    ap.add_argument("--K", type=int, default=8)
     ap.add_argument("--dock-radius", type=float, default=1.5)
     ap.add_argument("--lat-coarsen", type=int, default=4)
     ap.add_argument("--win-m", type=float, default=9.0, help="fine planning window side length (m)")
@@ -276,7 +273,6 @@ def main():
     res = navigate(
         args.world,
         device=args.device,
-        K=args.K,
         dock_radius=args.dock_radius,
         lat_coarsen=args.lat_coarsen,
         win_m=args.win_m,

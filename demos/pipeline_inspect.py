@@ -158,11 +158,11 @@ class Dashboard:
         ac.set_aspect("equal")
         ac.set_title("Cost-to-go V (colour) + best-heading flow → goal")
 
-        # --- MPPI rollout cloud (candidates by CVaR cost) + nominal, in the 8 m window
+        # --- MPPI rollout cloud (candidates by cost) + nominal, in the 8 m window
         pl = s["planner"]
         ctrl = pl.sim.controlled.numpy()  # [T+1, B, 3] window-local
-        Jc = pl.J_cand.numpy()
-        n_scen, n_cand = pl.n_slip, len(Jc)
+        Jc = pl.J.numpy()
+        n_cand = len(Jc)
         fin = Jc[np.isfinite(Jc)]
         lo, hi = (np.percentile(fin, [2, 92]) if len(fin) else (0.0, 1.0))
         norm = plt.Normalize(lo, max(hi, lo + 1e-6))
@@ -171,7 +171,7 @@ class Dashboard:
         am.imshow(np.where(s["elev_local"] > 0.5, 1.0, np.nan), origin="lower", extent=wext, cmap="Greys", alpha=0.55, vmin=0, vmax=1)
         rx, ry = ex - xmin, ey - ymin
         for b in np.argsort(-np.nan_to_num(Jc, nan=lo))[:: max(1, n_cand // 240)]:
-            p = ctrl[:, b * n_scen, :2] + np.array([xmin, ymin])  # window-local -> world
+            p = ctrl[:, b, :2] + np.array([xmin, ymin])  # window-local -> world
             col = plt.cm.viridis_r(norm(Jc[b])) if np.isfinite(Jc[b]) else (0.6, 0.6, 0.6, 0.15)
             am.plot(p[:, 0], p[:, 1], "-", color=col, lw=0.7, alpha=0.55)
         # nominal drawn through the SETTLING sim (not a unicycle) -> where the robot actually goes; the
