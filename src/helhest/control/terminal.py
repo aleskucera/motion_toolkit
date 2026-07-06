@@ -12,12 +12,17 @@ no sampling, no horizon:
 This is the separate terminal stage (vs patching the MPPI cost): routing and docking are different
 control problems, so they get different controllers.
 """
-
 import numpy as np
 
 
 def dock_control(
-    state, goal, dock_speed=2.0, slow_radius=1.5, wmax=4.0, turn_gain=3.0, turn_width=0.5
+    state,
+    goal,
+    dock_speed=2.0,
+    slow_radius=1.5,
+    wmax=4.0,
+    turn_gain=3.0,
+    turn_width=0.5,
 ):
     """state (x, y, yaw), goal (x, y) -> wheel command (wL, wR, rear) for one step.
 
