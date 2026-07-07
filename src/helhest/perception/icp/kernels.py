@@ -229,6 +229,44 @@ def accumulate_system_kernel(
 
 
 @wp.kernel
+def accumulate_gravity_prior_kernel(
+    pose: wp.array(dtype=wp.mat44),      # current target_T_source (rotation = world_R_base)
+    grav_up: wp.array(dtype=wp.vec3),    # IMU up direction in the source (base) frame, unit
+    grav_w: wp.array(dtype=wp.float32),  # prior weight; <= 0 disables (no-op)
+    JtJ: wp.array(dtype=wp.float32, ndim=2),
+    Jtr: wp.array(dtype=wp.float32),
+):
+    """Soft gravity prior: pull the pose's roll/pitch so R·up = world +z, leaving yaw free.
+
+    Adds the linearized least-squares contribution of the residual r_g = R·up - ẑ
+    (rotation block only) to the 6x6 Gauss-Newton system, in the SAME left-
+    perturbation convention as accumulate_system_kernel. J_g = -[R·up]x, so with
+    a = R·up: JtJ_rot += w·(|a|²I - a aᵀ) and Jtr_rot += w·Jᵀr = w·(-(a × ẑ)).
+    A single thread runs this after the geometry accumulation, before the solve.
+    """
+    w = grav_w[0]
+    if w <= 0.0:
+        return
+    m = pose[0]
+    u = grav_up[0]
+    # a = R · up  (R is the rotation block of the pose)
+    ax = m[0, 0] * u[0] + m[0, 1] * u[1] + m[0, 2] * u[2]
+    ay = m[1, 0] * u[0] + m[1, 1] * u[1] + m[1, 2] * u[2]
+    az = m[2, 0] * u[0] + m[2, 1] * u[1] + m[2, 2] * u[2]
+    aa = ax * ax + ay * ay + az * az
+    # JtJ_rot += w·(|a|²I - a aᵀ) — upper triangle, rotation DOF; rank 2 (null space = a = yaw)
+    wp.atomic_add(JtJ, 0, 0, w * (aa - ax * ax))
+    wp.atomic_add(JtJ, 0, 1, w * (-ax * ay))
+    wp.atomic_add(JtJ, 0, 2, w * (-ax * az))
+    wp.atomic_add(JtJ, 1, 1, w * (aa - ay * ay))
+    wp.atomic_add(JtJ, 1, 2, w * (-ay * az))
+    wp.atomic_add(JtJ, 2, 2, w * (aa - az * az))
+    # Jtr_rot += w·(-(a × ẑ)) = w·(-ay, ax, 0)   (translation block untouched)
+    wp.atomic_add(Jtr, 0, w * (-ay))
+    wp.atomic_add(Jtr, 1, w * ax)
+
+
+@wp.kernel
 def solve6x6_kernel(
     JtJ: wp.array(dtype=wp.float32, ndim=2),  # upper triangle populated
     Jtr: wp.array(dtype=wp.float32),

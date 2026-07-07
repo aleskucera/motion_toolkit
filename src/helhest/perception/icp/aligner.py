@@ -8,6 +8,7 @@ import numpy as np
 import warp as wp
 
 from ..voxel import VoxelGrid
+from .kernels import accumulate_gravity_prior_kernel
 from .kernels import accumulate_system_kernel
 from .kernels import estimate_normals_kernel
 from .kernels import keep_going_kernel
@@ -29,6 +30,12 @@ class IcpConfig:
     convergence_rotation_rad: float = 1.0e-4
     convergence_translation_m: float = 1.0e-4
     damping: float = 1.0e-6
+
+    # Soft gravity prior: when > 0 and an up-vector is passed to align(), anchor the
+    # pose's roll/pitch to gravity so geometry-only tilt cannot drift off level. The
+    # weight trades off against the per-point geometry residual (roughly "equivalent
+    # point-to-plane rows"); 0 disables it entirely.
+    gravity_weight: float = 0.0
 
     # Upper bound on input points per cloud. The aligner preallocates its device
     # buffers (and the voxel hash table) to this size; the fixed buffers are what
@@ -138,6 +145,11 @@ class IcpAligner:
             self._inliers = wp.zeros(1, dtype=wp.int32)
             self._pose = wp.zeros(1, dtype=wp.mat44)
             self._delta = wp.zeros(6, dtype=wp.float32)
+            # Gravity-prior inputs, read inside the (graph-captured) GN body. Set per
+            # align(); grav_w = 0 makes the prior kernel a no-op, so it can stay in the
+            # captured graph and be toggled by value without a re-capture.
+            self._grav_up = wp.zeros(1, dtype=wp.vec3)
+            self._grav_w = wp.zeros(1, dtype=wp.float32)
             self._dr = wp.zeros(1, dtype=wp.float32)
             self._dt = wp.zeros(1, dtype=wp.float32)
             self._iter = wp.zeros(1, dtype=wp.int32)
@@ -180,6 +192,20 @@ class IcpAligner:
         self._converged.zero_()
         self._keep_running.fill_(1)
 
+    def _set_gravity_prior(self, gravity_up: np.ndarray | None) -> None:
+        """Load the per-align gravity up-vector + weight into the device buffers the
+        (graph-captured) prior kernel reads. weight 0 => the kernel is a no-op."""
+        if gravity_up is None or self.config.gravity_weight <= 0.0:
+            self._grav_w.zero_()
+            return
+        u = np.asarray(gravity_up, np.float32).reshape(3)
+        norm = float(np.linalg.norm(u))
+        if norm < 1.0e-9:
+            self._grav_w.zero_()
+            return
+        self._grav_up.assign((u / norm).reshape(1, 3))
+        self._grav_w.fill_(float(self.config.gravity_weight))
+
     def _gn_body(self, grid: wp.HashGrid) -> None:
         """One Gauss-Newton iteration, entirely on device (this is the graph body).
 
@@ -212,6 +238,14 @@ class IcpAligner:
                 float(cfg.huber_delta),
             ],
             outputs=[self._JtJ, self._Jtr, self._cost, self._inliers],
+        )
+        # Gravity soft-prior on roll/pitch (no-op when _grav_w == 0). Added after the
+        # geometry rows, before the solve, so both fold into the same 6x6 system.
+        wp.launch(
+            accumulate_gravity_prior_kernel,
+            dim=1,
+            inputs=[self._pose, self._grav_up, self._grav_w],
+            outputs=[self._JtJ, self._Jtr],
         )
         wp.launch(
             solve6x6_kernel,
@@ -267,6 +301,7 @@ class IcpAligner:
         target: wp.array,
         init_pose: np.ndarray | None = None,
         *,
+        gravity_up: np.ndarray | None = None,
         profile: bool = False,
     ) -> IcpResult:
         """Align `source` to `target`, both device `wp.array(vec3)`; return the pose.
@@ -274,6 +309,10 @@ class IcpAligner:
         Fully device-resident — the clouds stay on the GPU end to end (upload them
         once at the sensor boundary). `init_pose` is a host 4x4 (the odom guess);
         only it and the final pose cross the host boundary.
+
+        `gravity_up` (3,) is the measured up-direction in the SOURCE frame (e.g. the
+        IMU gravity vector, in base). With `config.gravity_weight > 0` it anchors the
+        pose's roll/pitch to gravity each iteration; None (or weight 0) disables it.
         """
         if not isinstance(source, wp.array) or not isinstance(target, wp.array):
             raise TypeError("source and target must be wp.array(vec3) on the device")
@@ -312,6 +351,7 @@ class IcpAligner:
                 )
 
             self._seed_pose(init_pose)
+            self._set_gravity_prior(gravity_up)
             with prof.stage("iterations"):
                 self._run_gn(grid)
 

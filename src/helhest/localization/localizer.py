@@ -96,14 +96,20 @@ class Localizer:
         world_T_base_pred: np.ndarray,
         reference_cloud: wp.array,
         odom_T_base_curr: np.ndarray,
+        *,
+        gravity_up: np.ndarray | None = None,
     ) -> RegistrationOutcome:
         """Register the device scan against the device reference_cloud, commit, return.
 
         `scan_base` and `reference_cloud` are device `wp.array(vec3)`. The adopted
         pose (refined or odom fallback) becomes the previous corrected pose that
         seeds the next predict() — corrections compound forward.
+
+        `gravity_up` (3,) is the measured up-direction in the base frame at this scan
+        (e.g. the IMU gravity vector); with the aligner's `gravity_weight > 0` it
+        anchors the ICP roll/pitch to gravity. None disables it.
         """
-        outcome = self._register(scan_base, world_T_base_pred, reference_cloud)
+        outcome = self._register(scan_base, world_T_base_pred, reference_cloud, gravity_up)
         self._world_T_base_prev = outcome.pose
         self._odom_T_base_prev = odom_T_base_curr
         return outcome
@@ -113,6 +119,7 @@ class Localizer:
         scan_base: wp.array,
         world_T_base_pred: np.ndarray,
         reference_cloud: wp.array,
+        gravity_up: np.ndarray | None = None,
     ) -> RegistrationOutcome:
         cfg = self.config
         if not cfg.enable:
@@ -132,6 +139,7 @@ class Localizer:
             scan_base,
             submap[:n_submap],
             init_pose=world_T_base_pred,
+            gravity_up=gravity_up,
         )
         rot, trans = pose_correction_magnitude(world_T_base_pred, result.pose)
         accepted = (
