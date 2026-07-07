@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Source this file (do NOT execute it) to get a shell set up for building and
-# running the terrain_toolkit_ros package:
+# running the helhest_stack_ros package:
 #
 #   source <repo>/ros/dev-shell.sh
 #

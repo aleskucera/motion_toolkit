@@ -1,4 +1,4 @@
-"""Launch terrain_toolkit_ros with Livox-tuned defaults."""
+"""Launch file for the helhest_stack_ros node."""
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
@@ -11,9 +11,7 @@ def generate_launch_description() -> LaunchDescription:
     args = [
         # ROS / sensor
         DeclareLaunchArgument(
-            "lidar_topic",
-            default_value="/livox/lidar_both_filtered",
-            description="PointCloud2 input topic",
+            "lidar_topic", default_value="/lidar/points", description="PointCloud2 input topic"
         ),
         DeclareLaunchArgument(
             "map_frame", default_value="map", description="Map TF frame (unused)"
@@ -51,7 +49,7 @@ def generate_launch_description() -> LaunchDescription:
             "inpaint", default_value="true", description="Enable multigrid inpainting"
         ),
         DeclareLaunchArgument(
-            "inpaint_coarse_iters", default_value="200", description="Inpaint coarse iterations"
+            "inpaint_coarse_iters", default_value="50", description="Inpaint coarse iterations"
         ),
         DeclareLaunchArgument(
             "inpaint_iters_per_level",
@@ -139,7 +137,7 @@ def generate_launch_description() -> LaunchDescription:
         ),
         DeclareLaunchArgument(
             "filter_support_ratio",
-            default_value="0.1",
+            default_value="0.5",
             description="Min fraction of measured cells to keep",
         ),
         DeclareLaunchArgument(
@@ -167,10 +165,10 @@ def generate_launch_description() -> LaunchDescription:
             default_value="10",
             description="Skip hysteresis until this many obstacles seen",
         ),
-        # Occlusion (line-of-sight) masking (on by default for the demo)
+        # Occlusion (line-of-sight) masking
         DeclareLaunchArgument(
             "occlusion_enable",
-            default_value="true",
+            default_value="false",
             description="NaN-out cost in the line-of-sight shadow of obstacles",
         ),
         DeclareLaunchArgument(
@@ -193,10 +191,10 @@ def generate_launch_description() -> LaunchDescription:
             default_value="0.6",
             description="View-angle margin guarding flat-ground noise (deg)",
         ),
-        # Flat ground footprint (on by default for the demo)
+        # Flat ground footprint
         DeclareLaunchArgument(
             "footprint_enable",
-            default_value="true",
+            default_value="false",
             description="Force a flat ground patch under the robot",
         ),
         DeclareLaunchArgument(
@@ -230,7 +228,7 @@ def generate_launch_description() -> LaunchDescription:
     lc = LaunchConfiguration
 
     node = Node(
-        package="terrain_toolkit_ros",
+        package="helhest_stack_ros",
         executable="single_scan_terrain_node",
         name="single_scan_terrain",
         output="screen",

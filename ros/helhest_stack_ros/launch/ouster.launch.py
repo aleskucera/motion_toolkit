@@ -1,4 +1,4 @@
-"""Launch terrain_toolkit_ros with Ouster-tuned defaults."""
+"""Launch helhest_stack_ros with Ouster-tuned defaults."""
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
@@ -228,7 +228,7 @@ def generate_launch_description() -> LaunchDescription:
     lc = LaunchConfiguration
 
     node = Node(
-        package="terrain_toolkit_ros",
+        package="helhest_stack_ros",
         executable="single_scan_terrain_node",
         name="single_scan_terrain",
         output="screen",

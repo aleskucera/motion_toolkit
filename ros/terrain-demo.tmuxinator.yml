@@ -1,4 +1,4 @@
-# tmuxinator project for the terrain_toolkit_ros demo.
+# tmuxinator project for the helhest_stack_ros demo.
 #
 # Symlinked into ~/.config/tmuxinator/terrain-demo.yml so it can be launched
 # from anywhere with:
@@ -7,7 +7,7 @@
 #   BAG=/path/to/bag PROFILE=ouster \
 #       tmuxinator start terrain-demo         # override bag / launch profile
 #
-# Three panes — bag (paused; hit <space> to play), terrain_toolkit_ros node,
+# Three panes — bag (paused; hit <space> to play), helhest_stack_ros node,
 # and rviz2 with the preconfigured terrain_demo.rviz.
 #
 # Each pane runs inside the helhest Apptainer container via exec.sh. The
@@ -33,9 +33,9 @@ windows:
         - bag:
           - <%= exec_sh %> bash -c 'source /opt/ros/jazzy/setup.bash && ros2 bag play "<%= bag %>" --clock --start-paused; exec bash'
         - node:
-          - <%= exec_sh %> bash -c 'source "<%= ws_repo %>/ros/dev-shell.sh" && ros2 launch terrain_toolkit_ros <%= profile %>.launch.py; exec bash'
+          - <%= exec_sh %> bash -c 'source "<%= ws_repo %>/ros/dev-shell.sh" && ros2 launch helhest_stack_ros <%= profile %>.launch.py; exec bash'
         - rviz:
-          - <%= exec_sh %> bash -c 'source "<%= ws_repo %>/ros/dev-shell.sh" && rviz2 -d "$(ros2 pkg prefix terrain_toolkit_ros)/share/terrain_toolkit_ros/rviz/terrain_demo.rviz"; exec bash'
+          - <%= exec_sh %> bash -c 'source "<%= ws_repo %>/ros/dev-shell.sh" && rviz2 -d "$(ros2 pkg prefix helhest_stack_ros)/share/helhest_stack_ros/rviz/terrain_demo.rviz"; exec bash'
   # Scratch shell — same Apptainer + ROS env, ready for `ros2 topic ...`,
   # python3 imports of terrain_toolkit, etc.
   - shell:

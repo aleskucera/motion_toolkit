@@ -1,4 +1,4 @@
-# terrain_toolkit_ros
+# helhest_stack_ros
 
 ROS 2 **Kilted** wrapper for the [`terrain_toolkit`](https://github.com/aleskucera/terrain_toolkit)
 library. Subscribes to a LiDAR `PointCloud2`, transforms it into the robot
@@ -23,18 +23,18 @@ Then build the ROS package inside a colcon workspace:
 ```bash
 # assumes this repo is cloned into <ws>/src/terrain_toolkit
 cd <ws>
-colcon build --packages-select terrain_toolkit_ros --symlink-install
+colcon build --packages-select helhest_stack_ros --symlink-install
 source install/setup.bash
 ```
 
-> The ROS package sources live under `ros/terrain_toolkit_ros/`. Symlink or
+> The ROS package sources live under `ros/helhest_stack_ros/`. Symlink or
 > copy that directory into your colcon workspace's `src/`, or set the
 > workspace root so colcon discovers it.
 
 ## Run
 
 ```bash
-ros2 launch terrain_toolkit_ros single_scan_terrain_node.launch.py \
+ros2 launch helhest_stack_ros single_scan_terrain_node.launch.py \
     lidar_topic:=/points \
     robot_frame_ga:=base_link \
     resolution:=0.15 \
@@ -63,7 +63,7 @@ to the odom frame on the first scan — so it must be **gravity-aligned**
 > bounded window).
 
 ```bash
-ros2 launch terrain_toolkit_ros terrain_accumulator_node.launch.py \
+ros2 launch helhest_stack_ros terrain_accumulator_node.launch.py \
     lidar_topic:=/points \
     odom_topic:=/odom \
     base_frame:=base_link \
@@ -99,7 +99,7 @@ trade false removals (too small) against missed dynamics (too large).
 Bring-up checklist:
 
 1. `pip install -e .` (core lib) then `colcon build --packages-select
-   terrain_toolkit_ros --symlink-install`.
+   helhest_stack_ros --symlink-install`.
 2. Play a bag with a `PointCloud2`, a `nav_msgs/Odometry`, and a static
    sensor→`base_frame` TF.
 3. Launch as above; in RViz set the fixed frame to `map`.

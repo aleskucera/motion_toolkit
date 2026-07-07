@@ -1,4 +1,4 @@
-"""Launch file for the accumulating terrain mapper node."""
+"""Launch helhest_stack_ros with Livox-tuned defaults."""
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
@@ -9,142 +9,36 @@ from launch_ros.actions import Node
 def generate_launch_description() -> LaunchDescription:
 
     args = [
-        # ROS / sensors
+        # ROS / sensor
         DeclareLaunchArgument(
-            "lidar_topic", default_value="/lidar/points", description="PointCloud2 input topic"
+            "lidar_topic",
+            default_value="/livox/lidar_both_filtered",
+            description="PointCloud2 input topic",
         ),
         DeclareLaunchArgument(
-            "odom_topic", default_value="/odom", description="nav_msgs/Odometry input topic"
+            "map_frame", default_value="map", description="Map TF frame (unused)"
         ),
         DeclareLaunchArgument(
-            "base_frame",
+            "robot_frame_ga",
             default_value="base_link",
-            description="Robot body TF frame; must match the odometry child_frame_id",
+            description="Gravity-aligned robot TF frame the heightmap is built in "
+            "(use a real gravity-aligned frame on non-flat terrain)",
         ),
         DeclareLaunchArgument(
-            "map_frame", default_value="map", description="World frame the accumulated map lives in"
+            "robot_frame",
+            default_value="base_link",
+            description="Normal (un-leveled) robot body TF frame; used for the flat-footprint plane",
         ),
         DeclareLaunchArgument(
-            "sync_slop_s", default_value="0.05", description="Cloud/odom time-sync tolerance (s)"
+            "square_half_size", default_value="10.0", description="Half-side of square ROI (m)"
         ),
-        DeclareLaunchArgument(
-            "sync_queue", default_value="30", description="Cloud/odom sync queue size"
-        ),
-        # Accumulation / map
-        DeclareLaunchArgument(
-            "accumulation_voxel_m",
-            default_value="0.10",
-            description="Global cloud voxel-downsample size (m)",
-        ),
-        DeclareLaunchArgument(
-            "map_max_radius_m",
-            default_value="50.0",
-            description="Drop accumulated points beyond this distance from the robot (m)",
-        ),
-        # ICP (scan-to-submap)
-        DeclareLaunchArgument(
-            "icp_enable",
-            default_value="true",
-            description="Refine odom with ICP (false = odom dead-reckoning)",
-        ),
-        DeclareLaunchArgument(
-            "icp_submap_radius_m",
-            default_value="15.0",
-            description="Half-extent of the ICP target submap (m)",
-        ),
-        DeclareLaunchArgument(
-            "icp_max_iters", default_value="30", description="Max ICP iterations"
-        ),
-        DeclareLaunchArgument(
-            "icp_max_corr_dist_m",
-            default_value="0.5",
-            description="ICP max correspondence distance (m)",
-        ),
-        DeclareLaunchArgument(
-            "icp_normal_radius_m",
-            default_value="0.3",
-            description="ICP target-normal estimation radius (m)",
-        ),
-        DeclareLaunchArgument(
-            "icp_voxel_size_m",
-            default_value="0.1",
-            description="ICP source/target voxel size (0 = off) (m)",
-        ),
-        DeclareLaunchArgument(
-            "icp_voxel_target",
-            default_value="true",
-            description="Also voxel-downsample the ICP target submap",
-        ),
-        DeclareLaunchArgument(
-            "icp_min_inliers",
-            default_value="500",
-            description="Reject ICP below this inlier count",
-        ),
-        DeclareLaunchArgument(
-            "icp_max_corr_trans_m",
-            default_value="1.0",
-            description="Reject ICP correcting the prediction more than this (m)",
-        ),
-        DeclareLaunchArgument(
-            "icp_max_corr_rot_deg",
-            default_value="15.0",
-            description="Reject ICP correcting the prediction more than this (deg)",
-        ),
-        DeclareLaunchArgument(
-            "icp_min_submap_points",
-            default_value="2000",
-            description="Skip ICP if the submap has fewer points",
-        ),
-        # Dynamic obstacle filter (map-frame visibility; removes moving people)
-        DeclareLaunchArgument(
-            "dynamic_enable",
-            default_value="false",
-            description="Drop moving objects by map-frame visibility before accumulation",
-        ),
-        DeclareLaunchArgument(
-            "dynamic_az_bins", default_value="900", description="Range-image azimuth bins (360°)"
-        ),
-        DeclareLaunchArgument(
-            "dynamic_el_bins", default_value="64", description="Range-image elevation bins (FOV)"
-        ),
-        DeclareLaunchArgument(
-            "dynamic_el_min_deg",
-            default_value="-25.0",
-            description="Bottom of the sensor vertical FOV (deg)",
-        ),
-        DeclareLaunchArgument(
-            "dynamic_el_max_deg",
-            default_value="25.0",
-            description="Top of the sensor vertical FOV (deg)",
-        ),
-        DeclareLaunchArgument(
-            "dynamic_margin_m",
-            default_value="0.3",
-            description="Base depth margin for the visibility test (m)",
-        ),
-        DeclareLaunchArgument(
-            "dynamic_margin_rel",
-            default_value="0.02",
-            description="Range-proportional depth margin (m per m)",
-        ),
-        DeclareLaunchArgument(
-            "dynamic_min_range_m",
-            default_value="0.5",
-            description="Ignore returns closer than this (m)",
-        ),
-        # Viz
-        DeclareLaunchArgument(
-            "publish_map_tf",
-            default_value="true",
-            description="Broadcast the map→odom correction transform",
-        ),
-        # Grid (robot-centric window = pipeline bounds)
+        # Grid
         DeclareLaunchArgument("resolution", default_value="0.15", description="Grid cell size (m)"),
         DeclareLaunchArgument(
-            "x_range", default_value="12.0", description="Window half-extent in x (m)"
+            "x_range", default_value="5.0", description="Grid half-extent in x (m)"
         ),
         DeclareLaunchArgument(
-            "y_range", default_value="12.0", description="Window half-extent in y (m)"
+            "y_range", default_value="5.0", description="Grid half-extent in y (m)"
         ),
         # Pipeline
         DeclareLaunchArgument(
@@ -245,7 +139,7 @@ def generate_launch_description() -> LaunchDescription:
         ),
         DeclareLaunchArgument(
             "filter_support_ratio",
-            default_value="0.5",
+            default_value="0.1",
             description="Min fraction of measured cells to keep",
         ),
         DeclareLaunchArgument(
@@ -273,10 +167,10 @@ def generate_launch_description() -> LaunchDescription:
             default_value="10",
             description="Skip hysteresis until this many obstacles seen",
         ),
-        # Occlusion (line-of-sight) masking
+        # Occlusion (line-of-sight) masking (on by default for the demo)
         DeclareLaunchArgument(
             "occlusion_enable",
-            default_value="false",
+            default_value="true",
             description="NaN-out cost in the line-of-sight shadow of obstacles",
         ),
         DeclareLaunchArgument(
@@ -299,10 +193,10 @@ def generate_launch_description() -> LaunchDescription:
             default_value="0.6",
             description="View-angle margin guarding flat-ground noise (deg)",
         ),
-        # Flat ground footprint
+        # Flat ground footprint (on by default for the demo)
         DeclareLaunchArgument(
             "footprint_enable",
-            default_value="false",
+            default_value="true",
             description="Force a flat ground patch under the robot",
         ),
         DeclareLaunchArgument(
@@ -336,45 +230,18 @@ def generate_launch_description() -> LaunchDescription:
     lc = LaunchConfiguration
 
     node = Node(
-        package="terrain_toolkit_ros",
-        executable="terrain_accumulator_node",
-        name="terrain_accumulator",
+        package="helhest_stack_ros",
+        executable="single_scan_terrain_node",
+        name="single_scan_terrain",
         output="screen",
         parameters=[
             {
-                # ROS / sensors
+                # ROS / sensor
                 "lidar_topic": lc("lidar_topic"),
-                "odom_topic": lc("odom_topic"),
-                "base_frame": lc("base_frame"),
                 "map_frame": lc("map_frame"),
-                "sync_slop_s": lc("sync_slop_s"),
-                "sync_queue": lc("sync_queue"),
-                # Accumulation / map
-                "accumulation_voxel_m": lc("accumulation_voxel_m"),
-                "map_max_radius_m": lc("map_max_radius_m"),
-                # ICP
-                "icp_enable": lc("icp_enable"),
-                "icp_submap_radius_m": lc("icp_submap_radius_m"),
-                "icp_max_iters": lc("icp_max_iters"),
-                "icp_max_corr_dist_m": lc("icp_max_corr_dist_m"),
-                "icp_normal_radius_m": lc("icp_normal_radius_m"),
-                "icp_voxel_size_m": lc("icp_voxel_size_m"),
-                "icp_voxel_target": lc("icp_voxel_target"),
-                "icp_min_inliers": lc("icp_min_inliers"),
-                "icp_max_corr_trans_m": lc("icp_max_corr_trans_m"),
-                "icp_max_corr_rot_deg": lc("icp_max_corr_rot_deg"),
-                "icp_min_submap_points": lc("icp_min_submap_points"),
-                # Dynamic obstacle filter
-                "dynamic_enable": lc("dynamic_enable"),
-                "dynamic_az_bins": lc("dynamic_az_bins"),
-                "dynamic_el_bins": lc("dynamic_el_bins"),
-                "dynamic_el_min_deg": lc("dynamic_el_min_deg"),
-                "dynamic_el_max_deg": lc("dynamic_el_max_deg"),
-                "dynamic_margin_m": lc("dynamic_margin_m"),
-                "dynamic_margin_rel": lc("dynamic_margin_rel"),
-                "dynamic_min_range_m": lc("dynamic_min_range_m"),
-                # Viz
-                "publish_map_tf": lc("publish_map_tf"),
+                "robot_frame_ga": lc("robot_frame_ga"),
+                "robot_frame": lc("robot_frame"),
+                "square_half_size": lc("square_half_size"),
                 # Grid
                 "resolution": lc("resolution"),
                 "x_range": lc("x_range"),
