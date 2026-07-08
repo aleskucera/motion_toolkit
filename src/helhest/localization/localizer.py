@@ -1,9 +1,10 @@
 """Scan-to-map localization: odom-predicted pose, ICP-refined, drift-gated.
 
 Wraps the ICP aligner in the trajectory state machine the accumulating mapper
-needs: predict the next pose from the odometry frame-to-frame delta, register
-the scan against a reference cloud, and gate the correction so a diverging
-alignment falls back to dead-reckoned odometry.
+needs: predict the next pose from a frame-to-frame motion delta, register the
+scan against a reference cloud, and gate the correction so a diverging alignment
+falls back to dead reckoning. The prediction's rotation can come from the IMU
+(slip-immune) with only its translation taken from wheel odom — see predict().
 
 The localizer owns the pose state (previous corrected pose + previous odom) but
 NOT the reference cloud — that is passed in per frame. So the same localizer
@@ -24,6 +25,7 @@ import warp as wp
 
 from helhest.perception.cloud_ops import BoxCrop
 from helhest.perception.icp import IcpAligner
+from helhest.perception.icp import IcpResult
 from .pose_math import odom_delta
 from .pose_math import pose_correction_magnitude
 
@@ -42,6 +44,18 @@ class LocalizerConfig:
     # Reject if ICP moves / rotates the prediction farther than these.
     max_correction_trans_m: float = 1.0
     max_correction_rot_rad: float = float(np.deg2rad(15.0))
+    # Reject if the RMS point-to-plane residual exceeds this — the actual fitness of the
+    # alignment. <= 0 disables it. Preferred over gating on the ICP `converged` flag: that
+    # flag only means a GN step reached the (tight) iteration tolerance within max_iters, and
+    # a perfectly good alignment routinely plateaus just above it and burns all iterations
+    # without ever tripping it, so gating on it rejects good registrations.
+    max_rms_residual_m: float = 0.0
+    # Yaw multi-start: run this many ICPs from initial headings spread across
+    # +-yaw_search_deg/2 about the predicted yaw, and keep the best-fitting (lowest RMS with
+    # enough inliers). Escapes the wrong rotational basin a single init falls into under fast
+    # skid-steer yaw. 1 (or 0) = single ICP from the prediction (no sweep).
+    yaw_restarts: int = 1
+    yaw_search_deg: float = 30.0
 
 
 @dataclass
@@ -55,6 +69,7 @@ class RegistrationOutcome:
     converged: bool = False
     correction_rot_rad: float = 0.0
     correction_trans_m: float = 0.0
+    rms_residual_m: float = 0.0
     submap_points: int = 0
 
 
@@ -67,27 +82,46 @@ class Localizer:
         self.config = config
         self._world_T_base_prev: np.ndarray | None = None
         self._odom_T_base_prev: np.ndarray | None = None
+        self._imu_R_base_prev: np.ndarray | None = None  # world_R_base at the last frame (IMU)
         self._crop: BoxCrop | None = None  # lazy; sizes to the reference cloud on first use
 
     @property
     def initialized(self) -> bool:
         return self._world_T_base_prev is not None
 
-    def bootstrap(self, odom_T_base: np.ndarray, world_T_base: np.ndarray) -> None:
+    def bootstrap(
+        self,
+        odom_T_base: np.ndarray,
+        world_T_base: np.ndarray,
+        imu_R_base: np.ndarray | None = None,
+    ) -> None:
         """Seed the trajectory: adopt world_T_base as the first corrected pose."""
         self._odom_T_base_prev = odom_T_base
         self._world_T_base_prev = world_T_base
+        self._imu_R_base_prev = imu_R_base
 
-    def predict(self, odom_T_base_curr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Predict the new pose from the odom delta; return (world_T_base_pred, sweep_delta).
+    def predict(
+        self,
+        odom_T_base_curr: np.ndarray,
+        imu_R_base_curr: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Predict the new pose from the motion delta; return (world_T_base_pred, sweep_delta).
 
-        The returned delta (base_prev→base_curr) doubles as the constant-velocity
-        sweep motion for deskew, so the caller can motion-compensate the sweep
-        before handing it to update().
+        The delta's TRANSLATION always comes from odom. Its ROTATION comes from the IMU
+        orientation delta (`imu_R_base_curr`, world_R_base this frame) when available —
+        wheel odom yaw is unreliable under skid (in-place rotation), while the IMU can't
+        give position; each sensor supplies the DOF it is trustworthy on. With no IMU
+        rotation the delta is the pure odom delta.
+
+        The returned delta (base_prev→base_curr) doubles as the constant-velocity sweep
+        motion for deskew, so the caller can motion-compensate the sweep before update().
         """
         if self._world_T_base_prev is None or self._odom_T_base_prev is None:
             raise RuntimeError("Localizer.predict called before bootstrap")
         sweep_delta = odom_delta(self._odom_T_base_prev, odom_T_base_curr)
+        if imu_R_base_curr is not None and self._imu_R_base_prev is not None:
+            sweep_delta = sweep_delta.copy()  # keep odom translation, swap in the IMU rotation
+            sweep_delta[:3, :3] = self._imu_R_base_prev.T @ imu_R_base_curr
         return self._world_T_base_prev @ sweep_delta, sweep_delta
 
     def update(
@@ -97,13 +131,16 @@ class Localizer:
         reference_cloud: wp.array,
         odom_T_base_curr: np.ndarray,
         *,
+        imu_R_base_curr: np.ndarray | None = None,
         gravity_up: np.ndarray | None = None,
     ) -> RegistrationOutcome:
         """Register the device scan against the device reference_cloud, commit, return.
 
         `scan_base` and `reference_cloud` are device `wp.array(vec3)`. The adopted
         pose (refined or odom fallback) becomes the previous corrected pose that
-        seeds the next predict() — corrections compound forward.
+        seeds the next predict() — corrections compound forward. `odom_T_base_curr`
+        and `imu_R_base_curr` (world_R_base from the IMU, or None) are stored as the
+        previous frame's references the next predict() differences against.
 
         `gravity_up` (3,) is the measured up-direction in the base frame at this scan
         (e.g. the IMU gravity vector); with the aligner's `gravity_weight > 0` it
@@ -112,6 +149,7 @@ class Localizer:
         outcome = self._register(scan_base, world_T_base_pred, reference_cloud, gravity_up)
         self._world_T_base_prev = outcome.pose
         self._odom_T_base_prev = odom_T_base_curr
+        self._imu_R_base_prev = imu_R_base_curr
         return outcome
 
     def _register(
@@ -135,18 +173,28 @@ class Localizer:
         if n_submap < cfg.min_submap_points:
             return RegistrationOutcome(world_T_base_pred, "sparse", submap_points=n_submap)
 
-        result = self.aligner.align(
-            scan_base,
-            submap[:n_submap],
-            init_pose=world_T_base_pred,
-            gravity_up=gravity_up,
-        )
+        if cfg.yaw_restarts > 1:
+            result = self._align_yaw_sweep(scan_base, submap[:n_submap], world_T_base_pred, gravity_up)
+        else:
+            result = self.aligner.align(
+                scan_base,
+                submap[:n_submap],
+                init_pose=world_T_base_pred,
+                gravity_up=gravity_up,
+            )
         rot, trans = pose_correction_magnitude(world_T_base_pred, result.pose)
+        # RMS point-to-plane residual over the inliers: sqrt(mean weighted r²). This is the
+        # fitness gate — see max_rms_residual_m for why we do NOT gate on result.converged.
+        rms = (
+            float(np.sqrt(result.final_cost / result.num_inliers))
+            if result.num_inliers > 0
+            else float("inf")
+        )
         accepted = (
-            result.converged
-            and result.num_inliers >= cfg.min_inliers
+            result.num_inliers >= cfg.min_inliers
             and trans <= cfg.max_correction_trans_m
             and rot <= cfg.max_correction_rot_rad
+            and (cfg.max_rms_residual_m <= 0.0 or rms <= cfg.max_rms_residual_m)
         )
         return RegistrationOutcome(
             pose=result.pose if accepted else world_T_base_pred,
@@ -155,5 +203,36 @@ class Localizer:
             converged=bool(result.converged),
             correction_rot_rad=rot,
             correction_trans_m=trans,
+            rms_residual_m=rms,
             submap_points=n_submap,
+        )
+
+    def _align_yaw_sweep(self, scan, submap, pred, gravity_up):
+        """Run `yaw_restarts` ICPs from headings spanning ±yaw_search_deg/2 about the predicted
+        yaw; return the best-fitting result (lowest RMS with enough inliers).
+
+        Fast skid-steer yaw drops a single ICP into the wrong rotational basin; seeding several
+        headings and keeping the best fit escapes it. The sweep includes the prediction itself
+        (offset 0), so this never does worse than the single-start alignment.
+        """
+        cfg = self.config
+        half = float(np.deg2rad(cfg.yaw_search_deg)) * 0.5
+        # Build the H yaw-perturbed init poses and align them all in ONE batched GN pass.
+        inits = np.empty((cfg.yaw_restarts, 4, 4), dtype=np.float64)
+        for k, dyaw in enumerate(np.linspace(-half, half, cfg.yaw_restarts)):
+            c, s = float(np.cos(dyaw)), float(np.sin(dyaw))
+            rz = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+            inits[k] = pred
+            inits[k, :3, :3] = rz @ pred[:3, :3]  # perturb heading about world-up, keep position
+        poses, costs, inliers = self.aligner.align_batch(scan, submap, inits, gravity_up=gravity_up)
+        # Pick the best: lowest RMS = sqrt(cost / inliers) among those clearing the inlier gate.
+        rms = np.where(inliers > 0, np.sqrt(costs / np.maximum(inliers, 1)), np.inf)
+        rms[inliers < cfg.min_inliers] = np.inf
+        b = int(np.argmin(rms)) if np.isfinite(rms).any() else int(np.argmax(inliers))
+        return IcpResult(
+            pose=poses[b],
+            iterations=self.aligner.config.max_iters,
+            final_cost=float(costs[b]),
+            num_inliers=int(inliers[b]),
+            converged=True,
         )
