@@ -8,9 +8,14 @@ import numpy as np
 import warp as wp
 
 from ..voxel import VoxelGrid
+from .kernels import all_converged_batch_kernel
+from .kernels import accumulate_gravity_prior_batch_kernel
 from .kernels import accumulate_gravity_prior_kernel
+from .kernels import accumulate_system_batch_kernel
 from .kernels import accumulate_system_kernel
 from .kernels import estimate_normals_kernel
+from .kernels import se3_update_batch_kernel
+from .kernels import solve6x6_batch_kernel
 from .kernels import keep_going_kernel
 from .kernels import se3_update_kernel
 from .kernels import solve6x6_kernel
@@ -24,6 +29,9 @@ class IcpConfig:
     max_iters: int = 30
     max_correspondence_dist_m: float = 0.5
     huber_delta: float = 0.1
+    # Trimmed loss: reject correspondences whose point-to-plane residual exceeds this (a hard
+    # cut on gross outliers, more decisive than Huber's soft down-weight). 0 disables.
+    trim_residual_m: float = 0.0
     normal_radius_m: float = 0.2
     normal_min_neighbors: int = 5
     normal_power_iters: int = 12
@@ -122,6 +130,9 @@ class IcpAligner:
         self.verbose = verbose
         self._grid: wp.HashGrid | None = None
         self._graph = None  # captured GN-loop graph (built lazily on the first align)
+        self._prepared_grid: wp.HashGrid | None = None  # set by prepare(), used by align_from()
+        self._n_src_host = 0  # live source count after the last _prepare_target (batch launch dim)
+        self._batch_h = 0  # H the batched buffers below are sized for (0 = not allocated)
         self._capped_warned = False
 
         cfg = self.config
@@ -236,6 +247,7 @@ class IcpAligner:
                 self._n_src,
                 float(cfg.max_correspondence_dist_m),
                 float(cfg.huber_delta),
+                float(cfg.trim_residual_m),
             ],
             outputs=[self._JtJ, self._Jtr, self._cost, self._inliers],
         )
@@ -316,58 +328,189 @@ class IcpAligner:
         """
         if not isinstance(source, wp.array) or not isinstance(target, wp.array):
             raise TypeError("source and target must be wp.array(vec3) on the device")
+        prof = _EventTimer(self.device, profile)
+        with wp.ScopedDevice(self.device):
+            grid = self._prepare_target(source, target, prof)
+            return self._solve_from(grid, init_pose, gravity_up, prof)
 
+    def prepare(self, source: wp.array, target: wp.array) -> None:
+        """Prepare `target` (downsample + grid + normals) and load `source`, once, for
+        repeated `align_from()` calls with different init poses on the SAME clouds.
+
+        This is the init-independent, expensive part; `align_from()` is then just the GN
+        loop. Multi-start (e.g. a yaw sweep to escape rotational local minima) uses this +
+        `align_from()` so the target's grid and normals are built once, not per hypothesis.
+        """
+        if not isinstance(source, wp.array) or not isinstance(target, wp.array):
+            raise TypeError("source and target must be wp.array(vec3) on the device")
+        with wp.ScopedDevice(self.device):
+            self._prepare_target(source, target, _EventTimer(self.device, False))
+
+    def align_from(
+        self, init_pose: np.ndarray, *, gravity_up: np.ndarray | None = None
+    ) -> IcpResult:
+        """Align from `init_pose` on the target set by the last `prepare()` — only the GN
+        loop, so it is cheap to call many times over. Call `prepare()` first."""
+        if self._prepared_grid is None:
+            raise RuntimeError("align_from() called before prepare()")
+        with wp.ScopedDevice(self.device):
+            return self._solve_from(
+                self._prepared_grid, init_pose, gravity_up, _EventTimer(self.device, False)
+            )
+
+    def _prepare_target(
+        self, source: wp.array, target: wp.array, prof: _EventTimer
+    ) -> wp.HashGrid:
+        """Downsample source+target into the GN buffers, build the target hash grid, and
+        estimate target normals. Everything here depends only on the clouds, not the init."""
         cfg = self.config
         grid_radius = max(cfg.max_correspondence_dist_m, cfg.normal_radius_m)
-        prof = _EventTimer(self.device, profile)
-
         voxel_on = self._voxel is not None
+        # Downsample (if enabled) into the fixed GN buffers, all on device; only the point
+        # counts return to the host. The rest of each buffer is never read (kernels guard
+        # on the live count).
+        with prof.stage("voxel_downsample"):
+            n_src = self._prepare_cloud(source, self._src, voxel_on)
+            n_tgt = self._prepare_cloud(target, self._tgt, voxel_on and cfg.voxel_target)
+            self._n_src.fill_(n_src)
+            self._n_src_host = n_src
+        with prof.stage("grid_build"):
+            grid = self._ensure_grid()
+            grid.build(points=self._tgt[:n_tgt], radius=float(grid_radius))
+        with prof.stage("normals"):
+            wp.launch(
+                estimate_normals_kernel,
+                dim=n_tgt,
+                inputs=[
+                    grid.id,
+                    self._tgt,
+                    float(cfg.normal_radius_m),
+                    int(cfg.normal_min_neighbors),
+                    int(cfg.normal_power_iters),
+                ],
+                outputs=[self._normals, self._valid],
+            )
+        self._prepared_grid = grid
+        return grid
 
+    def _solve_from(
+        self,
+        grid: wp.HashGrid,
+        init_pose: np.ndarray | None,
+        gravity_up: np.ndarray | None,
+        prof: _EventTimer,
+    ) -> IcpResult:
+        """Run the GN loop from `init_pose` on the already-prepared target; read the result."""
+        self._seed_pose(init_pose)
+        self._set_gravity_prior(gravity_up)
+        with prof.stage("iterations"):
+            self._run_gn(grid)
+        prof.read()
+        wp.synchronize()
+        return IcpResult(
+            pose=self._pose.numpy().reshape(4, 4).astype(np.float64),
+            iterations=int(self._iter.numpy()[0]),
+            final_cost=float(self._cost.numpy()[0]),
+            num_inliers=int(self._inliers.numpy()[0]),
+            converged=bool(self._converged.numpy()[0]),
+            timings_ms=prof.ms if prof.enabled else {},
+        )
+
+    def _ensure_batch_buffers(self, h: int) -> None:
+        """Allocate the per-hypothesis GN accumulators for `h` hypotheses (reused if unchanged)."""
+        if self._batch_h == h:
+            return
         with wp.ScopedDevice(self.device):
-            # Downsample (if enabled) and load into the fixed GN buffers, all on
-            # device; only the point counts return to the host. The rest of each
-            # buffer is never read (kernels guard on the live count).
-            with prof.stage("voxel_downsample"):
-                n_src = self._prepare_cloud(source, self._src, voxel_on)
-                n_tgt = self._prepare_cloud(target, self._tgt, voxel_on and cfg.voxel_target)
-                self._n_src.fill_(n_src)
+            self._pose_h = wp.zeros(h, dtype=wp.mat44)
+            self._JtJ_h = wp.zeros((h, 6, 6), dtype=wp.float32)
+            self._Jtr_h = wp.zeros((h, 6), dtype=wp.float32)
+            self._cost_h = wp.zeros(h, dtype=wp.float32)
+            self._inliers_h = wp.zeros(h, dtype=wp.int32)
+            self._delta_h = wp.zeros((h, 6), dtype=wp.float32)
+            self._dr_h = wp.zeros(h, dtype=wp.float32)
+            self._dt_h = wp.zeros(h, dtype=wp.float32)
+            self._alldone = wp.zeros(1, dtype=wp.int32)
+        self._batch_h = h
 
-            with prof.stage("grid_build"):
-                grid = self._ensure_grid()
-                grid.build(points=self._tgt[:n_tgt], radius=float(grid_radius))
+    def align_batch(
+        self,
+        source: wp.array,
+        target: wp.array,
+        inits: np.ndarray,
+        *,
+        gravity_up: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Align `inits` (H host 4x4 guesses) to the same target in ONE batched GN loop.
 
-            with prof.stage("normals"):
+        All H hypotheses share the target grid + normals and advance together — each
+        iteration's correspondence search for all H runs in a single 2D launch, so the cost
+        is ~one ICP rather than H. Runs a fixed `max_iters` (no per-hypothesis early stop).
+        Returns (poses (H, 4, 4), final_costs (H,), num_inliers (H,)); the caller picks the
+        best (e.g. lowest RMS = sqrt(cost / inliers) clearing an inlier gate).
+        """
+        if not isinstance(source, wp.array) or not isinstance(target, wp.array):
+            raise TypeError("source and target must be wp.array(vec3) on the device")
+        inits = np.ascontiguousarray(inits, np.float32).reshape(-1, 4, 4)
+        n_hyp = int(inits.shape[0])
+        cfg = self.config
+        with wp.ScopedDevice(self.device):
+            grid = self._prepare_target(source, target, _EventTimer(self.device, False))
+            self._ensure_batch_buffers(n_hyp)
+            self._pose_h.assign(inits)
+            self._set_gravity_prior(gravity_up)
+            n = max(int(self._n_src_host), 1)
+            for _ in range(cfg.max_iters):
+                self._JtJ_h.zero_()
+                self._Jtr_h.zero_()
+                self._cost_h.zero_()
+                self._inliers_h.zero_()
                 wp.launch(
-                    estimate_normals_kernel,
-                    dim=n_tgt,
+                    accumulate_system_batch_kernel,
+                    dim=(n_hyp, n),
                     inputs=[
                         grid.id,
                         self._tgt,
-                        float(cfg.normal_radius_m),
-                        int(cfg.normal_min_neighbors),
-                        int(cfg.normal_power_iters),
+                        self._normals,
+                        self._valid,
+                        self._src,
+                        self._pose_h,
+                        self._n_src,
+                        float(cfg.max_correspondence_dist_m),
+                        float(cfg.huber_delta),
+                        float(cfg.trim_residual_m),
                     ],
-                    outputs=[self._normals, self._valid],
+                    outputs=[self._JtJ_h, self._Jtr_h, self._cost_h, self._inliers_h],
                 )
-
-            self._seed_pose(init_pose)
-            self._set_gravity_prior(gravity_up)
-            with prof.stage("iterations"):
-                self._run_gn(grid)
-
-            prof.read()
+                wp.launch(
+                    accumulate_gravity_prior_batch_kernel,
+                    dim=n_hyp,
+                    inputs=[self._pose_h, self._grav_up, self._grav_w],
+                    outputs=[self._JtJ_h, self._Jtr_h],
+                )
+                wp.launch(
+                    solve6x6_batch_kernel,
+                    dim=n_hyp,
+                    inputs=[self._JtJ_h, self._Jtr_h, float(cfg.damping)],
+                    outputs=[self._delta_h],
+                )
+                wp.launch(
+                    se3_update_batch_kernel,
+                    dim=n_hyp,
+                    inputs=[self._delta_h],
+                    outputs=[self._pose_h, self._dr_h, self._dt_h],
+                )
+                # Early stop once every hypothesis has settled (a loose tolerance — the tight
+                # single-ICP one rarely trips on real data). One tiny reducer + int readback.
+                wp.launch(
+                    all_converged_batch_kernel,
+                    dim=1,
+                    inputs=[self._dr_h, self._dt_h, n_hyp, 1.0e-3, 1.0e-3],
+                    outputs=[self._alldone],
+                )
+                if int(self._alldone.numpy()[0]) == 1:
+                    break
             wp.synchronize()
-            pose = self._pose.numpy().reshape(4, 4).astype(np.float64)
-            iters_run = int(self._iter.numpy()[0])
-            final_inliers = int(self._inliers.numpy()[0])
-            final_cost = float(self._cost.numpy()[0])
-            converged = bool(self._converged.numpy()[0])
-
-        return IcpResult(
-            pose=pose,
-            iterations=iters_run,
-            final_cost=final_cost,
-            num_inliers=final_inliers,
-            converged=converged,
-            timings_ms=prof.ms if profile else {},
-        )
+            poses = self._pose_h.numpy().reshape(n_hyp, 4, 4).astype(np.float64)
+            costs = self._cost_h.numpy().copy()
+            inliers = self._inliers_h.numpy().copy()
+        return poses, costs, inliers
