@@ -1,0 +1,158 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /accumulated_map1
+      Splitter Ratio: 0.5
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Cell Size: 1
+      Plane Cell Count: 40
+      Color: 100; 100; 100
+      Enabled: true
+      Value: true
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Show Names: true
+      Marker Scale: 1
+      Value: true
+    # The accumulated global map — the star of the show. Colored by height (Z).
+    - Alpha: 1
+      Autocompute Value Bounds:
+        Max Value: 3
+        Min Value: -1
+        Value: true
+      Axis: Z
+      Class: rviz_default_plugins/PointCloud2
+      Color Transformer: AxisColor
+      Decay Time: 0
+      Enabled: true
+      Name: accumulated_map
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.04
+      Style: Flat Squares
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /accumulated_map
+      Use Fixed Frame: true
+      Value: true
+    # Accumulated routing heightmap (16 m planning window).
+    - Alpha: 1
+      Autocompute Value Bounds:
+        Max Value: 3
+        Min Value: -1
+        Value: true
+      Axis: Z
+      Class: rviz_default_plugins/PointCloud2
+      Color Transformer: AxisColor
+      Decay Time: 0
+      Enabled: false
+      Name: elevation_global
+      Position Transformer: XYZ
+      Size (m): 0.08
+      Style: Boxes
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /elevation_global
+      Use Fixed Frame: true
+      Value: false
+    # Single-scan MPPI map (8 m local window).
+    - Alpha: 1
+      Axis: Z
+      Class: rviz_default_plugins/PointCloud2
+      Color Transformer: AxisColor
+      Decay Time: 0
+      Enabled: false
+      Name: elevation_local
+      Position Transformer: XYZ
+      Size (m): 0.08
+      Style: Boxes
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /elevation_local
+      Use Fixed Frame: true
+      Value: false
+    # Raw lidar (best-effort QoS!). Off by default — needs odom->base TF to place.
+    - Alpha: 1
+      Class: rviz_default_plugins/PointCloud2
+      Color: 200; 200; 200
+      Color Transformer: FlatColor
+      Decay Time: 0
+      Enabled: false
+      Name: ouster_points
+      Size (m): 0.02
+      Style: Points
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /ouster/points
+      Use Fixed Frame: true
+      Value: false
+    - Class: rviz_default_plugins/Path
+      Name: planned_path
+      Color: 25; 255; 50
+      Enabled: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        Value: /planned_path
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Name: mppi_fan
+      Enabled: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        Value: /mppi_fan
+      Value: true
+  Global Options:
+    Background Color: 33; 33; 40
+    Fixed Frame: map
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/SetGoal
+      Topic:
+        Value: /goal_pose
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 30
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Name: Current View
+      Pitch: 1.0
+      Yaw: 3.14
+    Saved: ~
+Window Geometry:
+  Height: 900
+  Width: 1400
+  Hidden:
+    - /Views1

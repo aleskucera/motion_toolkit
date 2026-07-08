@@ -1,0 +1,60 @@
+# tmuxinator project for the helhest_stack_ros elevation_node
+# (localization + mapping + MPPI planning viz).
+#
+# Symlinked into ~/.config/tmuxinator/elevation-demo.yml so it can be launched
+# from anywhere with:
+#
+#   tmuxinator start elevation-demo                   # defaults: rotate bag @ 0.25x
+#   BAG=~/projects/helhest_stack/bags/dynamic \
+#       tmuxinator start elevation-demo               # override bag
+#   RATE=0.5 tmuxinator start elevation-demo          # override playback rate
+#
+# Panes: bag (start-paused — hit <space> to play once the node is up),
+# elevation_node, and rviz2 with the preconfigured elevation.rviz.
+#
+# Each pane runs inside the helhest Apptainer via exec.sh. The node is run as a
+# module with PYTHONPATH set (no colcon workspace needed) — the same way it is
+# validated in this repo. Every pane forces LOCALHOST discovery (see README).
+
+<%
+  home    = ENV['HOME']
+  exec_sh = "#{home}/projects/helhest-singularity/exec.sh"
+  repo    = "#{home}/projects/helhest_stack"
+  bag     = ENV['BAG']  || "#{repo}/bags/rotate"
+  rate    = ENV['RATE'] || '0.25'
+  # Optional param overrides:
+  #   NO_FORGET=1 -> pure accumulation (no dynamic carve/recency, never wipe on reject).
+  #   YAW=16      -> yaw multi-start ICP (batched); escapes bad rotational init on fast spins.
+  extra   = ''
+  extra  += ' -p dynamic_enable:=false -p dynamic_recency_enable:=false -p reset_map_on_reject:=false' if ENV['NO_FORGET']
+  extra  += " -p icp_yaw_restarts:=#{ENV['YAW']}" if ENV['YAW']
+  args    = extra.empty? ? '' : "--ros-args#{extra}"
+  # Plain ROS + localhost discovery (for bag / rviz / rqt panes).
+  ros     = 'source /opt/ros/jazzy/setup.bash && export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST'
+  # Full dev env: dev-shell (venv + src + ROS) plus the ros package on PYTHONPATH.
+  dev     = "source \"#{repo}/ros/dev-shell.sh\" && export PYTHONPATH=\"#{repo}/ros/helhest_stack_ros:$PYTHONPATH\" && export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST"
+%>
+
+name: elevation-demo
+root: <%= repo %>
+
+windows:
+  - demo:
+      layout: main-vertical
+      panes:
+        - bag:
+          - <%= exec_sh %> bash -c '<%= ros %> && ros2 bag play "<%= bag %>" --rate <%= rate %> --loop --start-paused; exec bash'
+        - node:
+          - <%= exec_sh %> bash -c '<%= dev %> && python3 -m helhest_stack_ros.elevation_node <%= args %>; exec bash'
+        - rviz:
+          - <%= exec_sh %> bash -c '<%= ros %> && rviz2 -d "<%= repo %>/ros/helhest_stack_ros/rviz/elevation.rviz"; exec bash'
+  # Scratch shell — same Apptainer + ROS + helhest env, ready for `ros2 topic ...`,
+  # `python3 -c "import helhest"`, etc.
+  - shell:
+      panes:
+        - <%= exec_sh %> bash -c '<%= dev %>; exec bash'
+  # rqt_reconfigure GUI for live parameter tuning of the running node
+  # (icp_*, reset_after_rejects, imu_rotation_prior, dynamic_*, footprint_*, ...).
+  - rqt:
+      panes:
+        - <%= exec_sh %> bash -c '<%= ros %> && ros2 run rqt_reconfigure rqt_reconfigure; exec bash'
