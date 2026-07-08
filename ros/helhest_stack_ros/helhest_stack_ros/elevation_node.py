@@ -89,21 +89,6 @@ _IMU_BUFFER_LEN = 500  # ~5 s of 100 Hz IMU — enough to bracket any cloud stam
 _IMU_MAX_EXTRAP_S = 0.05  # fall back to odom if no IMU sample within this of the cloud stamp
 
 
-def _slerp(q0: np.ndarray, q1: np.ndarray, a: float) -> np.ndarray:
-    """Spherical linear interpolation between two `(x, y, z, w)` unit quaternions."""
-    dot = float(np.dot(q0, q1))
-    if dot < 0.0:  # take the shorter arc
-        q1 = -q1
-        dot = -dot
-    if dot > 0.9995:  # nearly parallel -> normalized lerp avoids the 0/0 in the slerp form
-        q = q0 + a * (q1 - q0)
-        return q / np.linalg.norm(q)
-    theta = np.arccos(dot) * a
-    q2 = q1 - q0 * dot
-    q2 = q2 / np.linalg.norm(q2)
-    return q0 * np.cos(theta) + q2 * np.sin(theta)
-
-
 def _rodrigues(omega: np.ndarray) -> np.ndarray:
     """Rotation matrix for the axis-angle vector `omega` (‖omega‖ = angle in rad)."""
     theta = float(np.linalg.norm(omega))
@@ -221,10 +206,13 @@ class ElevationNode(Node):
         self._plan_dims: tuple[int, int, int, int, int, int] | None = None
         self.localizer: Localizer | None = None
         self._latest_imu: Imu | None = None
-        # (t_sec, quaternion xyzw, angular_velocity xyz) history so the motion prior can
-        # interpolate the IMU orientation to the *cloud* stamp (not whatever arrived last),
-        # and the deskew can read the gyro rate at the sweep time.
+        # (t_sec, quaternion xyzw, angular_velocity xyz) history so the deskew and the
+        # rotation prior can read the gyro rate at the *cloud* stamp (not whatever arrived
+        # last). The quaternion is buffered for gravity/debug only — the prior uses the gyro.
         self._imu_buffer: deque[tuple[float, np.ndarray, np.ndarray]] = deque(maxlen=_IMU_BUFFER_LEN)
+        # Running gyro-integrated world_R_base + the stamp it is integrated to (rotation prior).
+        self._gyro_R_base: np.ndarray | None = None
+        self._gyro_t: float | None = None
         self._consecutive_rejects = 0  # for reset-on-sustained-divergence
         self._deskew_warned = False
         self._imu_warned = False
@@ -258,6 +246,7 @@ class ElevationNode(Node):
         self.pub_path = self.create_publisher(Path, "planned_path", 10)
         self.pub_path_marker = self.create_publisher(Marker, "planned_path_marker", 10)
         self.pub_fan = self.create_publisher(MarkerArray, "mppi_fan", 10)
+        self.pub_frame = self.create_publisher(Marker, "frame_marker", 1)
         self.add_on_set_parameters_callback(self._on_parameters_changed)
 
         self.get_logger().info(
@@ -388,6 +377,7 @@ class ElevationNode(Node):
         # accumulated map would smear against it — drop it and re-seed from this scan.
         d("reset_map_on_reject", True)
         d("reset_after_rejects", 5)  # wipe only after this many CONSECUTIVE rejects (sustained loss)
+        d("debug_frames", False)  # INFO-log each frame's registration metrics (debugging)
         # Gravity prior (IMU anchors ICP roll/pitch)
         d("gravity_enable", True)
         d("gravity_weight", 2000.0)
@@ -469,6 +459,7 @@ class ElevationNode(Node):
         self.imu_rotation_prior: bool = g("imu_rotation_prior")
         self.reset_map_on_reject: bool = g("reset_map_on_reject")
         self.reset_after_rejects: int = g("reset_after_rejects")
+        self.debug_frames: bool = g("debug_frames")
         self.publish_map_tf: bool = g("publish_map_tf")
         self.publish_accumulated: bool = g("publish_accumulated")
         self.plan_enable: bool = g("plan_enable")
@@ -666,7 +657,7 @@ class ElevationNode(Node):
             self.get_logger().warn("crop/self-filter removed all points — check bounds.")
             return
         gravity_up = self._gravity_up_base(cloud_msg.header.stamp)
-        imu_R_base = self._imu_orientation_base(cloud_msg.header.stamp)
+        imu_R_base = self._gyro_orientation_base(cloud_msg.header.stamp)
 
         if not self.localizer.initialized:
             world_T_base = odom_T_base
@@ -688,6 +679,13 @@ class ElevationNode(Node):
                 gravity_up=gravity_up,
             )
             self._log_registration(outcome)
+            if self.debug_frames:
+                self.get_logger().info(
+                    f"F{self._frame} {outcome.status} "
+                    f"rot={np.rad2deg(outcome.correction_rot_rad):.1f} "
+                    f"trans={outcome.correction_trans_m:.2f} rms={outcome.rms_residual_m:.3f} "
+                    f"inl={outcome.num_inliers} sub={outcome.submap_points} scan={len(scan_base)}"
+                )
             world_T_base = outcome.pose
             # A single reject just uses the fallback pose (the map keeps accumulating). Only
             # SUSTAINED divergence — tracking genuinely lost — wipes the map and re-seeds from
@@ -873,6 +871,26 @@ class ElevationNode(Node):
         self._publish_grid(self.pub_global, mf.relev_view, mf.rxmin, mf.rymin, mf.cell, stamp)
         if self.publish_accumulated:
             self._publish_accumulated(stamp)
+        self._publish_frame_marker(mf, stamp)
+
+    def _publish_frame_marker(self, mf: _MapFrame, stamp) -> None:
+        """A floating text label with the current processed-frame index (over the robot), so
+        the exact frame is readable in RViz — e.g. to pin down when tracking goes off."""
+        m = Marker()
+        m.header.stamp = stamp
+        m.header.frame_id = self.map_frame
+        m.ns = "frame"
+        m.id = 0
+        m.type = Marker.TEXT_VIEW_FACING
+        m.action = Marker.ADD
+        m.pose.position.x = float(mf.ex)
+        m.pose.position.y = float(mf.ey)
+        m.pose.position.z = 2.5
+        m.pose.orientation.w = 1.0
+        m.scale.z = 0.6  # text height (m)
+        m.color = ColorRGBA(r=1.0, g=1.0, b=0.2, a=1.0)
+        m.text = f"#{self._frame}"
+        self.pub_frame.publish(m)
 
     def _publish_accumulated(self, stamp) -> None:
         """Republish the raw accumulated device cloud (`self.map_wp`) as a PointCloud2.
@@ -1048,62 +1066,49 @@ class ElevationNode(Node):
         n = float(np.linalg.norm(up_base))
         return (up_base / n).astype(np.float64) if n > 1e-9 else None
 
-    def _imu_orientation_base(self, stamp) -> np.ndarray | None:
-        """world_R_base (3x3) from the IMU orientation interpolated to the cloud `stamp`.
+    def _gyro_orientation_base(self, stamp) -> np.ndarray | None:
+        """world_R_base (3x3) from INTEGRATING the base-frame gyro up to the cloud `stamp`.
 
-        The motion prior's rotation source: drift-free in roll/pitch (gravity) and
-        slip-immune in yaw (gyro), unlike wheel odom under skid. The orientation is
-        SLERP-interpolated to the cloud timestamp (not just the latest IMU sample), so a
-        fast rotation is not mis-timed against the scan. Needs the fused orientation
-        quaternion (accel alone can't give yaw) and an IMU sample bracketing the stamp;
-        returns None otherwise, so predict() falls back to the pure odom delta. The static
-        imu->base TF is applied so the result is in base_frame (imu == base -> identity).
+        The motion prior's rotation source. We do NOT use the fused orientation quaternion:
+        on this robot /imu/data's AHRS reports yaw with the wrong sign and attenuated (an
+        ENU/NED handedness bug, with no magnetometer to anchor yaw), which drove the
+        localization yaw the WRONG way and rotated the accumulated map ~20° over a spin.
+        The gyro angular_velocity is correct and slip-immune — it matches wheel odom, which
+        the fused orientation contradicts — so we integrate it instead.
+
+        Only the frame-to-frame delta is consumed by predict(), so the arbitrary integration
+        origin and any slow roll/pitch drift cancel: ICP's gravity prior re-anchors roll/pitch
+        each frame, and yaw has no other source anyway. Advanced once per cloud (from the last
+        cloud stamp to this one, piecewise over the buffered samples), so it stays correct even
+        when a frame is rejected — the delta still spans the true inter-cloud rotation.
+
+        The gyro is already in base_frame (imu == base); returns None when the prior is
+        disabled so predict() falls back to the pure odom delta.
         """
-        if not self.imu_rotation_prior or self._latest_imu is None:
+        if not self.imu_rotation_prior:
             return None
-        q = self._imu_orientation_at(stamp.sec + stamp.nanosec * 1e-9)
-        if q is None:
-            return None
-        world_R_imu = quaternion_to_matrix(q[0], q[1], q[2], q[3])[:3, :3]
-        try:
-            tf = self.tf_buffer.lookup_transform(
-                self.base_frame, self._latest_imu.header.frame_id, stamp
-            )
-        except TransformException:
-            try:  # fall back to the latest available IMU->base transform
-                tf = self.tf_buffer.lookup_transform(
-                    self.base_frame, self._latest_imu.header.frame_id, rclpy.time.Time()
-                )
-            except TransformException as exc:
-                self.get_logger().warn(f"IMU->base TF failed (rotation prior): {exc}")
-                return None
-        r = tf.transform.rotation
-        base_R_imu = quaternion_to_matrix(r.x, r.y, r.z, r.w)[:3, :3]
-        # world_R_base = world_R_imu · imu_R_base; the constant extrinsic cancels in the
-        # frame-to-frame delta predict() takes, so this is delta-consistent for any mount.
-        return (world_R_imu @ base_R_imu.T).astype(np.float64)
-
-    def _imu_orientation_at(self, t: float) -> np.ndarray | None:
-        """IMU orientation quaternion (xyzw) SLERP-interpolated to time `t`, or None.
-
-        None when the buffer is empty or `t` falls more than _IMU_MAX_EXTRAP_S outside it
-        (no sample close enough to trust) — the caller then falls back to odom.
-        """
-        buf = self._imu_buffer
-        if not buf:
-            return None
-        if t <= buf[0][0]:
-            return buf[0][1] if buf[0][0] - t <= _IMU_MAX_EXTRAP_S else None
-        if t >= buf[-1][0]:
-            return buf[-1][1] if t - buf[-1][0] <= _IMU_MAX_EXTRAP_S else None
-        # Scan from the newest end — the query is almost always near the latest samples.
-        for i in range(len(buf) - 1, 0, -1):
-            t0, q0 = buf[i - 1][0], buf[i - 1][1]
-            t1, q1 = buf[i][0], buf[i][1]
-            if t0 <= t <= t1:
-                a = (t - t0) / (t1 - t0) if t1 > t0 else 0.0
-                return _slerp(q0, q1, a)
-        return None
+        t = stamp.sec + stamp.nanosec * 1e-9
+        if self._gyro_R_base is None:  # seed at identity — only deltas matter downstream
+            self._gyro_R_base = np.eye(3)
+            self._gyro_t = t
+            return self._gyro_R_base.copy()
+        # Integrate omega across each buffered sample in (t_prev, t]; tail to the exact stamp.
+        R = self._gyro_R_base
+        tk = self._gyro_t
+        for ts, _q, w in self._imu_buffer:
+            if ts <= tk:
+                continue
+            if ts > t:
+                break
+            R = R @ _rodrigues(w * (ts - tk))  # body-frame rate -> right-multiply
+            tk = ts
+        if t > tk:
+            w = self._imu_omega_at(t)
+            if w is not None:
+                R = R @ _rodrigues(w * (t - tk))
+        self._gyro_R_base = R
+        self._gyro_t = t
+        return R.copy()
 
     def _imu_omega_at(self, t: float) -> np.ndarray | None:
         """IMU angular_velocity (rad/s, base frame) linearly interpolated to time `t`, or None.

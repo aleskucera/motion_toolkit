@@ -128,6 +128,15 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /mppi_fan
       Value: true
+    - Class: rviz_default_plugins/Marker
+      Name: frame_number
+      Enabled: true
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        Value: /frame_marker
+      Value: true
   Global Options:
     Background Color: 33; 33; 40
     Fixed Frame: map
