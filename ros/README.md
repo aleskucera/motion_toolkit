@@ -77,9 +77,12 @@ matching `/odom_2d`.
   wrong-sign on this hardware — AHRS ENU/NED bug). See `elevation_node._gyro_orientation_base`.
 - **Accumulator voxel grid is world-snapped** so the map does not erode under translation
   (`DeviceMapAccumulator._min_corner`).
-- **Map maintenance:** visibility ray-carve of dynamic obstacles ON, time-based recency
-  age-out OFF (erased static structure), reset-on-tracking-loss ON. `NO_FORGET=1` disables
-  all three; `RECENCY=1` re-enables the age-out.
+- **Map maintenance:** consecutive-free visibility carve of dynamic obstacles ON — a point is
+  dropped only after the scan sees PAST it for `carve_persist_frames` (3) frames in a row, so a
+  single ambiguous no-return can't delete static geometry; the frontier no-return path is OFF
+  by default (it over-carved static — real dynamics are caught by a real farther return). Also:
+  time-based recency age-out OFF (erased static), reset-on-tracking-loss ON. `NO_FORGET=1`
+  disables carve + recency + reset; `RECENCY=1` re-enables the age-out.
 - **Node broadcasts `odom→base_link`** (`publish_odom_tf`, default on) at the full odom rate,
   because `helhest_llc` publishes the `/odom_2d` message but no TF — without it `base_link`
   is disconnected from `map` and RViz can't place/follow the robot. Set false only if the odom
