@@ -46,6 +46,36 @@ def _bin_index(
     return row * az_bins + col
 
 
+@wp.func
+def _has_observed_neighbor(
+    depth: wp.array(dtype=wp.float32),
+    idx: int,
+    az_bins: int,
+    el_bins: int,
+) -> int:
+    """1 if any bin in a small window around `idx` was observed (a beam reached it).
+
+    Used to tell a BETWEEN-BEAM gap (an unobserved bearing whose neighbours ARE scanned — a
+    stale fragment the sensor can never re-hit) from a genuinely UNSCANNED region (outside the
+    vertical FOV, all neighbours empty too). The el window (+-2 rows) spans the beam pitch;
+    azimuth wraps the full circle."""
+    row = idx / az_bins
+    col = idx - row * az_bins
+    found = int(0)
+    for dr in range(-2, 3):
+        r2 = row + dr
+        if r2 >= 0 and r2 < el_bins:
+            for dc in range(-1, 2):
+                c2 = col + dc
+                if c2 < 0:
+                    c2 = c2 + az_bins
+                if c2 >= az_bins:
+                    c2 = c2 - az_bins
+                if depth[r2 * az_bins + c2] < _DEPTH_SENTINEL:
+                    found = 1
+    return found
+
+
 @wp.kernel
 def render_depth_kernel(
     points: wp.array(dtype=wp.vec3),
@@ -192,6 +222,7 @@ def classify_streak_kernel(
     other_depth: wp.array(dtype=wp.float32),
     streak_in: wp.array(dtype=wp.int32),
     persist: wp.int32,
+    gap_persist: wp.int32,
     keep: wp.array(dtype=wp.int32),
     streak_out: wp.array(dtype=wp.int32),
 ):
@@ -217,7 +248,16 @@ def classify_streak_kernel(
         streak_out[i] = s
         return
     od = other_depth[idx]
-    if od >= _DEPTH_SENTINEL:  # bearing not observed → no evidence → hold
+    if od >= _DEPTH_SENTINEL:  # no beam reached this exact bearing
+        # A BETWEEN-BEAM gap (neighbouring bearings ARE scanned) is a stale fragment the sensor
+        # can never re-hit — age it out. A point in a fully unscanned region (outside the vertical
+        # FOV, all neighbours empty) is held: we genuinely can't judge it.
+        if gap_persist > 0 and _has_observed_neighbor(other_depth, idx, az_bins, el_bins) == 1:
+            s = s + 1
+            streak_out[i] = s
+            if s >= gap_persist:
+                keep[i] = 0
+            return
         streak_out[i] = s
         return
     margin = margin_m + r * margin_rel

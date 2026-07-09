@@ -286,6 +286,7 @@ class DynamicPointFilter:
         sensor_origin: np.ndarray,
         streak_in: wp.array,
         persist: int,
+        gap_persist: int = 0,
         *,
         sensor_rotation: np.ndarray | None = None,
     ) -> tuple[wp.array, wp.array]:
@@ -297,6 +298,10 @@ class DynamicPointFilter:
         seen-through streak (maintained by `DeviceMapAccumulator`; all-zero on the first frame);
         `streak_out` is the updated streak to thread back through the accumulator. `persist <= 1`
         reduces to the instantaneous `carve()`.
+
+        `gap_persist` > 0 also ages out BETWEEN-BEAM points: a bearing with no beam whose neighbours
+        ARE scanned (a stale fragment the discrete beams can never re-hit) is dropped after that many
+        frames. Points in a fully unscanned region (outside the vertical FOV) are still held.
         """
         n_map = len(map_points)
         if n_map == 0:
@@ -319,6 +324,7 @@ class DynamicPointFilter:
                     self._scan_depth,
                     streak_in,
                     int(persist),
+                    int(gap_persist),
                 ],
                 outputs=[keep, streak_out],
             )

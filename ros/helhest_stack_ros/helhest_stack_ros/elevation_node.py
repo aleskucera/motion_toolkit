@@ -349,6 +349,11 @@ class ElevationNode(Node):
         # moving person (no return for 8 straight frames) IS carved — so the trail goes, the
         # current pose stays. This is what makes the frontier path (below) safe to leave on.
         d("carve_persist_frames", 8)
+        # Age out a BETWEEN-BEAM speck: a map point on a bearing no beam reached, but whose
+        # NEIGHBOURS were scanned (a stale fragment the discrete beams can never re-hit), is
+        # dropped after this many frames. 0 disables. A point in a fully unscanned region
+        # (outside the vertical FOV, no scanned neighbour) is still held.
+        d("carve_gap_frames", 8)
         d("dynamic_az_bins", 1024)  # range-image resolution; match the sensor (Ouster 1024x128)
         d("dynamic_el_bins", 128)
         d("dynamic_el_min_deg", -90.0)  # full hemisphere (world-frame binning, robust to mount)
@@ -484,6 +489,7 @@ class ElevationNode(Node):
         self.icp_yaw_search_deg: float = g("icp_yaw_search_deg")
         self.dynamic_enable: bool = g("dynamic_enable")
         self.carve_persist_frames: int = g("carve_persist_frames")
+        self.carve_gap_frames: int = g("carve_gap_frames")
         self.dynamic_frontier_enable: bool = g("dynamic_frontier_enable")
         self.dynamic_frontier_max_range_m: float = g("dynamic_frontier_max_range_m")
         self.dynamic_recency_enable: bool = g("dynamic_recency_enable")
@@ -781,7 +787,7 @@ class ElevationNode(Node):
                     else wp.zeros(n_map, dtype=wp.int32, device=self.device)
                 )
                 carve, streak_out = self.dynamic_filter.carve_streak(
-                    self.map_wp, carve_scan, sensor_origin, streak_in, persist
+                    self.map_wp, carve_scan, sensor_origin, streak_in, persist, self.carve_gap_frames
                 )
             elif self.dynamic_recency_enable and self.map_ages is not None:
                 # Carve + visibility-gated recency: also forget cells that are OBSERVABLE now

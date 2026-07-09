@@ -82,7 +82,12 @@ matching `/odom_2d`.
   single ambiguous no-return can't delete static geometry, while a spot a moving person vacated
   (no return for 8 straight frames) IS carved. Frontier no-return path ON (needed to carve a
   trail on open ground, where the vacated spot has no solid background); persist=8 is what makes
-  it safe. Net: a moving person keeps their current pose but leaves no trail. Also: recency
+  it safe. Net: a moving person keeps their current pose but leaves no trail. Between-beam-gap
+  age-out ON (`carve_gap_frames`, 8): a map point on a bearing no beam ever re-hits, but whose
+  neighbours ARE scanned, is a stale fragment the discrete Ouster beams can't confirm or carve
+  the normal way (it reads as "unobserved → keep" forever) — it is dropped after 8 frames. This
+  clears the sparse elevated specks that used to sit in the robot's path; a point in a fully
+  unscanned region (no scanned neighbour, outside the vertical FOV) is still held. Also: recency
   age-out OFF (erased static), reset-on-tracking-loss ON. `NO_FORGET=1` disables carve + recency
   + reset; `RECENCY=1` re-enables the age-out.
 - **Node broadcasts `odom→base_link`** (`publish_odom_tf`, default on) at the full odom rate,
