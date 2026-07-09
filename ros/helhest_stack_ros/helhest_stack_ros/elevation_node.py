@@ -344,7 +344,11 @@ class ElevationNode(Node):
         # Consecutive-free carve: only drop a point seen-through for this many frames in a row,
         # so one grazing/dark/dropped-beam no-return can't delete static geometry. <=1 = the old
         # instantaneous carve. Threaded per-cell through the accumulator (survives re-voxelizing).
-        d("carve_persist_frames", 3)
+        # 8, not 3: high enough that a static wall that intermittently no-returns survives (it is
+        # re-confirmed within 8 frames as the robot moves), while a vacated floor spot behind a
+        # moving person (no return for 8 straight frames) IS carved — so the trail goes, the
+        # current pose stays. This is what makes the frontier path (below) safe to leave on.
+        d("carve_persist_frames", 8)
         d("dynamic_az_bins", 1024)  # range-image resolution; match the sensor (Ouster 1024x128)
         d("dynamic_el_bins", 128)
         d("dynamic_el_min_deg", -90.0)  # full hemisphere (world-frame binning, robust to mount)
@@ -354,12 +358,12 @@ class ElevationNode(Node):
         #                                on slanted/radial walls that else reads as seen-through
         d("dynamic_min_range_m", 0.5)
         # Ray-carve against the free-space FRONTIER (organized cloud: miss beams -> far point),
-        # not just returns. OFF by default: a no-return beam is ambiguous (grazing/dark/dropped
-        # beam vs true free space), and trusting it as free space over-carved static structure
-        # (measured: ~2/3 of false carves, −3250 pts / 32% of a static map). Real dynamic
-        # obstacles have background behind them → a real farther return carves them without the
-        # frontier. Enable only for objects against open sky, accepting the static over-carve.
-        d("dynamic_frontier_enable", False)
+        # not just returns. ON: needed to carve a moving person's TRAIL on open ground — where
+        # the beam past a vacated spot hits nothing solid (a no-return), which only the frontier
+        # treats as free. A lone no-return is ambiguous and used to over-carve static, but the
+        # consecutive-free counter (carve_persist_frames above) now makes it safe: a static
+        # surface that briefly no-returns is re-confirmed within `persist` frames and survives.
+        d("dynamic_frontier_enable", True)
         d("dynamic_frontier_max_range_m", 100.0)  # range a no-return beam is treated as free to
         # Recency pruning: forget a cell that is OBSERVABLE this frame (a beam reached its
         # range) yet has gone unconfirmed for this many frames — the moving-object trail the
