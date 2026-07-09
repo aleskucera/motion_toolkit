@@ -27,6 +27,9 @@ wp.init()
 # Empty-slot `last_seen` before any observation stamps it. Well below any real frame
 # index so the first atomic-max always wins.
 _AGE_SENTINEL = -2_000_000_000
+# Empty-slot seen-through streak before any point min-reduces into it — well ABOVE any real
+# streak so the first atomic-min always wins.
+_STREAK_SENTINEL = 2_000_000_000
 
 
 @wp.kernel
@@ -176,6 +179,81 @@ def _compact_stamped_kernel(
     last_seen[s] = age_sentinel
 
 
+@wp.kernel
+def _accumulate_streak_kernel(
+    points: wp.array(dtype=wp.vec3),
+    valid: wp.array(dtype=wp.int32),
+    streaks: wp.array(dtype=wp.int32),
+    cx: wp.float32,
+    cy: wp.float32,
+    r2: wp.float32,
+    min_corner: wp.vec3,
+    inv_voxel: wp.float32,
+    dx: wp.int32,
+    dy: wp.int32,
+    dz: wp.int32,
+    cap_mask: wp.int64,
+    keys: wp.array(dtype=wp.int64),
+    sums: wp.array(dtype=wp.vec3),
+    counts: wp.array(dtype=wp.int32),
+    slots: wp.array(dtype=wp.int32),
+    slot_counter: wp.array(dtype=wp.int32),
+    streak: wp.array(dtype=wp.int32),
+):
+    """Like the stamped accumulate but MIN-reduces a per-point seen-through streak into the cell,
+    so any point with streak 0 (a fresh scan return = re-confirmed) resets the cell's streak."""
+    i = wp.tid()
+    if valid[i] == 0:
+        return
+    p = points[i]
+    if (p[0] - cx) * (p[0] - cx) + (p[1] - cy) * (p[1] - cy) > r2:
+        return
+    ix = int((p[0] - min_corner[0]) * inv_voxel)
+    iy = int((p[1] - min_corner[1]) * inv_voxel)
+    iz = int((p[2] - min_corner[2]) * inv_voxel)
+    if ix < 0 or ix >= dx or iy < 0 or iy >= dy or iz < 0 or iz >= dz:
+        return
+    key = _cell_key(ix, iy, iz)
+    slot = _slot_of(key, cap_mask)
+    cap = int(cap_mask) + 1
+    s = streaks[i]
+    for _ in range(cap):
+        cur = wp.atomic_cas(keys, slot, _EMPTY, key)
+        if cur == _EMPTY:
+            slots[wp.atomic_add(slot_counter, 0, 1)] = slot
+            wp.atomic_add(sums, slot, p)
+            wp.atomic_add(counts, slot, 1)
+            wp.atomic_min(streak, slot, s)
+            return
+        if cur == key:
+            wp.atomic_add(sums, slot, p)
+            wp.atomic_add(counts, slot, 1)
+            wp.atomic_min(streak, slot, s)
+            return
+        slot = wp.int32((wp.int64(slot) + wp.int64(1)) & cap_mask)
+
+
+@wp.kernel
+def _compact_streak_kernel(
+    slots: wp.array(dtype=wp.int32),
+    keys: wp.array(dtype=wp.int64),
+    sums: wp.array(dtype=wp.vec3),
+    counts: wp.array(dtype=wp.int32),
+    streak: wp.array(dtype=wp.int32),
+    streak_sentinel: wp.int32,
+    out_points: wp.array(dtype=wp.vec3),
+    out_streak: wp.array(dtype=wp.int32),
+):
+    """Emit each occupied cell's centroid + its min-reduced seen-through streak, reset the slot."""
+    s = slots[wp.tid()]
+    out_points[wp.tid()] = sums[s] / float(counts[s])
+    out_streak[wp.tid()] = streak[s]
+    keys[s] = _EMPTY
+    sums[s] = wp.vec3(0.0, 0.0, 0.0)
+    counts[s] = 0
+    streak[s] = streak_sentinel
+
+
 class DeviceMapAccumulator:
     """Rolling map kept on-device: carve + add + crop + voxel-thin per frame.
 
@@ -220,6 +298,9 @@ class DeviceMapAccumulator:
             # Recency tracking (opt-in via step(frame=...)): per-cell last-seen frame.
             # Untouched on the legacy path.
             self._last_seen = wp.full(capacity, _AGE_SENTINEL, dtype=wp.int32)
+            # Consecutive-free carve (opt-in via step(map_streak=...)): per-cell seen-through
+            # streak. Untouched on the legacy / recency paths.
+            self._streak = wp.full(capacity, _STREAK_SENTINEL, dtype=wp.int32)
 
     def _min_corner(self, cx: float, cy: float) -> wp.vec3:
         """Grid origin SNAPPED to the global voxel lattice, so a world point falls in the same
@@ -288,6 +369,38 @@ class DeviceMapAccumulator:
             ],
         )
 
+    def _accumulate_streak(
+        self, points: wp.array, mask: wp.array, streaks: wp.array, cx: float, cy: float
+    ) -> None:
+        """Bin `points` (kept where `mask != 0`), MIN-reducing per-point `streaks` into the cell."""
+        min_corner = self._min_corner(cx, cy)
+        wp.launch(
+            _accumulate_streak_kernel,
+            dim=len(points),
+            inputs=[
+                points,
+                mask,
+                streaks,
+                cx,
+                cy,
+                self.radius * self.radius,
+                min_corner,
+                1.0 / self.voxel,
+                self.dx,
+                self.dy,
+                self.dz,
+                wp.int64(self.capacity - 1),
+            ],
+            outputs=[
+                self._keys,
+                self._sums,
+                self._counts,
+                self._slots,
+                self._slot_counter,
+                self._streak,
+            ],
+        )
+
     def step(
         self,
         map_wp: wp.array | None,
@@ -298,6 +411,7 @@ class DeviceMapAccumulator:
         *,
         map_ages: wp.array | None = None,
         frame: int | None = None,
+        map_streak: wp.array | None = None,
     ) -> wp.array | tuple[wp.array, wp.array]:
         """Return the new map: (carved map ∪ valid new points), cropped + voxel-thinned.
 
@@ -317,12 +431,38 @@ class DeviceMapAccumulator:
         n_map = 0 if map_wp is None else len(map_wp)
         n_pts = len(points_wp)
         recency = frame is not None
+        streak_mode = map_streak is not None  # consecutive-free carve: thread per-cell streak
         with wp.ScopedDevice(self.device):
             if n_map + n_pts == 0:
                 empty = wp.zeros(0, dtype=wp.vec3)
-                return (empty, wp.zeros(0, dtype=wp.int32)) if recency else empty
+                return (empty, wp.zeros(0, dtype=wp.int32)) if (recency or streak_mode) else empty
 
             self._slot_counter.zero_()
+            if streak_mode:
+                # Consecutive-free carve: carry the seen-through streak per cell. Map points bring
+                # their (classify-updated) streak; scan returns stamp 0, so a re-observed cell
+                # min-reduces to 0 (re-confirmed). carve_mask already dropped points that hit the
+                # persist threshold this frame.
+                if n_map:
+                    keep = carve_mask if carve_mask is not None else wp.full(n_map, 1, dtype=wp.int32)
+                    self._accumulate_streak(map_wp, keep, map_streak, cx, cy)
+                if n_pts:
+                    zeros = wp.zeros(n_pts, dtype=wp.int32)
+                    self._accumulate_streak(points_wp, valid_wp, zeros, cx, cy)
+                wp.synchronize()
+                n_out = int(self._slot_counter.numpy()[0])
+                new_map = wp.empty(n_out, dtype=wp.vec3)
+                new_streak = wp.empty(n_out, dtype=wp.int32)
+                if n_out:
+                    wp.launch(
+                        _compact_streak_kernel,
+                        dim=n_out,
+                        inputs=[self._slots, self._keys, self._sums, self._counts,
+                                self._streak, _STREAK_SENTINEL],
+                        outputs=[new_map, new_streak],
+                    )
+                return new_map, new_streak
+
             if not recency:
                 # Two masked passes into the same hash — carved map, then new scan —
                 # so no host-side concatenation of the two clouds is needed.

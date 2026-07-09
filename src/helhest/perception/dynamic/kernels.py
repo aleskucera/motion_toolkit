@@ -173,3 +173,61 @@ def classify_recency_kernel(
         if (frame - ages[i]) > max_unseen:
             keep[i] = 0
     # else od < r − margin: occluded (beam stopped short) → not observable → keep
+
+
+@wp.kernel
+def classify_streak_kernel(
+    points: wp.array(dtype=wp.vec3),
+    origin: wp.vec3,
+    rot: wp.mat33,
+    az_bins: int,
+    el_bins: int,
+    az_min: wp.float32,
+    az_span: wp.float32,
+    el_min: wp.float32,
+    el_max: wp.float32,
+    min_range: wp.float32,
+    margin_m: wp.float32,
+    margin_rel: wp.float32,
+    other_depth: wp.array(dtype=wp.float32),
+    streak_in: wp.array(dtype=wp.int32),
+    persist: wp.int32,
+    keep: wp.array(dtype=wp.int32),
+    streak_out: wp.array(dtype=wp.int32),
+):
+    """Consecutive-free carve → keep mask + updated seen-through streak (one per map point).
+
+    A point is dropped only after the scan has seen PAST it for `persist` CONSECUTIVE frames,
+    not on a single frame's evidence. Per frame: seen-through (`od > r + margin`) grows the
+    streak; a beam that returns at ~the point's range confirms it and resets the streak to 0;
+    a bearing the scan did not observe (sentinel) or an occluded point (`od < r − margin`)
+    leaves the streak unchanged (no evidence either way). This tolerates the ambiguous single
+    no-return — grazing/dark/dropped beam — that the instantaneous carve wrongly deleted.
+    """
+    i = wp.tid()
+    keep[i] = 1
+    s = streak_in[i]
+    d = rot @ (points[i] - origin)
+    r = wp.length(d)
+    if r < min_range:
+        streak_out[i] = s
+        return
+    idx = _bin_index(d, az_bins, el_bins, az_min, az_span, el_min, el_max)
+    if idx < 0:
+        streak_out[i] = s
+        return
+    od = other_depth[idx]
+    if od >= _DEPTH_SENTINEL:  # bearing not observed → no evidence → hold
+        streak_out[i] = s
+        return
+    margin = margin_m + r * margin_rel
+    if od > r + margin:  # seen through → one free vote
+        s = s + 1
+        streak_out[i] = s
+        if s >= persist:
+            keep[i] = 0
+        return
+    if od >= r - margin:  # a beam returned at ~this range → confirmed occupied → reset
+        streak_out[i] = 0
+        return
+    streak_out[i] = s  # od < r − margin: occluded → cannot judge → hold

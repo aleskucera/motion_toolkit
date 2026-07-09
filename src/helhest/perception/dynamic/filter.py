@@ -10,6 +10,7 @@ from ..sensor import LidarSensorConfig
 from .kernels import _DEPTH_SENTINEL
 from .kernels import classify_kernel
 from .kernels import classify_recency_kernel
+from .kernels import classify_streak_kernel
 from .kernels import render_depth_kernel
 
 
@@ -277,6 +278,51 @@ class DynamicPointFilter:
                 outputs=[keep],
             )
             return keep
+
+    def carve_streak(
+        self,
+        map_points: wp.array,
+        scan_points: wp.array,
+        sensor_origin: np.ndarray,
+        streak_in: wp.array,
+        persist: int,
+        *,
+        sensor_rotation: np.ndarray | None = None,
+    ) -> tuple[wp.array, wp.array]:
+        """Consecutive-free carve, device-native → `(map_keep, streak_out)`.
+
+        Like `carve()`, but a point is dropped only after the scan has seen PAST it for `persist`
+        CONSECUTIVE frames — not on one frame's ambiguous evidence (a lone no-return from a
+        grazing/dark/dropped beam). `streak_in` (int32, len == map) is each point's current
+        seen-through streak (maintained by `DeviceMapAccumulator`; all-zero on the first frame);
+        `streak_out` is the updated streak to thread back through the accumulator. `persist <= 1`
+        reduces to the instantaneous `carve()`.
+        """
+        n_map = len(map_points)
+        if n_map == 0:
+            return wp.zeros(0, dtype=wp.int32), wp.zeros(0, dtype=wp.int32)
+        origin, rot = _pose_to_warp(sensor_origin, sensor_rotation)
+        with wp.ScopedDevice(self.device):
+            self._render(scan_points, len(scan_points), origin, rot, self._scan_depth)
+            keep = wp.empty(n_map, dtype=wp.int32)
+            streak_out = wp.empty(n_map, dtype=wp.int32)
+            wp.launch(
+                classify_streak_kernel,
+                dim=n_map,
+                inputs=[
+                    map_points,
+                    origin,
+                    rot,
+                    *self._grid,
+                    float(self.config.margin_m),
+                    float(self.config.margin_rel),
+                    self._scan_depth,
+                    streak_in,
+                    int(persist),
+                ],
+                outputs=[keep, streak_out],
+            )
+            return keep, streak_out
 
     def filter(
         self,

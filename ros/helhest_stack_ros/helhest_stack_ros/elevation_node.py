@@ -196,6 +196,7 @@ class ElevationNode(Node):
 
         self.map_wp: wp.array | None = None  # accumulated device cloud (world frame)
         self.map_ages: wp.array | None = None  # per-map-point last-seen frame (recency pruning)
+        self.map_streak: wp.array | None = None  # per-map-point seen-through streak (persist carve)
         self._frame: int = 0  # monotonic frame counter for recency stamps
         # Latest map->odom correction, cached from the last processed cloud and re-broadcast
         # at the full odom rate (see _odom_tf_callback) so base_link stays dense for TF lookups.
@@ -339,20 +340,26 @@ class ElevationNode(Node):
         d("map_z_max_m", 50.0)
         # Dynamic-obstacle carving: remove accumulated points the current scan sees
         # through (moving things). Visibility ray-carve against the new scan.
-        # OFF by default: it is currently over-carving STATIC structure (under investigation).
-        # With it off the map is pure accumulation (reset-on-loss still guards tracking loss).
-        d("dynamic_enable", False)
+        d("dynamic_enable", True)
+        # Consecutive-free carve: only drop a point seen-through for this many frames in a row,
+        # so one grazing/dark/dropped-beam no-return can't delete static geometry. <=1 = the old
+        # instantaneous carve. Threaded per-cell through the accumulator (survives re-voxelizing).
+        d("carve_persist_frames", 3)
         d("dynamic_az_bins", 1024)  # range-image resolution; match the sensor (Ouster 1024x128)
         d("dynamic_el_bins", 128)
         d("dynamic_el_min_deg", -90.0)  # full hemisphere (world-frame binning, robust to mount)
         d("dynamic_el_max_deg", 90.0)
         d("dynamic_margin_m", 0.3)  # carve only if the scan is farther by this + range*margin_rel
-        d("dynamic_margin_rel", 0.02)
+        d("dynamic_margin_rel", 0.05)  # range-proportional slack; absorbs angular-bin quantization
+        #                                on slanted/radial walls that else reads as seen-through
         d("dynamic_min_range_m", 0.5)
         # Ray-carve against the free-space FRONTIER (organized cloud: miss beams -> far point),
-        # not just returns. Without it, a moving object with no background behind it is never
-        # carved (see dynamic/frontier.py). Falls back to returns on a non-organized sensor.
-        d("dynamic_frontier_enable", True)
+        # not just returns. OFF by default: a no-return beam is ambiguous (grazing/dark/dropped
+        # beam vs true free space), and trusting it as free space over-carved static structure
+        # (measured: ~2/3 of false carves, −3250 pts / 32% of a static map). Real dynamic
+        # obstacles have background behind them → a real farther return carves them without the
+        # frontier. Enable only for objects against open sky, accepting the static over-carve.
+        d("dynamic_frontier_enable", False)
         d("dynamic_frontier_max_range_m", 100.0)  # range a no-return beam is treated as free to
         # Recency pruning: forget a cell that is OBSERVABLE this frame (a beam reached its
         # range) yet has gone unconfirmed for this many frames — the moving-object trail the
@@ -472,6 +479,7 @@ class ElevationNode(Node):
         self.icp_yaw_restarts: int = g("icp_yaw_restarts")
         self.icp_yaw_search_deg: float = g("icp_yaw_search_deg")
         self.dynamic_enable: bool = g("dynamic_enable")
+        self.carve_persist_frames: int = g("carve_persist_frames")
         self.dynamic_frontier_enable: bool = g("dynamic_frontier_enable")
         self.dynamic_frontier_max_range_m: float = g("dynamic_frontier_max_range_m")
         self.dynamic_recency_enable: bool = g("dynamic_recency_enable")
@@ -640,6 +648,7 @@ class ElevationNode(Node):
             if "device" in names:  # device moved -> device-resident state is stale
                 self.map_wp = None
                 self.map_ages = None
+                self.map_streak = None
                 self._build_localizer()  # fresh pose state; re-bootstraps on the next scan
         except Exception as exc:  # a bad value must not kill the node
             return SetParametersResult(successful=False, reason=str(exc))
@@ -736,6 +745,7 @@ class ElevationNode(Node):
             if self.reset_map_on_reject and self._consecutive_rejects >= self.reset_after_rejects:
                 self.map_wp = None
                 self.map_ages = None
+                self.map_streak = None
                 self._consecutive_rejects = 0
                 self.get_logger().warn(
                     f"{self.reset_after_rejects} consecutive ICP rejects -> resetting global map."
@@ -746,6 +756,9 @@ class ElevationNode(Node):
         # Dynamic-obstacle carving: drop accumulated points this scan saw THROUGH (moving
         # things). Carve the previous map by visibility against the fresh scan.
         carve = None
+        streak_out = None
+        persist = self.carve_persist_frames
+        streak_mode = self.dynamic_enable and persist > 1
         if self.dynamic_enable and self.map_wp is not None and len(self.map_wp) > 0:
             world_T_sensor = world_T_base @ base_T_sensor
             sensor_origin = world_T_sensor[:3, 3].copy()
@@ -754,7 +767,19 @@ class ElevationNode(Node):
             carve_scan = self._frontier_world(cloud_msg, world_T_sensor) if self.dynamic_frontier_enable else None
             if carve_scan is None:
                 carve_scan = world_scan
-            if self.dynamic_recency_enable and self.map_ages is not None:
+            if streak_mode:
+                # Consecutive-free carve: only drop a point the scan saw PAST for `persist`
+                # frames in a row, so a single ambiguous no-return can't delete static geometry.
+                n_map = len(self.map_wp)
+                streak_in = (
+                    self.map_streak
+                    if self.map_streak is not None and len(self.map_streak) == n_map
+                    else wp.zeros(n_map, dtype=wp.int32, device=self.device)
+                )
+                carve, streak_out = self.dynamic_filter.carve_streak(
+                    self.map_wp, carve_scan, sensor_origin, streak_in, persist
+                )
+            elif self.dynamic_recency_enable and self.map_ages is not None:
                 # Carve + visibility-gated recency: also forget cells that are OBSERVABLE now
                 # but went unconfirmed for max_unseen frames. Cells the sensor can't currently
                 # see (blind rear, occluded) are kept, so history survives behind the robot.
@@ -768,16 +793,29 @@ class ElevationNode(Node):
                 )
             else:
                 carve = self.dynamic_filter.carve(self.map_wp, carve_scan, sensor_origin)
+        if self.debug_frames and carve is not None:  # host readback — debugging only
+            nmap = len(self.map_wp)
+            ncarved = nmap - int(carve.numpy().sum())
+            self.get_logger().info(f"F{self._frame} carved={ncarved}/{nmap} map points")
         self._ck("worldscan+carve")
         center = (world_T_base[0, 3], world_T_base[1, 3])
-        if self.dynamic_recency_enable:
+        if streak_mode:
+            # Seed streaks at 0 on frames with no prior map (bootstrap / just reset).
+            streak_arg = streak_out if streak_out is not None else wp.zeros(0, dtype=wp.int32, device=self.device)
+            self.map_wp, self.map_streak = self.acc.step(
+                self.map_wp, carve, world_scan, valid, center, map_streak=streak_arg,
+            )
+            self.map_ages = None
+        elif self.dynamic_recency_enable:
             self.map_wp, self.map_ages = self.acc.step(
                 self.map_wp, carve, world_scan, valid, center,
                 map_ages=self.map_ages, frame=self._frame,
             )
+            self.map_streak = None
         else:
             self.map_wp = self.acc.step(self.map_wp, carve, world_scan, valid, center)
             self.map_ages = None
+            self.map_streak = None
         self._ck("accumulate")
         mf = self._build_maps(world_T_base, world_scan)
         self._ck("build_maps")
