@@ -197,6 +197,9 @@ class ElevationNode(Node):
         self.map_wp: wp.array | None = None  # accumulated device cloud (world frame)
         self.map_ages: wp.array | None = None  # per-map-point last-seen frame (recency pruning)
         self._frame: int = 0  # monotonic frame counter for recency stamps
+        # Latest map->odom correction, cached from the last processed cloud and re-broadcast
+        # at the full odom rate (see _odom_tf_callback) so base_link stays dense for TF lookups.
+        self._map_T_odom: np.ndarray | None = None
         self._beam_dirs: np.ndarray | None = None  # per-beam unit dirs, built once for the frontier
         self.goal_xy: tuple[float, float] | None = None  # planning goal in map frame
         self.planner: MppiGpu | None = None
@@ -243,6 +246,10 @@ class ElevationNode(Node):
             slop=self.get_parameter("sync_slop_s").value,
         )
         self.sync.registerCallback(self._synced_callback)
+        # Broadcast the pose TF on EVERY odom message (not just synced/processed frames), so
+        # map->base_link is dense enough for RViz to look it up at any cloud stamp — e.g. with
+        # base_link as the fixed frame. Same subscriber, extra callback: no second subscription.
+        self.odom_sub.registerCallback(self._odom_tf_callback)
 
         self.pub_local = self.create_publisher(PointCloud2, "elevation_local", 10)
         self.pub_global = self.create_publisher(PointCloud2, "elevation_global", 10)
@@ -398,6 +405,10 @@ class ElevationNode(Node):
         d("imu_rotation_prior", True)
         # Viz
         d("publish_map_tf", True)
+        # Close odom->base_link ourselves. helhest_llc publishes the /odom_2d message but
+        # broadcasts no TF, so without this base_link is disconnected from map. Default on
+        # here; set false if the odom source ever starts publishing it, or TF double-publishes.
+        d("publish_odom_tf", True)
         d("publish_accumulated", True)  # republish the raw accumulated cloud on accumulated_map
         # MPPI planning (visualization only — no motor commands). Consumes the maps this node
         # already builds: elevation_local as the rollout terrain, elevation_global for the
@@ -473,6 +484,7 @@ class ElevationNode(Node):
         self.debug_frames: bool = g("debug_frames")
         self.profile_stages: bool = g("profile_stages")
         self.publish_map_tf: bool = g("publish_map_tf")
+        self.publish_odom_tf: bool = g("publish_odom_tf")
         self.publish_accumulated: bool = g("publish_accumulated")
         self.plan_enable: bool = g("plan_enable")
         self.plan_batch: int = g("plan_batch")
@@ -773,7 +785,7 @@ class ElevationNode(Node):
             self._publish_maps(mf, cloud_msg.header.stamp)
             if self.plan_enable and self.goal_xy is not None and self.planner is not None:
                 self._plan(mf, world_T_base, cloud_msg.header.stamp)
-        self._broadcast_map_tf(world_T_base, odom_msg)
+        self._cache_map_correction(world_T_base, odom_msg)
         self._ck("publish+plan+tf")
         if self.profile_stages:
             self._prof_n += 1
@@ -1365,23 +1377,44 @@ class ElevationNode(Node):
                 "— using odom prediction."
             )
 
-    def _broadcast_map_tf(self, world_T_base: np.ndarray, odom_msg: Odometry) -> None:
-        if not self.publish_map_tf:
-            return
-        map_T_odom = world_T_base @ invert_pose(self._odom_to_matrix(odom_msg))
-        qx, qy, qz, qw = matrix_to_quaternion(map_T_odom)
+    def _make_tf(self, mat: np.ndarray, parent: str, child: str, stamp) -> TransformStamped:
+        """Marshal a 4x4 parent_T_child pose into a stamped TF message."""
+        qx, qy, qz, qw = matrix_to_quaternion(mat)
         tf = TransformStamped()
-        tf.header.stamp = odom_msg.header.stamp
-        tf.header.frame_id = self.map_frame
-        tf.child_frame_id = odom_msg.header.frame_id
-        tf.transform.translation.x = float(map_T_odom[0, 3])
-        tf.transform.translation.y = float(map_T_odom[1, 3])
-        tf.transform.translation.z = float(map_T_odom[2, 3])
+        tf.header.stamp = stamp
+        tf.header.frame_id = parent
+        tf.child_frame_id = child
+        tf.transform.translation.x = float(mat[0, 3])
+        tf.transform.translation.y = float(mat[1, 3])
+        tf.transform.translation.z = float(mat[2, 3])
         tf.transform.rotation.x = qx
         tf.transform.rotation.y = qy
         tf.transform.rotation.z = qz
         tf.transform.rotation.w = qw
-        self.tf_broadcaster.sendTransform(tf)
+        return tf
+
+    def _cache_map_correction(self, world_T_base: np.ndarray, odom_msg: Odometry) -> None:
+        """Cache the map->odom correction from a processed cloud; _odom_tf_callback broadcasts it."""
+        self._map_T_odom = world_T_base @ invert_pose(self._odom_to_matrix(odom_msg))
+
+    def _odom_tf_callback(self, odom_msg: Odometry) -> None:
+        """Broadcast the pose TF at the full odom rate so base_link is dense and fresh.
+
+        map->odom re-uses the last processed cloud's correction (it changes slowly between
+        clouds); odom->base_link is this message's raw pose. Both are re-stamped at the odom
+        time, so a lookup at any cloud stamp finds a bracketing sample instead of extrapolating.
+        """
+        stamp = odom_msg.header.stamp
+        if self.publish_map_tf and self._map_T_odom is not None:
+            self.tf_broadcaster.sendTransform(
+                self._make_tf(self._map_T_odom, self.map_frame, odom_msg.header.frame_id, stamp)
+            )
+        # Close odom->base_link when the odom source broadcasts no TF (see publish_odom_tf).
+        if self.publish_odom_tf:
+            odom_T_base = self._odom_to_matrix(odom_msg)
+            self.tf_broadcaster.sendTransform(
+                self._make_tf(odom_T_base, odom_msg.header.frame_id, self.base_frame, stamp)
+            )
 
 
 def main(args=None) -> None:

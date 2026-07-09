@@ -159,6 +159,9 @@ Visualization Manager:
       Name: Current View
       Pitch: 1.0
       Yaw: 3.14
+      # Follow the robot: camera focal point tracks base_link while Fixed Frame
+      # stays map, so the robot stays centered and the map accumulates in place.
+      Target Frame: base_link
     Saved: ~
 Window Geometry:
   Height: 900
