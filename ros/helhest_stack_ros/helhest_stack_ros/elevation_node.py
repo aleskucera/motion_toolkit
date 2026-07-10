@@ -44,6 +44,7 @@ from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Imu
+from sensor_msgs.msg import JointState
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs.msg import PointField
 from sensor_msgs_py.point_cloud2 import read_points_numpy
@@ -65,8 +66,11 @@ from helhest.perception import TerrainMap
 from helhest.perception import transform_points
 from helhest.perception.dynamic.frontier import frontier_from_organized
 from helhest import dynamics
+from helhest.control.command import condition_command
+from helhest.control.command import JOINT_NAMES
 from helhest.control.mppi import CostParams
 from helhest.control.mppi import MppiGpu
+from helhest.control.terminal import dock_control
 from helhest.engine import ForwardSimulator
 from helhest.engine import GridParams
 from helhest.planning.costtogo import CostToGo
@@ -203,6 +207,7 @@ class ElevationNode(Node):
         self._map_T_odom: np.ndarray | None = None
         self._beam_dirs: np.ndarray | None = None  # per-beam unit dirs, built once for the frontier
         self.goal_xy: tuple[float, float] | None = None  # planning goal in map frame
+        self._prev_cmd = np.zeros(3, np.float32)  # last published /cmd_joints [L, rear, R] (slew ref)
         self.planner: MppiGpu | None = None
         self.plan_sim: ForwardSimulator | None = None
         self.ctg: CostToGo | None = None
@@ -263,6 +268,7 @@ class ElevationNode(Node):
         self.pub_path_marker = self.create_publisher(Marker, "planned_path_marker", 10)
         self.pub_fan = self.create_publisher(MarkerArray, "mppi_fan", 10)
         self.pub_frame = self.create_publisher(Marker, "frame_marker", 1)
+        self.pub_cmd = self.create_publisher(JointState, self.get_parameter("cmd_topic").value, 10)
         self.add_on_set_parameters_callback(self._on_parameters_changed)
 
         self.get_logger().info(
@@ -457,6 +463,15 @@ class ElevationNode(Node):
         d("plan_robust_margin_m", 0.0)  # cost-to-go safety tube: lateral (m)
         d("plan_robust_margin_deg", 0.0)  # cost-to-go safety tube: heading (deg)
         d("plan_nominal_reset", 1.5)  # nominal wheel speed the planner seeds from
+        # ACTUATION (drive the robot). plan_actuate is OFF by default -- publishing wheel commands
+        # to a real robot must be an explicit opt-in. All motor-safety conditioning (the left-wheel
+        # sign flip, rear-follower, magnitude clamp, slew limit) is in control/command.py.
+        d("plan_actuate", False)  # publish /cmd_joints wheel commands (SAFETY: OFF by default)
+        d("cmd_topic", "/cmd_joints")  # JointState wheel-velocity command topic (to the LLC)
+        d("plan_max_omega", 4.0)  # hard cap on |wheel velocity| [rad/s] -- set to the motor safe max
+        d("plan_max_slew", 50.0)  # hard cap on |d(cmd)/dt| per wheel [rad/s^2]
+        d("plan_dock_radius", 1.5)  # hand off MPPI routing -> terminal dock within this range (m)
+        d("plan_reach_radius", 0.3)  # goal reached -> command a (ramped) stop within this range (m)
         d("plan_publish_fan", True)
         d("plan_fan_stride", 64)  # draw every Nth rollout in the fan
         d("plan_path_width", 0.08)  # intended-path line marker width (m)
@@ -537,6 +552,11 @@ class ElevationNode(Node):
         self.plan_robust_margin_m: float = g("plan_robust_margin_m")
         self.plan_robust_margin_deg: float = g("plan_robust_margin_deg")
         self.plan_nominal_reset: float = g("plan_nominal_reset")
+        self.plan_actuate: bool = g("plan_actuate")
+        self.plan_max_omega: float = g("plan_max_omega")
+        self.plan_max_slew: float = g("plan_max_slew")
+        self.plan_dock_radius: float = g("plan_dock_radius")
+        self.plan_reach_radius: float = g("plan_reach_radius")
         self.plan_publish_fan: bool = g("plan_publish_fan")
         self.plan_fan_stride: int = g("plan_fan_stride")
         self.plan_path_width: float = g("plan_path_width")
@@ -1105,6 +1125,40 @@ class ElevationNode(Node):
         self._publish_path(ctrl[:, 0, :2] + origin, ez, stamp)
         if self.plan_publish_fan:
             self._publish_fan(ctrl, origin, ez, stamp)
+
+        # --- ACTUATION: turn the plan into a conditioned /cmd_joints command (default OFF) ---
+        if not self.plan_actuate:
+            return
+        d = float(np.hypot(gx - mf.ex, gy - mf.ey))  # robot -> goal distance
+        if d < self.plan_reach_radius:
+            wl, wr = 0.0, 0.0  # reached -> stop (the slew limiter ramps the command down)
+        elif d < self.plan_dock_radius:
+            u = dock_control(state_l, goal_l, wmax=self.plan_max_omega)  # terminal dock
+            wl, wr = float(u[0]), float(u[1])
+        else:
+            u0 = self.planner.nominal()[0]  # first committed step (wL, wR), model convention
+            wl, wr = float(u0[0]), float(u0[1])
+        # sign flip + rear-follower + magnitude clamp + slew limit, all in control/command.py
+        cmd = condition_command(
+            wl, wr, self._prev_cmd,
+            max_omega=self.plan_max_omega, max_slew=self.plan_max_slew, dt=dynamics.DT,
+        )
+        self._prev_cmd = cmd
+        self._publish_cmd(cmd)
+
+    def _publish_cmd(self, cmd: np.ndarray) -> None:
+        """Publish the conditioned [left, rear, right] wheel velocities to /cmd_joints.
+
+        Stamped with the current clock (not the sensor stamp) so an LLC deadman sees a fresh
+        command. Matches the robot's /joint_setpoint format: velocity is the command; position
+        and effort are inf ('unused'). cmd is already in the real-robot sign convention."""
+        m = JointState()
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.name = list(JOINT_NAMES)
+        m.velocity = [float(v) for v in cmd]
+        m.position = [float("inf")] * 3
+        m.effort = [float("inf")] * 3
+        self.pub_cmd.publish(m)
 
     def _publish_path(self, xy: np.ndarray, z: float, stamp) -> None:
         path = Path()
