@@ -19,8 +19,8 @@ DT = 0.1  # control timestep -- the plan horizon step AND the driver frame step 
 # Calibrated 2026-07-10 against ICP-truth over real manual-drive bags (rotate_in_place0 + arc_diff0
 # agree at alpha ~= 1.33 vs the old 2.6): the robot turns ~2x more than the old gain assumed. 0.4 gives
 # 1 + 0.4*0.8 = 1.32 at the planner's mu=0.8. (Forward gain measured ~0.97 -> wheel_radius unchanged.
-# NOTE the real LEFT-wheel joint sign is inverted vs this model -- that is an LLC-interface flip on the
-# command, NOT a model change; see the wheel_sign_convention_calibration memory.)
+# The /cmd_joints command convention is all-positive-forward, same sign as this model -- no flip;
+# see control/command.py and the wheel_sign_convention_calibration memory.)
 K_TURN = 0.4
 
 

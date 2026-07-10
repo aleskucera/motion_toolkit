@@ -70,6 +70,7 @@ from helhest.control.command import condition_command
 from helhest.control.command import JOINT_NAMES
 from helhest.control.mppi import CostParams
 from helhest.control.mppi import MppiGpu
+from helhest.control.mppi import SamplingConfig
 from helhest.control.terminal import dock_control
 from helhest.engine import ForwardSimulator
 from helhest.engine import GridParams
@@ -150,6 +151,9 @@ _PLAN_BUILD = frozenset(
         "plan_robust_margin_m",
         "plan_robust_margin_deg",
         "plan_nominal_reset",
+        "plan_goal_running",
+        "plan_effort",
+        "plan_wmax",
         "device",
     }
 )
@@ -467,6 +471,16 @@ class ElevationNode(Node):
         # 0 belly contacts). Tighten in narrow spaces -- it erodes the feasible set both sides.
         d("plan_robust_margin_deg", 0.0)  # cost-to-go safety tube: heading (deg)
         d("plan_nominal_reset", 1.5)  # nominal wheel speed the planner seeds from
+        # MPPI speed knobs (rebuild the planner on change): the robot drives slow because the cost
+        # balance prefers it. Raise goal_running (reward progress) and/or lower effort (penalty on
+        # wheel-speed^2) to drive faster. plan_max_omega is only the output SAFETY clamp, not speed.
+        d("plan_goal_running", 0.3)  # cost-to-go V^2 per step -> higher = faster (more progress pull)
+        d("plan_effort", 2e-3)  # penalize wheel-speed^2 -> lower = faster (less speed penalty)
+        # HARD speed ceiling: the MPPI wheel-speed sampling box [0, plan_wmax] rad/s. The planner
+        # NEVER commands above this regardless of the cost -- raising goal_running does nothing once
+        # it saturates at plan_wmax. This is the real top-speed knob. Keep <= the motor safe max
+        # (plan_max_omega, the output clamp). ~1.4 m/s at 4.0; ~2.1 m/s at 6.0 (r=0.35).
+        d("plan_wmax", 4.0)  # max per-wheel omega the planner may command [rad/s]
         # ACTUATION (drive the robot). plan_actuate is OFF by default -- publishing wheel commands
         # to a real robot must be an explicit opt-in. All motor-safety conditioning (the left-wheel
         # sign flip, rear-follower, magnitude clamp, slew limit) is in control/command.py.
@@ -556,6 +570,9 @@ class ElevationNode(Node):
         self.plan_robust_margin_m: float = g("plan_robust_margin_m")
         self.plan_robust_margin_deg: float = g("plan_robust_margin_deg")
         self.plan_nominal_reset: float = g("plan_nominal_reset")
+        self.plan_goal_running: float = g("plan_goal_running")
+        self.plan_effort: float = g("plan_effort")
+        self.plan_wmax: float = g("plan_wmax")
         self.plan_actuate: bool = g("plan_actuate")
         self.plan_max_omega: float = g("plan_max_omega")
         self.plan_max_slew: float = g("plan_max_slew")
@@ -656,7 +673,12 @@ class ElevationNode(Node):
             self.device,
         )
         self.plan_sim.set_uniform_friction(self.plan_friction)
-        self.planner = MppiGpu(self.plan_sim, CostParams(), n_theta=int(self.plan_n_theta))
+        self.planner = MppiGpu(
+            self.plan_sim,
+            CostParams(goal_running=self.plan_goal_running, effort=self.plan_effort),
+            sampling=SamplingConfig(wmax=self.plan_wmax),
+            n_theta=int(self.plan_n_theta),
+        )
         self.planner.reset_nominal(self.plan_nominal_reset)
         self.ctg = CostToGo(
             GridParams(rcnx, rcny, rccell, 0.0, 0.0),
@@ -1154,14 +1176,13 @@ class ElevationNode(Node):
         """Publish the conditioned [left, rear, right] wheel velocities to /cmd_joints.
 
         Stamped with the current clock (not the sensor stamp) so an LLC deadman sees a fresh
-        command. Matches the robot's /joint_setpoint format: velocity is the command; position
-        and effort are inf ('unused'). cmd is already in the real-robot sign convention."""
+        command. VELOCITY ONLY: position/effort are left empty. Filling them with inf breaks
+        serialization across the micro-ROS/XRCE bridge, so the LLC never receives the command
+        (found live on the robot 2026-07-10)."""
         m = JointState()
         m.header.stamp = self.get_clock().now().to_msg()
         m.name = list(JOINT_NAMES)
         m.velocity = [float(v) for v in cmd]
-        m.position = [float("inf")] * 3
-        m.effort = [float("inf")] * 3
         self.pub_cmd.publish(m)
 
     def _publish_path(self, xy: np.ndarray, z: float, stamp) -> None:
