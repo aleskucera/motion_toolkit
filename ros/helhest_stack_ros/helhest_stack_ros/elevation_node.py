@@ -321,9 +321,11 @@ class ElevationNode(Node):
         d("outlier_search_radius_m", 0.25)
         d("outlier_min_neighbors", 6)
         d("outlier_std_mult", 1.0)  # reject beyond mean + this*std of the neighbor distance
-        # Heightmap (live-tunable)
-        d("resolution", 0.15)
-        d("win_m", 8.0)  # single-scan / MPPI window (robot-centered)
+        # Heightmap (live-tunable). resolution/win_m validated on real bags: the finer 0.08 m cell
+        # + 12 m fine window let the MPPI actually see berms across its plan (footprint violations
+        # 36%->8% vs the old 0.15/8) -- see the Tier-B planner analysis.
+        d("resolution", 0.08)
+        d("win_m", 12.0)  # single-scan / MPPI window (robot-centered)
         d("route_m", 16.0)  # accumulated / planning window (robot-centered)
         d("local_support", 2)  # min points/cell to trust the single scan
         d("local_max_gap_m", 0.4)  # trust the inpaint this far from a real return
@@ -460,7 +462,9 @@ class ElevationNode(Node):
         d("plan_lat_coarsen", 4)  # routing/cost-to-go grid coarsening vs the map cell
         d("plan_n_refine", 3)  # MPPI refine iterations per frame
         d("plan_friction", 0.8)  # uniform rollout friction
-        d("plan_robust_margin_m", 0.0)  # cost-to-go safety tube: lateral (m)
+        d("plan_robust_margin_m", 0.3)  # cost-to-go safety tube: lateral (m) ~ robot half-width;
+        # keeps the routed center a footprint-width off berms (validated in the Tier-C closed loop:
+        # 0 belly contacts). Tighten in narrow spaces -- it erodes the feasible set both sides.
         d("plan_robust_margin_deg", 0.0)  # cost-to-go safety tube: heading (deg)
         d("plan_nominal_reset", 1.5)  # nominal wheel speed the planner seeds from
         # ACTUATION (drive the robot). plan_actuate is OFF by default -- publishing wheel commands
