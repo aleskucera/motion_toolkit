@@ -18,13 +18,14 @@ DT = 0.1  # control timestep -- the plan horizon step AND the driver frame step 
 # skid-steer turn gain: alpha = 1 + K_TURN*mu sets the turn resistance (yaw rate = ideal / alpha).
 # The gain is TERRAIN-dependent -- outdoor grass/dirt grips harder, so the skid-steer resists turning
 # more (understeers). Both values are ICP-truth calibrated against real manual-drive bags:
-#   indoor  alpha ~= 1.33  (rotate_in_place0 + arc_diff0)           -> K_TURN 0.4
+#   indoor  alpha ~= 1.48  (experiment0 gyro fit, corr 0.95)        -> K_TURN 0.6
+#           (was 0.4 from rotate_in_place0 + arc_diff0 alpha~1.33; bumped after the experiment0 fit)
 #   outdoor alpha ~= 1.82  (manual_drive_outdoor0, turns ~0.72x)    -> K_TURN 1.0
 # Pick per environment via k_turn_for(); a single constant can't be right for both. (Forward gain
 # measured ~0.95-0.97 both -> wheel_radius unchanged; /cmd_joints is all-positive-forward, no flip.)
 # TODO: online K_TURN/friction estimation would remove this manual switch. See
 # wheel_sign_convention_calibration memory.
-K_TURN_INDOOR = 0.4
+K_TURN_INDOOR = 0.6
 K_TURN_OUTDOOR = 1.0
 K_TURN = K_TURN_INDOOR  # module default (used by WarpDriver / demos when not overridden)
 

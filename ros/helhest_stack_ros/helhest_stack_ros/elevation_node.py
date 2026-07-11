@@ -220,6 +220,7 @@ class ElevationNode(Node):
         self._d_hist: deque[float] = deque(maxlen=15)  # recent robot->goal distances (progress check)
         self._prev_plan_U: np.ndarray | None = None  # last frame's nominal plan (for plan-consistency EMA)
         self._goal_reached = False  # latched at the goal -> idle (no planning) until the goal changes
+        self._holding = False  # walled-off hold active -> planned-path marker drawn red
         self.planner: MppiGpu | None = None
         self.plan_sim: ForwardSimulator | None = None
         self.ctg: CostToGo | None = None
@@ -1305,6 +1306,7 @@ class ElevationNode(Node):
         self._prev_cmd = cmd
         self._publish_cmd(cmd)
         self.pub_holding.publish(Bool(data=holding))  # True = walled-off hold, False = driving
+        self._holding = holding  # colors the planned-path marker red next frame (see _publish_path)
 
     def _publish_cmd(self, cmd: np.ndarray) -> None:
         """Publish the conditioned [left, rear, right] wheel velocities to /cmd_joints.
@@ -1340,7 +1342,12 @@ class ElevationNode(Node):
         m.type = Marker.LINE_STRIP
         m.action = Marker.ADD
         m.scale.x = float(self.plan_path_width)
-        m.color = ColorRGBA(r=1.0, g=0.0, b=1.0, a=1.0)  # magenta: reads over the green height map
+        # Magenta while driving; RED when the planner is HOLDING (goal walled off, no viable path)
+        # -- the path shown is the rejected explore-fallback, so red flags "not being driven".
+        if self._holding:
+            m.color = ColorRGBA(r=1.0, g=0.1, b=0.1, a=1.0)
+        else:
+            m.color = ColorRGBA(r=1.0, g=0.0, b=1.0, a=1.0)  # magenta: reads over the green height map
         m.pose.orientation.w = 1.0
         m.points = [Point(x=float(x), y=float(y), z=z) for x, y in xy]
         self.pub_path_marker.publish(m)

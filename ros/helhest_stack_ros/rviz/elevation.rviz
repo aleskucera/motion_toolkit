@@ -141,6 +141,14 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /goal_pose
       Value: true
+    # The robot's current pose (position + heading) as XYZ axes, from the map->base_link TF.
+    - Class: rviz_default_plugins/Axes
+      Name: robot_pose
+      Enabled: true
+      Reference Frame: base_link
+      Length: 0.8
+      Radius: 0.1
+      Value: true
   Global Options:
     Background Color: 33; 33; 40
     Fixed Frame: map
