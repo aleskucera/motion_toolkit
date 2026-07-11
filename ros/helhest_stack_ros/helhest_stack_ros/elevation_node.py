@@ -149,6 +149,7 @@ _PLAN_BUILD = frozenset(
         "plan_lat_coarsen",
         "plan_friction",
         "terrain",
+        "k_turn",
         "plan_robust_margin_m",
         "plan_robust_margin_deg",
         "plan_nominal_reset",
@@ -471,6 +472,7 @@ class ElevationNode(Node):
         # 'indoor' (K_TURN 0.4, alpha~1.33) or 'outdoor' (K_TURN 1.0, alpha~1.82 -- grass/dirt grips
         # harder so it understeers). ICP-calibrated per environment; see dynamics.k_turn_for.
         d("terrain", "indoor")
+        d("k_turn", -1.0)  # explicit turn-gain override (e.g. from calibrate_turn.sh); <0 = use terrain
         d("plan_robust_margin_m", 0.3)  # cost-to-go safety tube: lateral (m) ~ robot half-width;
         # keeps the routed center a footprint-width off berms (validated in the Tier-C closed loop:
         # 0 belly contacts). Tighten in narrow spaces -- it erodes the feasible set both sides.
@@ -576,6 +578,7 @@ class ElevationNode(Node):
         self.plan_n_refine: int = g("plan_n_refine")
         self.plan_friction: float = g("plan_friction")
         self.terrain: str = g("terrain")
+        self.k_turn_override: float = g("k_turn")
         self.plan_robust_margin_m: float = g("plan_robust_margin_m")
         self.plan_robust_margin_deg: float = g("plan_robust_margin_deg")
         self.plan_nominal_reset: float = g("plan_nominal_reset")
@@ -673,8 +676,13 @@ class ElevationNode(Node):
         rcny, rcnx, rccell = rwh // kr, rww // kr, cell * kr
         win_grid = GridParams(ww, wh, cell, 0.0, 0.0)
         # terrain-dependent turn gain (outdoor grips harder -> understeers). See dynamics.k_turn_for.
-        kt = dynamics.k_turn_for(self.terrain)
-        self.get_logger().info(f"planner terrain='{self.terrain}' -> K_TURN={kt}")
+        # explicit k_turn param wins; else the terrain preset (indoor/outdoor)
+        if self.k_turn_override >= 0.0:
+            kt = self.k_turn_override
+            self.get_logger().info(f"planner K_TURN={kt} (k_turn param override)")
+        else:
+            kt = dynamics.k_turn_for(self.terrain)
+            self.get_logger().info(f"planner terrain='{self.terrain}' -> K_TURN={kt}")
         self.plan_sim = ForwardSimulator(
             dynamics.robot_params(),
             dynamics.planning_solver(k_turn=kt),
