@@ -41,7 +41,7 @@ This nonlinear map $f$ is implemented exactly in `engine/step.py` (`rollout_kern
 
 ## 2. Constants
 
-Helhest Junior defaults (source: [`src/helhest/model.py`](https://github.com/aleskucera/terrain_toolkit/blob/main/src/helhest/model.py) and [`src/helhest/dynamics.py`](https://github.com/aleskucera/terrain_toolkit/blob/main/src/helhest/dynamics.py)):
+Helhest Junior defaults (source: `src/helhest/model.py` and `src/helhest/dynamics.py`):
 
 | Symbol | Value | Unit | Meaning |
 |--------|-------|------|---------|
