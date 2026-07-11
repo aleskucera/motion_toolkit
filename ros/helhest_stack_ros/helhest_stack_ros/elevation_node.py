@@ -50,7 +50,6 @@ from sensor_msgs.msg import PointField
 from sensor_msgs_py.point_cloud2 import read_points_numpy
 from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker
-from visualization_msgs.msg import MarkerArray
 from helhest.perception import DeviceMapAccumulator
 from helhest.perception import DynamicFilterConfig
 from helhest.perception import DynamicPointFilter
@@ -270,7 +269,6 @@ class ElevationNode(Node):
         self.pub_accum = self.create_publisher(PointCloud2, "accumulated_map", 1)
         self.pub_path = self.create_publisher(Path, "planned_path", 10)
         self.pub_path_marker = self.create_publisher(Marker, "planned_path_marker", 10)
-        self.pub_fan = self.create_publisher(MarkerArray, "mppi_fan", 10)
         self.pub_frame = self.create_publisher(Marker, "frame_marker", 1)
         self.pub_cmd = self.create_publisher(JointState, self.get_parameter("cmd_topic").value, 10)
         self.add_on_set_parameters_callback(self._on_parameters_changed)
@@ -457,7 +455,7 @@ class ElevationNode(Node):
         # MPPI planning (visualization only — no motor commands). Consumes the maps this node
         # already builds: elevation_local as the rollout terrain, elevation_global for the
         # cost-to-go routing field. Goal comes from RViz "2D Nav Goal" on goal_topic. Publishes
-        # the intended path (nav_msgs/Path) + the MPPI sample fan (MarkerArray).
+        # the intended path (nav_msgs/Path + a thick LINE_STRIP marker).
         d("plan_enable", True)
         d("goal_topic", "/goal_pose")
         d("plan_batch", 4096)  # MPPI rollouts B
@@ -490,8 +488,6 @@ class ElevationNode(Node):
         d("plan_max_slew", 50.0)  # hard cap on |d(cmd)/dt| per wheel [rad/s^2]
         d("plan_dock_radius", 1.5)  # hand off MPPI routing -> terminal dock within this range (m)
         d("plan_reach_radius", 0.3)  # goal reached -> command a (ramped) stop within this range (m)
-        d("plan_publish_fan", True)
-        d("plan_fan_stride", 64)  # draw every Nth rollout in the fan
         d("plan_path_width", 0.08)  # intended-path line marker width (m)
 
     def _cache_params(self) -> None:
@@ -578,8 +574,6 @@ class ElevationNode(Node):
         self.plan_max_slew: float = g("plan_max_slew")
         self.plan_dock_radius: float = g("plan_dock_radius")
         self.plan_reach_radius: float = g("plan_reach_radius")
-        self.plan_publish_fan: bool = g("plan_publish_fan")
-        self.plan_fan_stride: int = g("plan_fan_stride")
         self.plan_path_width: float = g("plan_path_width")
 
     @staticmethod
@@ -912,10 +906,11 @@ class ElevationNode(Node):
         self._ck("build_maps")
         if mf is not None:
             self._publish_maps(mf, cloud_msg.header.stamp)
+            self._ck("publish_maps")
             if self.plan_enable and self.goal_xy is not None and self.planner is not None:
                 self._plan(mf, world_T_base, cloud_msg.header.stamp)
         self._cache_map_correction(world_T_base, odom_msg)
-        self._ck("publish+plan+tf")
+        self._ck("cache_tf")
         if self.profile_stages:
             self._prof_n += 1
             if self._prof_n % 30 == 0:
@@ -1118,7 +1113,7 @@ class ElevationNode(Node):
     # ------------------------------------------------------------------
 
     def _plan(self, mf: _MapFrame, world_T_base: np.ndarray, stamp) -> None:
-        """Run MPPI toward the goal on this frame's maps; publish the intended path + fan.
+        """Run MPPI toward the goal on this frame's maps; publish the intended path.
 
         Terrain = the single-scan elevation_local; the routing cost-to-go is solved on the
         accumulated elevation_global. Visualization only — no motor commands are emitted.
@@ -1135,6 +1130,7 @@ class ElevationNode(Node):
             self.plan_sim.set_terrain(
                 wp.array(np.ascontiguousarray(mf.elev_local), dtype=wp.float32, device=self.device)
             )
+            self._ck("plan:set_terrain")
             relev = mf.relev_mem  # (rwh, rww), blind cells = 0
             if kr > 1:
                 Hc = relev[: rcny * kr, : rcnx * kr].reshape(rcny, kr, rcnx, kr).max(axis=(1, 3))
@@ -1143,14 +1139,16 @@ class ElevationNode(Node):
             V = self.ctg.compute(
                 wp.array(np.ascontiguousarray(Hc), dtype=wp.float32, device=self.device), goal_r
             )
+            self._ck("plan:ctg")
             self.planner.set_lattice(V, self.sgrid)
             self.planner.replan(state_l, goal_l, int(self.plan_n_refine))
+            self._ck("plan:replan")
         # candidate 0 is the committed nominal rollout; window-local -> map coords.
         ctrl = self.planner.sim.controlled.numpy()  # [T+1, B, 3] = (x, y, yaw)
+        self._ck("plan:readback")
         origin = np.array([mf.lxmin, mf.lymin], np.float32)
         self._publish_path(ctrl[:, 0, :2] + origin, ez, stamp)
-        if self.plan_publish_fan:
-            self._publish_fan(ctrl, origin, ez, stamp)
+        self._ck("plan:pub_path")
 
         # --- ACTUATION: turn the plan into a conditioned /cmd_joints command (default OFF) ---
         if not self.plan_actuate:
@@ -1210,26 +1208,6 @@ class ElevationNode(Node):
         m.pose.orientation.w = 1.0
         m.points = [Point(x=float(x), y=float(y), z=z) for x, y in xy]
         self.pub_path_marker.publish(m)
-
-    def _publish_fan(self, ctrl: np.ndarray, origin: np.ndarray, z: float, stamp) -> None:
-        """A subsample of the MPPI rollouts as one faint LINE_LIST marker (the "fan")."""
-        stride = max(1, int(self.plan_fan_stride))
-        m = Marker()
-        m.header.stamp = stamp
-        m.header.frame_id = self.map_frame
-        m.ns = "mppi_fan"
-        m.id = 0
-        m.type = Marker.LINE_LIST
-        m.action = Marker.ADD
-        m.scale.x = 0.02  # line width (m)
-        m.color = ColorRGBA(r=0.2, g=0.7, b=1.0, a=0.35)
-        m.pose.orientation.w = 1.0
-        for b in range(0, ctrl.shape[1], stride):
-            xy = ctrl[:, b, :2] + origin
-            for k in range(len(xy) - 1):
-                m.points.append(Point(x=float(xy[k, 0]), y=float(xy[k, 1]), z=z))
-                m.points.append(Point(x=float(xy[k + 1, 0]), y=float(xy[k + 1, 1]), z=z))
-        self.pub_fan.publish(MarkerArray(markers=[m]))
 
     # ------------------------------------------------------------------
     # IMU gravity vector -> up-in-base

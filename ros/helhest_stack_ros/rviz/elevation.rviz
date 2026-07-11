@@ -120,15 +120,6 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /planned_path_marker
       Value: true
-    - Class: rviz_default_plugins/MarkerArray
-      Name: mppi_fan
-      Enabled: true
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        Reliability Policy: Reliable
-        Value: /mppi_fan
-      Value: true
     - Class: rviz_default_plugins/Marker
       Name: frame_number
       Enabled: true
