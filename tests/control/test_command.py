@@ -43,6 +43,20 @@ def test_stop_ramps_down():
     np.testing.assert_allclose(cmd, [2.0, 2.0, 2.0], atol=1e-5)
 
 
+def test_turn_boost_amplifies_diff_keeps_mean():
+    # boost=2 doubles the (wr-wl) differential but leaves the forward mean (rear) unchanged.
+    base = condition_command(1.0, 3.0, Z, max_omega=10.0, max_slew=1e6, dt=0.1)          # [1, 2, 3]
+    boosted = condition_command(1.0, 3.0, Z, max_omega=10.0, max_slew=1e6, dt=0.1, turn_boost=2.0)
+    np.testing.assert_allclose(boosted, [0.0, 2.0, 4.0], atol=1e-5)  # mean 2 kept, diff 2 -> 4
+    assert boosted[1] == base[1]  # rear (forward) unchanged
+
+
+def test_turn_boost_default_is_noop():
+    a = condition_command(1.0, 3.0, Z, max_omega=10.0, max_slew=1e6, dt=0.1)
+    b = condition_command(1.0, 3.0, Z, max_omega=10.0, max_slew=1e6, dt=0.1, turn_boost=1.0)
+    np.testing.assert_allclose(a, b, atol=1e-6)
+
+
 def test_turn_direction():
     # planner turn: wr > wl -> intended +yaw (left/CCW). Right wheel commanded faster than left.
     cmd = condition_command(1.0, 2.0, Z, max_omega=4.0, max_slew=1e6, dt=0.1)

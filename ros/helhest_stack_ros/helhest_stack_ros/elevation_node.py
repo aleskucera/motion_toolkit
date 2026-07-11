@@ -495,6 +495,9 @@ class ElevationNode(Node):
         d("cmd_topic", "/cmd_joints")  # JointState wheel-velocity command topic (to the LLC)
         d("plan_max_omega", 8.0)  # hard cap on |wheel velocity| [rad/s] -- set to the motor safe max
         d("plan_max_slew", 50.0)  # hard cap on |d(cmd)/dt| per wheel [rad/s^2]
+        # amplify the commanded turn differential to compensate the drivetrain (motors realize only
+        # ~half the commanded wheel-speed difference outdoors). 1.0 = off; ~2.0 recovers the loss.
+        d("plan_turn_boost", 1.0)
         d("plan_dock_radius", 1.5)  # hand off MPPI routing -> terminal dock within this range (m)
         d("plan_reach_radius", 0.3)  # goal reached -> command a (ramped) stop within this range (m)
         # UNREACHABLE-GOAL STOP: when the cost-to-go at the robot is saturated (no route to the goal)
@@ -588,6 +591,7 @@ class ElevationNode(Node):
         self.plan_actuate: bool = g("plan_actuate")
         self.plan_max_omega: float = g("plan_max_omega")
         self.plan_max_slew: float = g("plan_max_slew")
+        self.plan_turn_boost: float = g("plan_turn_boost")
         self.plan_dock_radius: float = g("plan_dock_radius")
         self.plan_reach_radius: float = g("plan_reach_radius")
         self.plan_progress_min: float = g("plan_progress_min")
@@ -1215,6 +1219,7 @@ class ElevationNode(Node):
         cmd = condition_command(
             wl, wr, self._prev_cmd,
             max_omega=self.plan_max_omega, max_slew=self.plan_max_slew, dt=dynamics.DT,
+            turn_boost=self.plan_turn_boost,
         )
         self._prev_cmd = cmd
         self._publish_cmd(cmd)

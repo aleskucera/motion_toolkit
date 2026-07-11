@@ -31,6 +31,7 @@ def condition_command(
     max_omega: float,
     max_slew: float,
     dt: float,
+    turn_boost: float = 1.0,
 ) -> np.ndarray:
     """Planner (wl, wr) -> conditioned [left, rear, right] wheel-velocity command for /cmd_joints.
 
@@ -42,11 +43,16 @@ def condition_command(
     Returns [left, rear, right] velocities to publish. To STOP, call with wl = wr = 0 -- the slew
     limiter ramps the command down to rest.
     """
-    rear = 0.5 * (wl + wr)  # rear rolls as a follower at the body forward speed (mean of L/R)
-    # /cmd_joints input convention: forward = all positive, so left/right pass straight through
-    # (rear = mean). No sign flip -- the LLC applies its own internal signs. Verified: forward
-    # (wl=wr=v) -> [+v, +v, +v] drove the robot straight forward. See wheel_sign_convention_calibration.
-    target = np.array([wl, rear, wr], dtype=np.float32)
+    # Split into forward (mean) + turn (differential). The drivetrain realizes the forward command
+    # 1:1 but only ~half the TURN differential (the two motors equalize under load; measured over
+    # outdoor bags). turn_boost amplifies the commanded differential to compensate so the wheels
+    # actually deliver the yaw MPPI intended -- forward speed (mean) is untouched. 1.0 = no boost;
+    # ~2.0 recovers the measured ~0.5 realization. Tune in the field. See the turn-tracking analysis.
+    mean = 0.5 * (wl + wr)  # forward speed; also the rear follower target (rear = mean of L/R)
+    diff = (wr - wl) * float(turn_boost)  # turn differential, amplified
+    # /cmd_joints input convention: forward = all positive, no sign flip -- the LLC applies its own
+    # internal signs. Verified: forward (wl=wr=v) -> [+v, +v, +v] drove the robot straight forward.
+    target = np.array([mean - 0.5 * diff, mean, mean + 0.5 * diff], dtype=np.float32)
     prev = np.asarray(prev, dtype=np.float32)
     d = float(max_slew) * float(dt)  # max change per joint this step
     cmd = np.clip(target, prev - d, prev + d)  # slew-rate limit
