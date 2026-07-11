@@ -16,12 +16,22 @@ from .engine import SolverParams
 
 DT = 0.1  # control timestep -- the plan horizon step AND the driver frame step (must match)
 # skid-steer turn gain: alpha = 1 + K_TURN*mu sets the turn resistance (yaw rate = ideal / alpha).
-# Calibrated 2026-07-10 against ICP-truth over real manual-drive bags (rotate_in_place0 + arc_diff0
-# agree at alpha ~= 1.33 vs the old 2.6): the robot turns ~2x more than the old gain assumed. 0.4 gives
-# 1 + 0.4*0.8 = 1.32 at the planner's mu=0.8. (Forward gain measured ~0.97 -> wheel_radius unchanged.
-# The /cmd_joints command convention is all-positive-forward, same sign as this model -- no flip;
-# see control/command.py and the wheel_sign_convention_calibration memory.)
-K_TURN = 0.4
+# The gain is TERRAIN-dependent -- outdoor grass/dirt grips harder, so the skid-steer resists turning
+# more (understeers). Both values are ICP-truth calibrated against real manual-drive bags:
+#   indoor  alpha ~= 1.33  (rotate_in_place0 + arc_diff0)           -> K_TURN 0.4
+#   outdoor alpha ~= 1.82  (manual_drive_outdoor0, turns ~0.72x)    -> K_TURN 1.0
+# Pick per environment via k_turn_for(); a single constant can't be right for both. (Forward gain
+# measured ~0.95-0.97 both -> wheel_radius unchanged; /cmd_joints is all-positive-forward, no flip.)
+# TODO: online K_TURN/friction estimation would remove this manual switch. See
+# wheel_sign_convention_calibration memory.
+K_TURN_INDOOR = 0.4
+K_TURN_OUTDOOR = 1.0
+K_TURN = K_TURN_INDOOR  # module default (used by WarpDriver / demos when not overridden)
+
+
+def k_turn_for(terrain: str) -> float:
+    """Calibrated turn gain for 'indoor' / 'outdoor' (falls back to the module default)."""
+    return {"indoor": K_TURN_INDOOR, "outdoor": K_TURN_OUTDOOR}.get(terrain, K_TURN)
 
 
 def robot_params():
@@ -29,11 +39,11 @@ def robot_params():
     return RobotParams()
 
 
-def planning_solver(dt=DT):
+def planning_solver(dt=DT, k_turn=K_TURN):
     """Solver for the MPPI rollouts (B in the thousands): shallow + loose settle, for speed."""
-    return SolverParams(dt=dt, k_turn=K_TURN, newton_iters=6, atol=1e-4)
+    return SolverParams(dt=dt, k_turn=k_turn, newton_iters=6, atol=1e-4)
 
 
-def execution_solver(dt=DT):
+def execution_solver(dt=DT, k_turn=K_TURN):
     """Solver for the single driven / settled robot: deeper settle for fidelity."""
-    return SolverParams(dt=dt, k_turn=K_TURN, newton_iters=12, tilt_clamp=1.2)
+    return SolverParams(dt=dt, k_turn=k_turn, newton_iters=12, tilt_clamp=1.2)
