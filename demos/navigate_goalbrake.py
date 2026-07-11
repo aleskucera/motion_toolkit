@@ -37,7 +37,7 @@ DT = dynamics.DT
 
 
 def simulate(world, *, T, brake_dist, consistency, wmax, effort, max_frames, device, fan_n=60,
-             max_slew=50.0, raw=False, reach_radius=0.3):
+             max_slew=50.0, raw=False, reach_radius=0.3, straight_frac=0.0, n_refine=3, sigma=0.5):
     """Run the closed loop; return per-frame snapshots for rendering."""
     builder, start, goal = W.WORLDS[world]
     scene = builder()
@@ -47,7 +47,8 @@ def simulate(world, *, T, brake_dist, consistency, wmax, effort, max_frames, dev
     plan_sim = ForwardSimulator(dynamics.robot_params(), dynamics.planning_solver(), grid, 4096, int(T), device)
     plan_sim.set_terrain(wp.array(np.ascontiguousarray(scene.H, np.float32), dtype=wp.float32, device=device))
     plan_sim.set_friction(mu)
-    planner = MppiGpu(plan_sim, CostParams(effort=effort), sampling=SamplingConfig(wmax=wmax), n_theta=24)
+    planner = MppiGpu(plan_sim, CostParams(effort=effort),
+                      sampling=SamplingConfig(wmax=wmax, straight_frac=straight_frac, sigma=sigma), n_theta=24)
     planner.reset_nominal(1.5)
     ctg = CostToGo(grid, dynamics.robot_params(), dynamics.planning_solver(), n_theta=24, device=device)
     V = ctg.compute(wp.array(np.ascontiguousarray(scene.H, np.float32), dtype=wp.float32, device=device), goal)
@@ -74,7 +75,7 @@ def simulate(world, *, T, brake_dist, consistency, wmax, effort, max_frames, dev
             drv.step([float(cmd[0]), float(cmd[2]), float(cmd[1])])
             fan, cost, plan = last_fan, last_cost, last_plan  # freeze the last viz snapshot
         else:
-            planner.replan(np.array([st.x, st.y, st.yaw], np.float32), goal, 3)
+            planner.replan(np.array([st.x, st.y, st.yaw], np.float32), goal, n_refine)
             U = planner.nominal()
             if consistency > 0.0 and prev_U is not None:
                 sh = np.roll(prev_U, -1, axis=0)
@@ -168,13 +169,17 @@ def main():
     ap.add_argument("--fps", type=int, default=15)
     ap.add_argument("--max-slew", type=float, default=50.0, help="slew limit [rad/s^2]; big = ~off")
     ap.add_argument("--raw", action="store_true", help="forward-clamp brake, bypass condition_command")
+    ap.add_argument("--straight-frac", type=float, default=0.2, help="fraction of straight-prior samples")
+    ap.add_argument("--n-refine", type=int, default=3, help="MPPI refine iterations per frame")
+    ap.add_argument("--sigma", type=float, default=0.5, help="per-step sampling noise")
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     wp.init()
     T, brake, cons = (70, 0.0, 0.0) if args.legacy else (args.horizon, args.brake_dist, args.consistency)
     scene, goal, frames = simulate(args.world, T=T, brake_dist=brake, consistency=cons, wmax=args.wmax,
                                    effort=args.effort, max_frames=args.max_frames, device=args.device,
-                                   max_slew=args.max_slew, raw=args.raw)
+                                   max_slew=args.max_slew, raw=args.raw, straight_frac=args.straight_frac,
+                                   n_refine=args.n_refine, sigma=args.sigma)
     closest = min(fr["d"] for fr in frames)
     print(f"world={args.world} {'LEGACY(T70,no-brake)' if args.legacy else f'FIXED(T{T},brake{brake},cons{cons})'}"
           f" -> frames={len(frames)} closest={closest:.2f} reached={frames[-1]['reached']}")
