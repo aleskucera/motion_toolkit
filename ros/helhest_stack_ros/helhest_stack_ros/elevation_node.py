@@ -499,7 +499,8 @@ class ElevationNode(Node):
         # ~half the commanded wheel-speed difference outdoors). 1.0 = off; ~2.0 recovers the loss.
         # HOTFIX for a motor-control defect -- see docs/turn_differential_hotfix.md.
         d("plan_turn_boost", 1.0)
-        d("plan_dock_radius", 1.5)  # hand off MPPI routing -> terminal dock within this range (m)
+        d("plan_dock_radius", 1.5)  # within this range of the goal: dock (if enabled) or just stop
+        d("plan_dock_enable", True)  # True = terminal dock; False = just STOP when within dock_radius
         d("plan_reach_radius", 0.3)  # goal reached -> command a (ramped) stop within this range (m)
         # UNREACHABLE-GOAL STOP: when the cost-to-go at the robot is saturated (no route to the goal)
         # AND the committed plan reduces distance-to-goal by less than this, the robot is walled off
@@ -594,6 +595,7 @@ class ElevationNode(Node):
         self.plan_max_slew: float = g("plan_max_slew")
         self.plan_turn_boost: float = g("plan_turn_boost")
         self.plan_dock_radius: float = g("plan_dock_radius")
+        self.plan_dock_enable: bool = g("plan_dock_enable")
         self.plan_reach_radius: float = g("plan_reach_radius")
         self.plan_progress_min: float = g("plan_progress_min")
         self.plan_path_width: float = g("plan_path_width")
@@ -1190,8 +1192,11 @@ class ElevationNode(Node):
         if d < self.plan_reach_radius:
             wl, wr = 0.0, 0.0  # reached -> stop (the slew limiter ramps the command down)
         elif d < self.plan_dock_radius:
-            u = dock_control(state_l, goal_l, wmax=self.plan_max_omega)  # terminal dock
-            wl, wr = float(u[0]), float(u[1])
+            if self.plan_dock_enable:
+                u = dock_control(state_l, goal_l, wmax=self.plan_max_omega)  # terminal dock
+                wl, wr = float(u[0]), float(u[1])
+            else:
+                wl, wr = 0.0, 0.0  # dock disabled -> just stop near the goal (ramped)
         else:
             u0 = self.planner.nominal()[0]  # first committed step (wL, wR), model convention
             wl, wr = float(u0[0]), float(u0[1])
