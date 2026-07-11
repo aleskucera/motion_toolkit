@@ -48,6 +48,7 @@ from sensor_msgs.msg import JointState
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs.msg import PointField
 from sensor_msgs_py.point_cloud2 import read_points_numpy
+from std_msgs.msg import Bool
 from std_msgs.msg import ColorRGBA
 from visualization_msgs.msg import Marker
 from helhest.perception import DeviceMapAccumulator
@@ -272,6 +273,7 @@ class ElevationNode(Node):
         self.pub_path_marker = self.create_publisher(Marker, "planned_path_marker", 10)
         self.pub_frame = self.create_publisher(Marker, "frame_marker", 1)
         self.pub_cmd = self.create_publisher(JointState, self.get_parameter("cmd_topic").value, 10)
+        self.pub_holding = self.create_publisher(Bool, "plan_holding", 10)  # True = walled-off hold
         self.add_on_set_parameters_callback(self._on_parameters_changed)
 
         self.get_logger().info(
@@ -1163,6 +1165,7 @@ class ElevationNode(Node):
             return
         d = float(np.hypot(gx - mf.ex, gy - mf.ey))  # robot -> goal distance
         self._d_hist.append(d)
+        holding = False  # walled-off hold this frame -> published on /plan_holding
         if d < self.plan_reach_radius:
             wl, wr = 0.0, 0.0  # reached -> stop (the slew limiter ramps the command down)
         elif d < self.plan_dock_radius:
@@ -1187,6 +1190,7 @@ class ElevationNode(Node):
             )
             if saturated and stuck:
                 wl, wr = 0.0, 0.0  # walled off + no real progress -> hold
+                holding = True
                 self.get_logger().warn(
                     f"goal unreachable (walled off, no progress in {self._d_hist.maxlen} frames) "
                     f"-> holding [d={d:.1f}]", throttle_duration_sec=2.0
@@ -1198,6 +1202,7 @@ class ElevationNode(Node):
         )
         self._prev_cmd = cmd
         self._publish_cmd(cmd)
+        self.pub_holding.publish(Bool(data=holding))  # True = walled-off hold, False = driving
 
     def _publish_cmd(self, cmd: np.ndarray) -> None:
         """Publish the conditioned [left, rear, right] wheel velocities to /cmd_joints.
