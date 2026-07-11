@@ -211,6 +211,7 @@ class ElevationNode(Node):
         self._beam_dirs: np.ndarray | None = None  # per-beam unit dirs, built once for the frontier
         self.goal_xy: tuple[float, float] | None = None  # planning goal in map frame
         self._prev_cmd = np.zeros(3, np.float32)  # last published /cmd_joints [L, rear, R] (slew ref)
+        self._d_hist: deque[float] = deque(maxlen=15)  # recent robot->goal distances (progress check)
         self.planner: MppiGpu | None = None
         self.plan_sim: ForwardSimulator | None = None
         self.ctg: CostToGo | None = None
@@ -488,6 +489,11 @@ class ElevationNode(Node):
         d("plan_max_slew", 50.0)  # hard cap on |d(cmd)/dt| per wheel [rad/s^2]
         d("plan_dock_radius", 1.5)  # hand off MPPI routing -> terminal dock within this range (m)
         d("plan_reach_radius", 0.3)  # goal reached -> command a (ramped) stop within this range (m)
+        # UNREACHABLE-GOAL STOP: when the cost-to-go at the robot is saturated (no route to the goal)
+        # AND the committed plan reduces distance-to-goal by less than this, the robot is walled off
+        # -> stop instead of the explore-fallback nosing into the obstacle. Keep it below a horizon's
+        # worth of forward progress so genuine exploration down an open corridor is NOT stopped.
+        d("plan_progress_min", 0.3)  # min plan progress toward the goal to keep driving when saturated (m)
         d("plan_path_width", 0.08)  # intended-path line marker width (m)
 
     def _cache_params(self) -> None:
@@ -574,6 +580,7 @@ class ElevationNode(Node):
         self.plan_max_slew: float = g("plan_max_slew")
         self.plan_dock_radius: float = g("plan_dock_radius")
         self.plan_reach_radius: float = g("plan_reach_radius")
+        self.plan_progress_min: float = g("plan_progress_min")
         self.plan_path_width: float = g("plan_path_width")
 
     @staticmethod
@@ -701,6 +708,7 @@ class ElevationNode(Node):
                 "set the RViz Fixed Frame to the map frame."
             )
         self.goal_xy = (msg.pose.position.x, msg.pose.position.y)
+        self._d_hist.clear()  # fresh progress history for the new goal
         self.get_logger().info(f"goal set: ({self.goal_xy[0]:.2f}, {self.goal_xy[1]:.2f})")
 
     def _on_parameters_changed(self, params) -> SetParametersResult:
@@ -1154,6 +1162,7 @@ class ElevationNode(Node):
         if not self.plan_actuate:
             return
         d = float(np.hypot(gx - mf.ex, gy - mf.ey))  # robot -> goal distance
+        self._d_hist.append(d)
         if d < self.plan_reach_radius:
             wl, wr = 0.0, 0.0  # reached -> stop (the slew limiter ramps the command down)
         elif d < self.plan_dock_radius:
@@ -1162,6 +1171,26 @@ class ElevationNode(Node):
         else:
             u0 = self.planner.nominal()[0]  # first committed step (wL, wR), model convention
             wl, wr = float(u0[0]), float(u0[1])
+            # UNREACHABLE-GOAL STOP: the robot sits at the routing-window CENTER, so the cost-to-go
+            # there is V at the robot. If it is SATURATED (no route to the goal) AND the committed
+            # plan reduces distance-to-goal by less than plan_progress_min, the robot is walled off
+            # -> stop, instead of the explore-fallback nosing straight into the obstacle. (While the
+            # corridor ahead is still open the plan DOES make progress, so this does not fire.)
+            v_robot = float(self.ctg.V.numpy()[rcny // 2, rcnx // 2].min())
+            saturated = v_robot >= 0.9 * self.ctg._vcap
+            # actual progress over the recent window (plan shape is an unreliable signal -- the blind
+            # far horizon stretches toward the goal even when the near path is walled; measure whether
+            # the robot is really getting closer). Full window + < plan_progress_min gained = stuck.
+            stuck = (
+                len(self._d_hist) >= self._d_hist.maxlen
+                and self._d_hist[0] - d < self.plan_progress_min
+            )
+            if saturated and stuck:
+                wl, wr = 0.0, 0.0  # walled off + no real progress -> hold
+                self.get_logger().warn(
+                    f"goal unreachable (walled off, no progress in {self._d_hist.maxlen} frames) "
+                    f"-> holding [d={d:.1f}]", throttle_duration_sec=2.0
+                )
         # sign flip + rear-follower + magnitude clamp + slew limit, all in control/command.py
         cmd = condition_command(
             wl, wr, self._prev_cmd,
