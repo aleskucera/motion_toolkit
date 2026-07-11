@@ -37,7 +37,7 @@ DT = dynamics.DT
 
 
 def simulate(world, *, T, brake_dist, consistency, wmax, effort, max_frames, device, fan_n=60,
-             max_slew=50.0, raw=False):
+             max_slew=50.0, raw=False, reach_radius=0.3):
     """Run the closed loop; return per-frame snapshots for rendering."""
     builder, start, goal = W.WORLDS[world]
     scene = builder()
@@ -59,41 +59,50 @@ def simulate(world, *, T, brake_dist, consistency, wmax, effort, max_frames, dev
     prev_cmd = np.zeros(3, np.float32)
     prev_U = None
     reached = False
+    last_fan, last_cost, last_plan = None, None, None
     for f in range(max_frames):
         st = drv.render_state()
         d = float(np.hypot(st.x - goal[0], st.y - goal[1]))
-        if d < 0.3:
-            reached = True
-        planner.replan(np.array([st.x, st.y, st.yaw], np.float32), goal, 3)
-        U = planner.nominal()
-        if consistency > 0.0 and prev_U is not None:
-            sh = np.roll(prev_U, -1, axis=0)
-            sh[-1] = prev_U[-1]
-            U = (1.0 - consistency) * U + consistency * sh
-            planner.set_nominal(U)
-        prev_U = U.copy()
-        # snapshot the rollout fan + chosen plan for the viz
-        ctrl = planner.sim.controlled.numpy()  # [T+1, B, 3]
-        J = planner.J.numpy()
-        ci = np.linspace(0, planner.n_cand - 1, min(fan_n, planner.n_cand)).astype(int)
         v_now = float(np.hypot(st.x - frames[-1]["x"], st.y - frames[-1]["y"]) / DT) if frames else 0.0
-        frames.append(dict(x=st.x, y=st.y, yaw=st.yaw, d=d, v=v_now, reached=reached,
-                           fan=ctrl[:, ci, :2].astype(np.float32), cost=J[ci].astype(np.float32),
-                           plan=ctrl[:, 0, :2].astype(np.float32)))
-        # actuate through the SAME conditioning path as the robot (output brake lives here)
-        wl, wr = float(U[0, 0]), float(U[0, 1])
-        if raw:  # bypass condition_command: forward-clamped brake only (my validation path)
-            mean, diff = 0.5 * (wl + wr), (wr - wl)
-            if brake_dist > 0:
-                mean *= min(1.0, d / brake_dist)
-            cwl, cwr = max(0.0, mean - 0.5 * diff), max(0.0, mean + 0.5 * diff)
-            drv.step([cwl, cwr, 0.5 * (cwl + cwr)])
-        else:
-            cmd = condition_command(wl, wr, prev_cmd, max_omega=wmax, max_slew=max_slew, dt=DT,
-                                    goal_dist=d, brake_dist=brake_dist)
+        if d < reach_radius:
+            reached = True  # latched: mirror the node -> stop + idle (do NOT keep driving MPPI past
+            # the goal, or a forward-only planner sails through and orbits).
+        if reached:
+            # goal reached -> command a ramped STOP each frame (the node's reach-idle behavior).
+            cmd = condition_command(0.0, 0.0, prev_cmd, max_omega=wmax, max_slew=max_slew, dt=DT)
             prev_cmd = cmd
-            drv.step([float(cmd[0]), float(cmd[2]), float(cmd[1])])  # [L, R, rear] for the driver
-        if reached and v_now < 0.05:
+            drv.step([float(cmd[0]), float(cmd[2]), float(cmd[1])])
+            fan, cost, plan = last_fan, last_cost, last_plan  # freeze the last viz snapshot
+        else:
+            planner.replan(np.array([st.x, st.y, st.yaw], np.float32), goal, 3)
+            U = planner.nominal()
+            if consistency > 0.0 and prev_U is not None:
+                sh = np.roll(prev_U, -1, axis=0)
+                sh[-1] = prev_U[-1]
+                U = (1.0 - consistency) * U + consistency * sh
+                planner.set_nominal(U)
+            prev_U = U.copy()
+            ctrl = planner.sim.controlled.numpy()  # [T+1, B, 3]
+            J = planner.J.numpy()
+            ci = np.linspace(0, planner.n_cand - 1, min(fan_n, planner.n_cand)).astype(int)
+            fan, cost, plan = ctrl[:, ci, :2].astype(np.float32), J[ci].astype(np.float32), ctrl[:, 0, :2].astype(np.float32)
+            last_fan, last_cost, last_plan = fan, cost, plan
+            # actuate through the SAME conditioning path as the robot (output brake lives here)
+            wl, wr = float(U[0, 0]), float(U[0, 1])
+            if raw:  # bypass condition_command: forward-clamped brake only
+                mean, diff = 0.5 * (wl + wr), (wr - wl)
+                if brake_dist > 0:
+                    mean *= min(1.0, d / brake_dist)
+                cwl, cwr = max(0.0, mean - 0.5 * diff), max(0.0, mean + 0.5 * diff)
+                drv.step([cwl, cwr, 0.5 * (cwl + cwr)])
+            else:
+                cmd = condition_command(wl, wr, prev_cmd, max_omega=wmax, max_slew=max_slew, dt=DT,
+                                        goal_dist=d, brake_dist=brake_dist)
+                prev_cmd = cmd
+                drv.step([float(cmd[0]), float(cmd[2]), float(cmd[1])])  # [L, R, rear] for the driver
+        frames.append(dict(x=st.x, y=st.y, yaw=st.yaw, d=d, v=v_now, reached=reached,
+                           fan=fan, cost=cost, plan=plan))
+        if reached and v_now < 0.03:
             break
     return scene, goal, frames
 
