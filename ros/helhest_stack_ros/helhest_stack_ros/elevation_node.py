@@ -156,6 +156,7 @@ _PLAN_BUILD = frozenset(
         "plan_goal_running",
         "plan_effort",
         "plan_wmax",
+        "plan_straight_frac",
         "device",
     }
 )
@@ -499,6 +500,11 @@ class ElevationNode(Node):
         # it saturates at plan_wmax. This is the real top-speed knob. Keep <= the motor safe max
         # (plan_max_omega, the output clamp). ~1.4 m/s at 4.0; ~2.8 m/s at 8.0 (r=0.35).
         d("plan_wmax", 8.0)  # max per-wheel omega the planner may command [rad/s]
+        # STRAIGHT sampling prior: fraction of MPPI candidates drawn as zero-differential (straight
+        # ahead) drives. Straight is usually near-optimal, so seeding it lets the elite lock onto a
+        # clean straight command instead of averaging noisy micro-turns -> ~25% less lateral wander on
+        # a clear shot, no cost when a turn is actually needed. 0 = off.
+        d("plan_straight_frac", 0.2)
         # ACTUATION (drive the robot). plan_actuate publishes wheel commands to a real robot; set
         # it false to run planning as visualization only. All motor-safety conditioning (the
         # left-wheel sign flip, rear-follower, magnitude clamp, slew limit) is in control/command.py.
@@ -606,6 +612,7 @@ class ElevationNode(Node):
         self.plan_nominal_reset: float = g("plan_nominal_reset")
         self.plan_goal_running: float = g("plan_goal_running")
         self.plan_effort: float = g("plan_effort")
+        self.plan_straight_frac: float = g("plan_straight_frac")
         self.plan_wmax: float = g("plan_wmax")
         self.plan_actuate: bool = g("plan_actuate")
         self.plan_max_omega: float = g("plan_max_omega")
@@ -720,7 +727,7 @@ class ElevationNode(Node):
         self.planner = MppiGpu(
             self.plan_sim,
             CostParams(goal_running=self.plan_goal_running, effort=self.plan_effort),
-            sampling=SamplingConfig(wmax=self.plan_wmax),
+            sampling=SamplingConfig(wmax=self.plan_wmax, straight_frac=self.plan_straight_frac),
             n_theta=int(self.plan_n_theta),
         )
         self.planner.reset_nominal(self.plan_nominal_reset)
