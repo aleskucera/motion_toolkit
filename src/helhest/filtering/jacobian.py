@@ -125,6 +125,41 @@ def jacobian_F_6d(
 
     return F
 
+
+def predict_q6d(
+    q0: np.ndarray,
+    u0: np.ndarray,
+    sim: ForwardSimulator,
+) -> np.ndarray:
+    """Nonlinear 6-D forward prediction q_next = f(q0, u0) at one timestep.
+
+    The companion to jacobian_F_6d: it evaluates the model itself (the un-perturbed
+    rollout) rather than its derivative, sharing the same twist/rotation extraction
+    (_q6d_from_batch) so f and ∂f/∂q stay consistent. Only q0[0:3] seeds the sim; the
+    stored velocity q0[3:6] is never read (see module docstring).
+    q0 : [6]  current state [x, y, ψ, ẋᵂ, ẏᵂ, ψ̇]
+    u0 : [3]  wheel speeds  [ω_L, ω_R, ω_rear]  (rad/s)
+    sim must be pre-built with batch_size=1, n_steps=1 and terrain already loaded.
+    """
+    assert sim.batch_size == 1 and sim.n_steps == 1, (
+        f"sim must have batch_size=1, n_steps=1; got {sim.batch_size=}, {sim.n_steps=}"
+    )
+
+    u_f32 = u0.astype(np.float32)
+    sim.start_pose.assign(q0[:3].astype(np.float32).reshape(1, 3))
+    # target_wheel_omega shape [T, B] = [1, 1].
+    sim.target_wheel_omega.assign(u_f32.reshape(1, 1, 3))
+    # Steady-state: lagged omega == target (no motor lag for this step).
+    sim.init_current_wheel_omega.assign(u_f32.reshape(1, 3))
+
+    sim.rollout_launch()
+
+    ctrl = sim.controlled.numpy()  # [2, 1, 3]
+    deriv = sim.derived.numpy()    # [2, 1, 3]
+    turn = sim.turning.numpy()     # [1, 1, 2]
+    return _q6d_from_batch(ctrl, deriv, turn, 0, u0)
+
+
 #------------------------------------------
 # Tests of jacobian_F_6d functions
 #------------------------------------------

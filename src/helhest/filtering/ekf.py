@@ -90,3 +90,73 @@ class EKF:
 
         self.x = self.x + K @ y
         self.P = (np.eye(3) - K) @ self.P
+
+
+class EKF6D:
+    """EKF for the 6-DOF Helhest state [x, y, ψ, ẋᵂ, ẏᵂ, ψ̇].
+
+    State dimension: 6
+        x, y  — world-frame position [m]
+        ψ     — heading [rad]
+        ẋ, ẏ  — world-frame linear velocity [m/s]
+        ψ̇     — yaw rate [rad/s]
+
+    The prediction is driven by the Helhest kinematic forward model, whose nonlinear
+    output f(q, u) and linearised transition F = ∂f/∂q are supplied by the caller (see
+    helhest.filtering.jacobian.predict_q6d / jacobian_F_6d) — the EKF never calls the
+    model itself. The only measurement is a LiDAR ICP pose [x, y, ψ], observed through
+    H = [I₃ | 0₃] (position states measured, velocity states not).
+    """
+
+    # Position states are observed, velocity states are not: z = H q with H = [I₃ | 0₃].
+    H: np.ndarray = np.hstack([np.eye(3), np.zeros((3, 3))])
+
+    def __init__(
+        self,
+        x0: np.ndarray,
+        P0: np.ndarray,
+        Q: np.ndarray,
+        R_icp: np.ndarray,
+    ) -> None:
+        """
+        x0     : [6]    initial state  [x, y, ψ, ẋ, ẏ, ψ̇]
+        P0     : [6,6]  initial state covariance
+        Q      : [6,6]  process noise covariance
+        R_icp  : [3,3]  ICP measurement noise covariance (on [x, y, ψ])
+        """
+        self.x: np.ndarray = x0.copy()
+        self.P: np.ndarray = P0.copy()
+        self.Q: np.ndarray = Q.copy()
+        self.R_icp: np.ndarray = R_icp.copy()
+
+    def predict(self, F: np.ndarray, x_pred: np.ndarray) -> None:
+        """Propagate the filter by one timestep.
+
+        F      : [6,6] linearised state-transition matrix ∂f/∂q at (q, u) — from caller
+        x_pred : [6]   nonlinear model prediction f(q, u) — also from caller
+        """
+        self.x = x_pred.copy()
+        self.P = F @ self.P @ F.T + self.Q
+
+    def update_icp(self, z: np.ndarray) -> None:
+        """Measurement update from a LiDAR ICP pose.
+
+        z : [3]  observed pose  [x, y, ψ]  in world frame [m, m, rad]
+
+        S = H P⁻ Hᵀ + R
+        K = P⁻ Hᵀ S⁻¹
+        y = z − H x⁻          (innovation; ψ component wrapped to (−π, π])
+        x = x⁻ + K y
+        P = (I₆ − K H) P⁻
+        """
+        H = self.H
+        S = H @ self.P @ H.T + self.R_icp
+        # K = P Hᵀ S⁻¹; solve(S, (P Hᵀ)ᵀ)ᵀ avoids explicit inversion (S symmetric).
+        K = np.linalg.solve(S, (self.P @ H.T).T).T
+
+        y = z - H @ self.x
+        # wrap ψ innovation to (−π, π] so a 359° error is not treated as 359° [rad]
+        y[2] = (y[2] + np.pi) % (2.0 * np.pi) - np.pi
+
+        self.x = self.x + K @ y
+        self.P = (np.eye(6) - K @ H) @ self.P
