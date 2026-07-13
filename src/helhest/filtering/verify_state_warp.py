@@ -13,7 +13,7 @@ The caller that is trying to call verify_state has to do the following:
     sim.set_friction(friction_hm)          # or sim.set_uniform_friction(mu)
 
     # current_pose : wp.array(dtype=wp.vec3, shape=(1,))  -- (x, y, yaw)
-    # omega        : wp.array2d(dtype=wp.vec3, shape=(1,1)) -- wheel speeds [L, R, rear]
+    # omega        : wp.array2d(dtype=wp.vec3, shape=(1,1)) -- commanded wheel speeds [L, R, rear]
     # estimate     : wp.array(dtype=wp.vec3, shape=(1,))  -- (x_hat, y_hat, psi_hat)
     score = verify_state(sim, current_pose, omega, estimate)
 """
@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import warp as wp
 
-from kinematic_helhest.engine import ForwardSimulator
+from helhest.engine import ForwardSimulator
 
 XY_THRES = 0.3
 ANG_THRES = wp.pi / 8.0
@@ -62,7 +62,8 @@ def verify_state(
 
     sim          : ForwardSimulator built with batch_size=1, n_steps=1; terrain pre-loaded
     current_pose : wp.array(dtype=wp.vec3, shape=(1,))   -- (x, y, yaw) [m, m, rad]
-    omega        : wp.array2d(dtype=wp.vec3, shape=(1,1)) -- wheel angular velocities [L, R, rear] (rad/s)
+    omega        : wp.array2d(dtype=wp.vec3, shape=(1,1)) -- commanded wheel speeds [L, R, rear] (rad/s);
+                   assumed steady-state (init lagged omega = commanded)
     estimate     : wp.array(dtype=wp.vec3, shape=(1,))   -- (x_hat, y_hat, psi_hat)
     """
     assert sim.batch_size == 1 and sim.n_steps == 1, (
@@ -71,8 +72,13 @@ def verify_state(
 
     # Copy to sim object:
     wp.copy(sim.start_pose, current_pose)
-    wp.copy(sim.wheel_omega, omega)
-    
+    wp.copy(sim.target_wheel_omega, omega)
+    # Steady-state: lagged omega already at target (motor lag is a no-op for this step).
+    wp.copy(
+        sim.init_current_wheel_omega,
+        wp.array([omega.list()[0]], dtype=wp.vec3, device=omega.device),
+    )
+
     # Step:
     sim.rollout_launch()
     helpers = {"l2": get_l2_error, "confidence": get_max_confidence}
@@ -85,10 +91,10 @@ def verify_state(
 
 
 if __name__ == "__main__":
-    from kinematic_helhest.engine import ForwardSimulator
-    from kinematic_helhest.engine import GridParams
-    from kinematic_helhest.engine import RobotParams
-    from kinematic_helhest.engine import SolverParams
+    from helhest.engine import ForwardSimulator
+    from helhest.engine import GridParams
+    from helhest.engine import RobotParams
+    from helhest.engine import SolverParams
 
     DEVICE = "cuda:0"
 
@@ -108,7 +114,7 @@ if __name__ == "__main__":
     v = 1.0
     w = v / robot.wheel_radius  # ≈ 2.857 rad/s
 
-    # shapes must match sim.start_pose (1,) and sim.wheel_omega (1, 1)
+    # shapes must match sim.start_pose (1,) and sim.target_wheel_omega (1, 1)
     current_pose = wp.array([wp.vec3(0.0, 0.0, 0.0)], dtype=wp.vec3, device=DEVICE)
     omega = wp.array([[wp.vec3(w, w, w)]], dtype=wp.vec3, device=DEVICE)
 
