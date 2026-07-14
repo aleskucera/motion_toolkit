@@ -43,6 +43,9 @@ class SamplingConfig:
     wmin: float = 0.0  # wheel-speed box [wmin, wmax]; wmin >= 0 -> no reverse
     wmax: float = 4.0
     wide_frac: float = 0.25  # fraction of candidates drawn from the WIDE global-search prior
+    # fraction drawn from the STRAIGHT prior (zero differential, wl == wr): straight-ahead is usually
+    # near-optimal, so seeding it explicitly stops the sampling-noise wobble on a clear shot. 0 = off.
+    straight_frac: float = 0.0
     elite_frac: float = 0.02  # CEM top-k elite fraction
 
 
@@ -62,6 +65,9 @@ class CostWeights:
     effort: float
     smoothness: float
     infeasible: float
+    # penalize the turn differential (wr - wl)^2 -> a gradient toward STRAIGHT where the goal cost is
+    # flat w.r.t. heading (the free-heading goal). Distinct from effort (which penalizes total speed).
+    turn: float
 
 
 @dataclass(frozen=True)
@@ -81,6 +87,9 @@ class CostParams:  # host-side cost weights -- what you tune; build() -> the dev
     smoothness: float = 2e-3  # penalize wheel-speed CHANGES (jerk)
     # penalize clearance/residual/tip-over violations (does obstacle avoidance)
     infeasible: float = 1e5
+    # penalize turning (wr - wl)^2 -> prefer straight when the goal cost doesn't care about heading;
+    # small enough that a real need to turn (obstacle/offset goal) still wins. 0 = off.
+    turn: float = 0.0
 
     def build(self) -> CostWeights:
         cw = CostWeights()
@@ -92,6 +101,7 @@ class CostParams:  # host-side cost weights -- what you tune; build() -> the dev
         cw.effort = self.effort
         cw.smoothness = self.smoothness
         cw.infeasible = self.infeasible
+        cw.turn = self.turn
         return cw
 
 
@@ -167,12 +177,14 @@ def _sample_target_wheel_omega_kernel(
     wmin: float,
     wmax: float,
     n_wide: int,
+    n_straight: int,
     n_knots: int,
     seed: wp.array(dtype=int),
     target_wheel_omega: wp.array2d(dtype=wp.vec3),
 ):
     # one rollout per candidate: b = r. Candidate 0 keeps the nominal; the next n_wide draw from the
-    # WIDE global-search prior; the rest jitter around the nominal (NARROW local refine).
+    # WIDE global-search prior; the next n_straight from the STRAIGHT prior (wl == wr); the rest
+    # jitter around the nominal (NARROW local refine).
     t, r = wp.tid()
     n_cand = target_wheel_omega.shape[1]
     b = r
@@ -197,6 +209,18 @@ def _sample_target_wheel_omega_kernel(
         )
         wheel_l = (1.0 - frac) * left_lo + frac * left_hi
         wheel_r = (1.0 - frac) * right_lo + frac * right_hi
+    elif b < n_wide + n_straight:
+        # STRAIGHT prior: zero differential (wl == wr -> drives straight ahead). One common forward
+        # speed per knot (so it can ramp/decelerate along the horizon while staying straight). Straight
+        # is usually the near-optimal path, so seeding it explicitly lets the elite collapse onto a
+        # clean straight command instead of averaging noisy turns; when a turn is actually needed these
+        # cost more and simply don't win.
+        span = wmax - wmin
+        v_lo = wmin + span * wp.randf(wp.rand_init(seed[0] + 4321, b * n_knots + knot_lo))
+        v_hi = wmin + span * wp.randf(wp.rand_init(seed[0] + 4321, b * n_knots + knot_hi))
+        v = (1.0 - frac) * v_lo + frac * v_hi
+        wheel_l = v
+        wheel_r = v
     else:
         # NARROW (local refine): SPLINE bias around the nominal + per-step jitter (option A).
         # Knots keyed on (b, knot) -> shared across t -> a smooth committed maneuver. Recompute
@@ -263,6 +287,7 @@ def _cost_kernel(
         terminal_cost = goal_cost  # last iter (t = horizon) sticks -> terminal goal cost
     effort_sum = float(0.0)
     smooth_sum = float(0.0)
+    turn_sum = float(0.0)
     penalty_sum = float(0.0)
     prev_l = float(0.0)
     prev_r = float(0.0)
@@ -270,6 +295,8 @@ def _cost_kernel(
         wheels = target_wheel_omega[t, r]  # (wL, wR)
         sp2 = wheels[0] * wheels[0] + wheels[1] * wheels[1]
         effort_sum += sp2
+        diff = wheels[1] - wheels[0]  # turn differential -> penalize (prefer straight)
+        turn_sum += diff * diff
         if t > 0:
             dl = wheels[0] - prev_l
             dr = wheels[1] - prev_r
@@ -300,6 +327,7 @@ def _cost_kernel(
         + cw.out_of_bounds * oob_sum
         + cw.effort * effort_sum
         + cw.smoothness * smooth_sum
+        + cw.turn * turn_sum
         + penalty_sum * cw.infeasible
     )
 
@@ -421,6 +449,7 @@ class MppiGpu:
         self.n_bisect = _n_bisect(self.n_cand)  # CEM threshold bisection steps (scales with n_cand)
         self.sampling = sampling
         self.n_wide = int(sampling.wide_frac * self.n_cand)  # candidates drawn from the WIDE prior
+        self.n_straight = int(sampling.straight_frac * self.n_cand)  # candidates from the STRAIGHT prior
 
         # CEM elite count (over candidates)
         self.target_k = float(int(sampling.elite_frac * self.n_cand))
@@ -500,6 +529,7 @@ class MppiGpu:
                 self.sampling.wmin,
                 self.sampling.wmax,
                 self.n_wide,
+                self.n_straight,
                 self.sampling.n_knots,
                 self.seed,
             ],

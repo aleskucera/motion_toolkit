@@ -27,9 +27,10 @@ import numpy as np
 import warp as wp
 from helhest import dynamics
 from helhest import worlds as W
+from helhest.control.command import condition_command
 from helhest.control.mppi import CostParams
 from helhest.control.mppi import MppiGpu
-from helhest.control.terminal import dock_control
+from helhest.control.mppi import SamplingConfig
 from helhest.driver import WarpDriver
 from helhest.engine import ForwardSimulator
 from helhest.engine import GridParams
@@ -212,8 +213,10 @@ def run(
     shot=None,
     shot_frame=None,
     max_frames=2000,
+    rate=0.0,
 ):
     import glfw
+    import time
     from OpenGL import GL as gl
 
     wp.init()
@@ -240,11 +243,18 @@ def run(
 
     drv = WarpDriver(scene, mu, init_pose=tuple(start), device=device)  # reality
     win_grid = GridParams(ww, wh, cell, 0.0, 0.0)
+    # match the ROS node's planner config (elevation_node params): short horizon, wmax 8, and the
+    # straightness stack (turn penalty + peaky elite + straight prior).
     plan_sim = ForwardSimulator(
-        dynamics.robot_params(), dynamics.planning_solver(), win_grid, 4096, 70, device
+        dynamics.robot_params(), dynamics.planning_solver(), win_grid, 4096, 25, device
     )
     plan_sim.set_uniform_friction(0.8)
-    planner = MppiGpu(plan_sim, CostParams(), n_theta=24)
+    planner = MppiGpu(
+        plan_sim,
+        CostParams(goal_running=0.3, effort=2e-3, turn=0.03),
+        sampling=SamplingConfig(wmax=8.0, straight_frac=0.2, elite_frac=0.01),
+        n_theta=24,
+    )
     planner.reset_nominal(1.5)
     rww = rwh = int(round(max(route_m, win_m) / cell))
     kr = max(1, int(lat_coarsen))
@@ -263,6 +273,8 @@ def run(
     local = inpaint_map  # LOCAL map the MPPI plans on (rebuilt per frame from the current scan)
     rng = np.random.default_rng(0)
     drift_x = drift_y = drift_yaw = 0.0  # accumulated SE(2) global-map drift (m, m, rad)
+    prev_cmd = np.zeros(3, np.float32)  # last published [L, rear, R] for the slew limiter (node parity)
+    prev_plan_U = None  # last nominal plan for the consistency EMA (node plan_consistency)
     stepB = max(1, plan_sim.batch_size // max(1, fan_n))
     # feasibility limits for coloring the rollouts (same as the MPPI cost invalid term)
     CM, RT, T = 0.05, 1e-2, plan_sim.n_steps
@@ -314,6 +326,7 @@ def run(
         )
 
     f = 0
+    _t_frame = time.perf_counter()
     while not (glfw.window_should_close(win_l) or glfw.window_should_close(win_r)):
         glfw.poll_events()
         if any(
@@ -369,31 +382,43 @@ def run(
                 wp.array(np.ascontiguousarray(Hc), dtype=wp.float32, device=device), goal_r
             )
             planner.set_lattice(V, sgrid)
-            if dock_radius > 0.0 and d < dock_radius and not mode["manual"]:
-                cmd = dock_control(state_l, goal_l)
+            # ENDGAME = the ROS node's (no dock): always replan (so window 2 shows the fan), EMA the
+            # plan for consistency, then condition the command (output goal-brake + slew + clamp).
+            planner.replan(state_l, goal_l, 3)
+            U = planner.nominal()
+            if prev_plan_U is not None and prev_plan_U.shape == U.shape:  # plan_consistency 0.3
+                sh = np.roll(prev_plan_U, -1, axis=0)
+                sh[-1] = prev_plan_U[-1]
+                U = 0.7 * U + 0.3 * sh
+                planner.set_nominal(U)
+            prev_plan_U = U.copy()
+            der = planner.sim.derived.numpy()
+            clr, rsd = planner.sim.clearance.numpy(), planner.sim.residual.numpy()
+            pit, rol = der[:T, :, 1], der[:T, :, 2]
+            feas = ~(
+                (clr < CM) | (rsd > RT) | (np.abs(rol) > MAXR) | (-pit > MAXPU) | (pit > MAXPD)
+            ).any(
+                0
+            )  # per-rollout validity
+            elite = np.argsort(planner.J.numpy())[: max(8, int(0.01 * planner.n_cand))]
+            fan = dict(
+                ctr=planner.sim.controlled.numpy(),
+                z=der[..., 0],
+                feas=feas,
+                elite=elite,
+                wx0=wx0,
+                wy0=wy0,
+            )
+            # MANUAL: you drive (keyboard); AUTO: the node's conditioned command. Inside reach_radius
+            # (0.3 m) command a ramped stop; else the MPPI step 0 with the distance-scaled goal brake.
+            if mode["manual"]:
+                cmd = _commands(_press).astype(np.float32)
             else:
-                planner.replan(state_l, goal_l, 3)  # always plan, so window 2 shows the fan + plan
-                u = planner.nominal()
-                auto_cmd = np.array([u[0, 0], u[0, 1], 0.5 * (u[0, 0] + u[0, 1])], np.float32)
-                der = planner.sim.derived.numpy()
-                clr, rsd = planner.sim.clearance.numpy(), planner.sim.residual.numpy()
-                pit, rol = der[:T, :, 1], der[:T, :, 2]
-                feas = ~(
-                    (clr < CM) | (rsd > RT) | (np.abs(rol) > MAXR) | (-pit > MAXPU) | (pit > MAXPD)
-                ).any(
-                    0
-                )  # per-rollout validity
-                elite = np.argsort(planner.J.numpy())[: max(8, int(0.02 * planner.n_cand))]
-                fan = dict(
-                    ctr=planner.sim.controlled.numpy(),
-                    z=der[..., 0],
-                    feas=feas,
-                    elite=elite,
-                    wx0=wx0,
-                    wy0=wy0,
-                )
-                # MANUAL: you drive (keyboard, either window); AUTO: follow the MPPI nominal (cyan)
-                cmd = _commands(_press).astype(np.float32) if mode["manual"] else auto_cmd
+                wl_c, wr_c = (0.0, 0.0) if d < 0.3 else (float(U[0, 0]), float(U[0, 1]))
+                c = condition_command(wl_c, wr_c, prev_cmd, max_omega=8.0, max_slew=50.0,
+                                      dt=dynamics.DT, goal_dist=d, brake_dist=3.0)
+                prev_cmd = c
+                cmd = np.array([c[0], c[2], c[1]], np.float32)  # [L, rear, R] -> driver [wl, wr, rear]
             drv.step(cmd)
             Vmin = V.numpy().min(axis=2)
             cost_C = _cost_colors(Vmin, ctg._vcap, scene, rwx0, rwy0, rccell, rcny, rcnx)
@@ -478,6 +503,10 @@ def run(
         img_r = _grab(win_r) if img_l is not None else None
         glfw.swap_buffers(win_r)
 
+        if rate > 0.0:  # hold each frame to at least `rate` wall-seconds (0.1 ~ real-time; larger = slow-mo)
+            time.sleep(max(0.0, rate - (time.perf_counter() - _t_frame)))
+        _t_frame = time.perf_counter()
+
         f += 1
         if f >= max_frames or img_l is not None:
             if img_l is not None:
@@ -529,9 +558,17 @@ def main():
         default=None,
         help="capture --shot at this frame (default: at goal reach)",
     )
+    ap.add_argument(
+        "--rate",
+        type=float,
+        default=0.0,
+        help="wall-seconds to hold each frame: 0 = as fast as possible, 0.1 ~ real-time "
+        "(sim dt), 0.3 = ~3x slow-mo. Use it to actually SEE the motion.",
+    )
     args = ap.parse_args()
     run(
         world=args.world,
+        rate=args.rate,
         dock_radius=args.dock_radius,
         lat_coarsen=args.lat_coarsen,
         win_m=args.win_m,

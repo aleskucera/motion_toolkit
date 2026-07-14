@@ -44,12 +44,14 @@ from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Imu
+from sensor_msgs.msg import JointState
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs.msg import PointField
 from sensor_msgs_py.point_cloud2 import read_points_numpy
+from std_msgs.msg import Bool
 from std_msgs.msg import ColorRGBA
+from std_msgs.msg import Float32
 from visualization_msgs.msg import Marker
-from visualization_msgs.msg import MarkerArray
 from helhest.perception import DeviceMapAccumulator
 from helhest.perception import DynamicFilterConfig
 from helhest.perception import DynamicPointFilter
@@ -65,8 +67,13 @@ from helhest.perception import TerrainMap
 from helhest.perception import transform_points
 from helhest.perception.dynamic.frontier import frontier_from_organized
 from helhest import dynamics
+from helhest.control.command import condition_command
+from helhest.control.command import JOINT_NAMES
 from helhest.control.mppi import CostParams
 from helhest.control.mppi import MppiGpu
+from helhest.control.mppi import SamplingConfig
+from helhest.control.terminal import dock_control
+from helhest.control.turn_adapt import AdaptiveTurnBoost
 from helhest.engine import ForwardSimulator
 from helhest.engine import GridParams
 from helhest.planning.costtogo import CostToGo
@@ -143,9 +150,19 @@ _PLAN_BUILD = frozenset(
         "plan_n_theta",
         "plan_lat_coarsen",
         "plan_friction",
+        "terrain",
+        "k_turn",
         "plan_robust_margin_m",
         "plan_robust_margin_deg",
         "plan_nominal_reset",
+        "plan_goal_running",
+        "plan_effort",
+        "plan_turn",
+        "plan_wmax",
+        "plan_straight_frac",
+        "plan_elite_frac",
+        "plan_turn_boost_adapt",
+        "plan_turn_boost_tau",
         "device",
     }
 )
@@ -203,6 +220,13 @@ class ElevationNode(Node):
         self._map_T_odom: np.ndarray | None = None
         self._beam_dirs: np.ndarray | None = None  # per-beam unit dirs, built once for the frontier
         self.goal_xy: tuple[float, float] | None = None  # planning goal in map frame
+        self._prev_cmd = np.zeros(3, np.float32)  # last published /cmd_joints [L, rear, R] (slew ref)
+        self._d_hist: deque[float] = deque(maxlen=15)  # recent robot->goal distances (progress check)
+        self._prev_plan_U: np.ndarray | None = None  # last frame's nominal plan (for plan-consistency EMA)
+        self._turn_adapt: AdaptiveTurnBoost | None = None  # optional online turn_boost (gyro feedback)
+        self._last_diff_out: float | None = None  # last commanded (wR-wL), paired with the yaw it caused
+        self._goal_reached = False  # latched at the goal -> idle (no planning) until the goal changes
+        self._holding = False  # walled-off hold active -> planned-path marker drawn red
         self.planner: MppiGpu | None = None
         self.plan_sim: ForwardSimulator | None = None
         self.ctg: CostToGo | None = None
@@ -261,8 +285,10 @@ class ElevationNode(Node):
         self.pub_accum = self.create_publisher(PointCloud2, "accumulated_map", 1)
         self.pub_path = self.create_publisher(Path, "planned_path", 10)
         self.pub_path_marker = self.create_publisher(Marker, "planned_path_marker", 10)
-        self.pub_fan = self.create_publisher(MarkerArray, "mppi_fan", 10)
         self.pub_frame = self.create_publisher(Marker, "frame_marker", 1)
+        self.pub_cmd = self.create_publisher(JointState, self.get_parameter("cmd_topic").value, 10)
+        self.pub_holding = self.create_publisher(Bool, "plan_holding", 10)  # True = walled-off hold
+        self.pub_turn_boost = self.create_publisher(Float32, "turn_boost", 10)  # turn_boost in effect (debug)
         self.add_on_set_parameters_callback(self._on_parameters_changed)
 
         self.get_logger().info(
@@ -315,9 +341,11 @@ class ElevationNode(Node):
         d("outlier_search_radius_m", 0.25)
         d("outlier_min_neighbors", 6)
         d("outlier_std_mult", 1.0)  # reject beyond mean + this*std of the neighbor distance
-        # Heightmap (live-tunable)
-        d("resolution", 0.15)
-        d("win_m", 8.0)  # single-scan / MPPI window (robot-centered)
+        # Heightmap (live-tunable). resolution/win_m validated on real bags: the finer 0.08 m cell
+        # + 12 m fine window let the MPPI actually see berms across its plan (footprint violations
+        # 36%->8% vs the old 0.15/8) -- see the Tier-B planner analysis.
+        d("resolution", 0.08)
+        d("win_m", 12.0)  # single-scan / MPPI window (robot-centered)
         d("route_m", 16.0)  # accumulated / planning window (robot-centered)
         d("local_support", 2)  # min points/cell to trust the single scan
         d("local_max_gap_m", 0.4)  # trust the inpaint this far from a real return
@@ -445,20 +473,91 @@ class ElevationNode(Node):
         # MPPI planning (visualization only — no motor commands). Consumes the maps this node
         # already builds: elevation_local as the rollout terrain, elevation_global for the
         # cost-to-go routing field. Goal comes from RViz "2D Nav Goal" on goal_topic. Publishes
-        # the intended path (nav_msgs/Path) + the MPPI sample fan (MarkerArray).
+        # the intended path (nav_msgs/Path + a thick LINE_STRIP marker).
         d("plan_enable", True)
         d("goal_topic", "/goal_pose")
         d("plan_batch", 4096)  # MPPI rollouts B
-        d("plan_horizon", 70)  # rollout steps T (planning_solver dt = 0.1 s)
+        # rollout steps T (planning_solver dt = 0.1 s). SHORT is better here: the cost-to-go lattice
+        # does the global routing, so a short MPPI just follows it decisively -- sim-validated to reach
+        # more (6/6 vs 2/6 stress worlds), cruise ~30% faster, brake cleanly, fit the 12 m local map,
+        # and cost ~3.5x less than T=70. A long horizon instead defers braking into its (never-executed)
+        # tail and orbits the goal. Raise toward 40-70 only if far-field lookahead is genuinely needed.
+        d("plan_horizon", 25)
+        # PLAN CONSISTENCY: EMA the nominal plan toward last frame's (shifted one step) so the committed
+        # maneuver doesn't jitter on open ground. 0 = off; ~0.3 cut cruise churn ~35% in sim. Too high
+        # adds reaction lag to new obstacles/goals.
+        d("plan_consistency", 0.3)
         d("plan_n_theta", 24)  # cost-to-go heading bins
         d("plan_lat_coarsen", 4)  # routing/cost-to-go grid coarsening vs the map cell
         d("plan_n_refine", 3)  # MPPI refine iterations per frame
         d("plan_friction", 0.8)  # uniform rollout friction
-        d("plan_robust_margin_m", 0.0)  # cost-to-go safety tube: lateral (m)
+        # 'indoor' (K_TURN 0.4, alpha~1.33) or 'outdoor' (K_TURN 1.0, alpha~1.82 -- grass/dirt grips
+        # harder so it understeers). ICP-calibrated per environment; see dynamics.k_turn_for.
+        d("terrain", "outdoor")
+        d("k_turn", -1.0)  # explicit turn-gain override (e.g. from calibrate_turn.sh); <0 = use terrain
+        d("plan_robust_margin_m", 0.3)  # cost-to-go safety tube: lateral (m) ~ robot half-width;
+        # keeps the routed center a footprint-width off berms (validated in the Tier-C closed loop:
+        # 0 belly contacts). Tighten in narrow spaces -- it erodes the feasible set both sides.
         d("plan_robust_margin_deg", 0.0)  # cost-to-go safety tube: heading (deg)
         d("plan_nominal_reset", 1.5)  # nominal wheel speed the planner seeds from
-        d("plan_publish_fan", True)
-        d("plan_fan_stride", 64)  # draw every Nth rollout in the fan
+        # MPPI speed knobs (rebuild the planner on change): the robot drives slow because the cost
+        # balance prefers it. Raise goal_running (reward progress) and/or lower effort (penalty on
+        # wheel-speed^2) to drive faster. plan_max_omega is only the output SAFETY clamp, not speed.
+        d("plan_goal_running", 0.3)  # cost-to-go V^2 per step -> higher = faster (more progress pull)
+        d("plan_effort", 1e-3)  # penalize wheel-speed^2 -> lower = faster (less speed penalty)
+        # TURN penalty: cost on the wheel differential (wr - wl)^2 -> a real gradient toward STRAIGHT
+        # where the goal cost is flat w.r.t. heading (free-heading goal). Cut straight-line wander ~70%
+        # (0.42 -> 0.12 m) AND, by killing the near-goal wobble, reached 6/6 stress worlds vs 4/6.
+        # Small enough that a genuine need to turn still wins; >~0.1 starts refusing hard turns.
+        d("plan_turn", 0.03)
+        # HARD speed ceiling: the MPPI wheel-speed sampling box [0, plan_wmax] rad/s. The planner
+        # NEVER commands above this regardless of the cost -- raising goal_running does nothing once
+        # it saturates at plan_wmax. This is the real top-speed knob. Keep <= the motor safe max
+        # (plan_max_omega, the output clamp). ~1.4 m/s at 4.0; ~2.8 m/s at 8.0; ~3.5 m/s at 10.0 (r=0.35).
+        d("plan_wmax", 10.0)  # max per-wheel omega the planner may command [rad/s]
+        # STRAIGHT sampling prior: fraction of MPPI candidates drawn as zero-differential (straight
+        # ahead) drives. Straight is usually near-optimal, so seeding it lets the elite lock onto a
+        # clean straight command instead of averaging noisy micro-turns -> ~25% less lateral wander on
+        # a clear shot, no cost when a turn is actually needed. 0 = off.
+        d("plan_straight_frac", 0.2)
+        # CEM elite fraction: MPPI commits the MEAN of the top-k lowest-cost candidates. Because the
+        # goal heading is free, small turns near the goal barely change cost -> the elite fills with
+        # near-equal micro-turn candidates and their mean WOBBLES. A PEAKIER elite (smaller frac ->
+        # average fewer, better candidates) drives markedly straighter: 0.02 -> 0.01 cut lateral wander
+        # ~20%, 0.005 ~33%, with 0 contact regressions in sim (even fixed one stress world). Too small
+        # (<~0.003) starves the mean. Batch size barely helps by comparison.
+        d("plan_elite_frac", 0.01)
+        # ACTUATION (drive the robot). plan_actuate publishes wheel commands to a real robot; set
+        # it false to run planning as visualization only. All motor-safety conditioning (the
+        # left-wheel sign flip, rear-follower, magnitude clamp, slew limit) is in control/command.py.
+        d("plan_actuate", True)  # publish /cmd_joints wheel commands
+        d("cmd_topic", "/cmd_joints")  # JointState wheel-velocity command topic (to the LLC)
+        d("plan_max_omega", 10.0)  # hard cap on |wheel velocity| [rad/s] -- set to the motor safe max
+        d("plan_max_slew", 50.0)  # hard cap on |d(cmd)/dt| per wheel [rad/s^2]
+        # amplify the commanded turn differential to compensate the drivetrain (motors realize only
+        # ~half the commanded wheel-speed difference outdoors). 1.0 = off; ~2.0 recovers the loss.
+        # HOTFIX for a motor-control defect -- see docs/turn_differential_hotfix.md.
+        d("plan_turn_boost", 2.0)
+        # OPTIONAL: self-tune plan_turn_boost online from gyro feedback (control/turn_adapt.py) so the
+        # realized yaw matches the plan across terrains + the drivetrain defect -- makes the fixed
+        # plan_turn_boost adaptive. False = off (use the fixed value above). When on, plan_turn_boost
+        # is the initial guess; plan_turn_boost_tau is the EMA time constant [s] (slow, so it can't
+        # fight replanning). Only adapts while turning; clamps to [1, 3].
+        d("plan_turn_boost_adapt", False)
+        d("plan_turn_boost_tau", 3.0)
+        d("plan_dock_radius", 1.5)  # within this range of the goal: dock (if enabled) or just stop
+        d("plan_dock_enable", True)  # True = terminal dock; False = just STOP when within dock_radius
+        d("plan_reach_radius", 0.3)  # goal reached -> command a (ramped) stop within this range (m)
+        # GOAL BRAKE: scale MPPI's forward speed to 0 over the last brake_dist m so the forward-only
+        # robot noses in slow and settles AT the goal instead of overshooting/orbiting past it. Cruise
+        # speed is untouched beyond brake_dist. 0 = off. Replaces the hard dock/stop radius; validated
+        # in sim (~0.2 m settle, zero overshoot) -- see the goal-brake note in control/command.py.
+        d("plan_goal_brake_dist", 2.0)  # start braking within this range of the goal (m); 0 = off
+        # UNREACHABLE-GOAL STOP: when the cost-to-go at the robot is saturated (no route to the goal)
+        # AND the committed plan reduces distance-to-goal by less than this, the robot is walled off
+        # -> stop instead of the explore-fallback nosing into the obstacle. Keep it below a horizon's
+        # worth of forward progress so genuine exploration down an open corridor is NOT stopped.
+        d("plan_progress_min", 0.3)  # min plan progress toward the goal to keep driving when saturated (m)
         d("plan_path_width", 0.08)  # intended-path line marker width (m)
 
     def _cache_params(self) -> None:
@@ -530,15 +629,33 @@ class ElevationNode(Node):
         self.plan_enable: bool = g("plan_enable")
         self.plan_batch: int = g("plan_batch")
         self.plan_horizon: int = g("plan_horizon")
+        self.plan_consistency: float = g("plan_consistency")
         self.plan_n_theta: int = g("plan_n_theta")
         self.plan_lat_coarsen: int = g("plan_lat_coarsen")
         self.plan_n_refine: int = g("plan_n_refine")
         self.plan_friction: float = g("plan_friction")
+        self.terrain: str = g("terrain")
+        self.k_turn_override: float = g("k_turn")
         self.plan_robust_margin_m: float = g("plan_robust_margin_m")
         self.plan_robust_margin_deg: float = g("plan_robust_margin_deg")
         self.plan_nominal_reset: float = g("plan_nominal_reset")
-        self.plan_publish_fan: bool = g("plan_publish_fan")
-        self.plan_fan_stride: int = g("plan_fan_stride")
+        self.plan_goal_running: float = g("plan_goal_running")
+        self.plan_effort: float = g("plan_effort")
+        self.plan_turn: float = g("plan_turn")
+        self.plan_straight_frac: float = g("plan_straight_frac")
+        self.plan_elite_frac: float = g("plan_elite_frac")
+        self.plan_wmax: float = g("plan_wmax")
+        self.plan_actuate: bool = g("plan_actuate")
+        self.plan_max_omega: float = g("plan_max_omega")
+        self.plan_max_slew: float = g("plan_max_slew")
+        self.plan_turn_boost: float = g("plan_turn_boost")
+        self.plan_turn_boost_adapt: bool = g("plan_turn_boost_adapt")
+        self.plan_turn_boost_tau: float = g("plan_turn_boost_tau")
+        self.plan_dock_radius: float = g("plan_dock_radius")
+        self.plan_dock_enable: bool = g("plan_dock_enable")
+        self.plan_reach_radius: float = g("plan_reach_radius")
+        self.plan_goal_brake_dist: float = g("plan_goal_brake_dist")
+        self.plan_progress_min: float = g("plan_progress_min")
         self.plan_path_width: float = g("plan_path_width")
 
     @staticmethod
@@ -623,21 +740,52 @@ class ElevationNode(Node):
         kr = max(1, int(self.plan_lat_coarsen))
         rcny, rcnx, rccell = rwh // kr, rww // kr, cell * kr
         win_grid = GridParams(ww, wh, cell, 0.0, 0.0)
+        # terrain-dependent turn gain (outdoor grips harder -> understeers). See dynamics.k_turn_for.
+        # explicit k_turn param wins; else the terrain preset (indoor/outdoor)
+        if self.k_turn_override >= 0.0:
+            kt = self.k_turn_override
+            self.get_logger().info(f"planner K_TURN={kt} (k_turn param override)")
+        else:
+            kt = dynamics.k_turn_for(self.terrain)
+            self.get_logger().info(f"planner terrain='{self.terrain}' -> K_TURN={kt}")
         self.plan_sim = ForwardSimulator(
             dynamics.robot_params(),
-            dynamics.planning_solver(),
+            dynamics.planning_solver(k_turn=kt),
             win_grid,
             int(self.plan_batch),
             int(self.plan_horizon),
             self.device,
         )
         self.plan_sim.set_uniform_friction(self.plan_friction)
-        self.planner = MppiGpu(self.plan_sim, CostParams(), n_theta=int(self.plan_n_theta))
+        self.planner = MppiGpu(
+            self.plan_sim,
+            CostParams(goal_running=self.plan_goal_running, effort=self.plan_effort, turn=self.plan_turn),
+            sampling=SamplingConfig(wmax=self.plan_wmax, straight_frac=self.plan_straight_frac,
+                                    elite_frac=self.plan_elite_frac),
+            n_theta=int(self.plan_n_theta),
+        )
         self.planner.reset_nominal(self.plan_nominal_reset)
+        # optional online turn_boost from gyro feedback: alpha = 1 + k_turn*mu matches the plan model.
+        if self.plan_turn_boost_adapt:
+            rp = dynamics.robot_params()
+            self._turn_adapt = AdaptiveTurnBoost(
+                alpha_model=1.0 + kt * self.plan_friction,
+                wheel_radius=rp.wheel_radius,
+                half_track=rp.half_track,
+                dt=dynamics.DT,
+                tau_s=self.plan_turn_boost_tau,
+                init=self.plan_turn_boost,
+            )
+            self.get_logger().info(
+                f"adaptive turn_boost ON (alpha_model={1.0 + kt * self.plan_friction:.2f}, "
+                f"tau={self.plan_turn_boost_tau}s, init={self.plan_turn_boost})"
+            )
+        else:
+            self._turn_adapt = None
         self.ctg = CostToGo(
             GridParams(rcnx, rcny, rccell, 0.0, 0.0),
             dynamics.robot_params(),
-            dynamics.planning_solver(),
+            dynamics.planning_solver(k_turn=kt),  # static settle ignores k_turn; passed for consistency
             n_theta=int(self.plan_n_theta),
             robust_margin_m=self.plan_robust_margin_m,
             robust_margin_deg=self.plan_robust_margin_deg,
@@ -661,6 +809,9 @@ class ElevationNode(Node):
                 "set the RViz Fixed Frame to the map frame."
             )
         self.goal_xy = (msg.pose.position.x, msg.pose.position.y)
+        self._d_hist.clear()  # fresh progress history for the new goal
+        self._prev_plan_U = None  # new goal -> don't smooth against the old goal's plan
+        self._goal_reached = False  # new goal -> resume planning
         self.get_logger().info(f"goal set: ({self.goal_xy[0]:.2f}, {self.goal_xy[1]:.2f})")
 
     def _on_parameters_changed(self, params) -> SetParametersResult:
@@ -866,10 +1017,11 @@ class ElevationNode(Node):
         self._ck("build_maps")
         if mf is not None:
             self._publish_maps(mf, cloud_msg.header.stamp)
+            self._ck("publish_maps")
             if self.plan_enable and self.goal_xy is not None and self.planner is not None:
                 self._plan(mf, world_T_base, cloud_msg.header.stamp)
         self._cache_map_correction(world_T_base, odom_msg)
-        self._ck("publish+plan+tf")
+        self._ck("cache_tf")
         if self.profile_stages:
             self._prof_n += 1
             if self._prof_n % 30 == 0:
@@ -1072,7 +1224,7 @@ class ElevationNode(Node):
     # ------------------------------------------------------------------
 
     def _plan(self, mf: _MapFrame, world_T_base: np.ndarray, stamp) -> None:
-        """Run MPPI toward the goal on this frame's maps; publish the intended path + fan.
+        """Run MPPI toward the goal on this frame's maps; publish the intended path.
 
         Terrain = the single-scan elevation_local; the routing cost-to-go is solved on the
         accumulated elevation_global. Visualization only — no motor commands are emitted.
@@ -1085,10 +1237,30 @@ class ElevationNode(Node):
         state_l = np.array([mf.ex - mf.lxmin, mf.ey - mf.lymin, eyaw], np.float32)
         goal_l = (gx - mf.lxmin, gy - mf.lymin)
         goal_r = (gx - mf.rxmin, gy - mf.rymin)
+
+        # --- goal reached: announce once, then IDLE (skip cost-to-go + MPPI) until the goal changes.
+        # Keep publishing a (ramped) stop each frame so the LLC stays fed at rest. Resumes on a new goal.
+        d_goal = float(np.hypot(gx - mf.ex, gy - mf.ey))
+        if not self._goal_reached and d_goal < self.plan_reach_radius:
+            self._goal_reached = True
+            self.get_logger().info(
+                f"REACHED goal (d={d_goal:.2f} m) -- stopping; idle until a new goal is set."
+            )
+        if self._goal_reached:
+            if self.plan_actuate:
+                cmd = condition_command(
+                    0.0, 0.0, self._prev_cmd, max_omega=self.plan_max_omega,
+                    max_slew=self.plan_max_slew, dt=dynamics.DT, turn_boost=self.plan_turn_boost,
+                )
+                self._prev_cmd = cmd
+                self._publish_cmd(cmd)
+                self.pub_holding.publish(Bool(data=False))
+            return
         with wp.ScopedDevice(self.device):
             self.plan_sim.set_terrain(
                 wp.array(np.ascontiguousarray(mf.elev_local), dtype=wp.float32, device=self.device)
             )
+            self._ck("plan:set_terrain")
             relev = mf.relev_mem  # (rwh, rww), blind cells = 0
             if kr > 1:
                 Hc = relev[: rcny * kr, : rcnx * kr].reshape(rcny, kr, rcnx, kr).max(axis=(1, 3))
@@ -1097,14 +1269,98 @@ class ElevationNode(Node):
             V = self.ctg.compute(
                 wp.array(np.ascontiguousarray(Hc), dtype=wp.float32, device=self.device), goal_r
             )
+            self._ck("plan:ctg")
             self.planner.set_lattice(V, self.sgrid)
             self.planner.replan(state_l, goal_l, int(self.plan_n_refine))
+            self._ck("plan:replan")
+        # PLAN CONSISTENCY: EMA the nominal toward last frame's plan, shifted one step forward (the
+        # receding horizon) so the committed maneuver is stable frame-to-frame instead of jittering on
+        # open ground. Feeds the next replan's warm-start too. plan_consistency = 0 disables it.
+        if self.plan_consistency > 0.0:
+            U = self.planner.nominal()
+            if self._prev_plan_U is not None and self._prev_plan_U.shape == U.shape:
+                shifted = np.roll(self._prev_plan_U, -1, axis=0)
+                shifted[-1] = self._prev_plan_U[-1]
+                U = (1.0 - self.plan_consistency) * U + self.plan_consistency * shifted
+                self.planner.set_nominal(U)
+            self._prev_plan_U = U.copy()
         # candidate 0 is the committed nominal rollout; window-local -> map coords.
         ctrl = self.planner.sim.controlled.numpy()  # [T+1, B, 3] = (x, y, yaw)
+        self._ck("plan:readback")
         origin = np.array([mf.lxmin, mf.lymin], np.float32)
         self._publish_path(ctrl[:, 0, :2] + origin, ez, stamp)
-        if self.plan_publish_fan:
-            self._publish_fan(ctrl, origin, ez, stamp)
+        self._ck("plan:pub_path")
+
+        # --- ACTUATION: turn the plan into a conditioned /cmd_joints command (default OFF) ---
+        if not self.plan_actuate:
+            return
+        d = float(np.hypot(gx - mf.ex, gy - mf.ey))  # robot -> goal distance
+        self._d_hist.append(d)
+        holding = False  # walled-off hold this frame -> published on /plan_holding
+        if d < self.plan_reach_radius:
+            wl, wr = 0.0, 0.0  # reached -> stop (the slew limiter ramps the command down)
+        elif self.plan_dock_enable and d < self.plan_dock_radius:
+            u = dock_control(state_l, goal_l, wmax=self.plan_max_omega)  # terminal dock
+            wl, wr = float(u[0]), float(u[1])
+        else:
+            # MPPI drives; the goal brake (in condition_command) bleeds off speed on the final
+            # approach so it settles instead of orbiting. With the dock disabled this branch covers
+            # the whole reach_radius..inf band -- the continuous brake replaces the hard stop-radius.
+            u0 = self.planner.nominal()[0]  # first committed step (wL, wR), model convention
+            wl, wr = float(u0[0]), float(u0[1])
+            # UNREACHABLE-GOAL STOP: the robot sits at the routing-window CENTER, so the cost-to-go
+            # there is V at the robot. If it is SATURATED (no route to the goal) AND the committed
+            # plan reduces distance-to-goal by less than plan_progress_min, the robot is walled off
+            # -> stop, instead of the explore-fallback nosing straight into the obstacle. (While the
+            # corridor ahead is still open the plan DOES make progress, so this does not fire.)
+            v_robot = float(self.ctg.V.numpy()[rcny // 2, rcnx // 2].min())
+            saturated = v_robot >= 0.9 * self.ctg._vcap
+            # actual progress over the recent window (plan shape is an unreliable signal -- the blind
+            # far horizon stretches toward the goal even when the near path is walled; measure whether
+            # the robot is really getting closer). Full window + < plan_progress_min gained = stuck.
+            stuck = (
+                len(self._d_hist) >= self._d_hist.maxlen
+                and self._d_hist[0] - d < self.plan_progress_min
+            )
+            if saturated and stuck:
+                wl, wr = 0.0, 0.0  # walled off + no real progress -> hold
+                holding = True
+                self.get_logger().warn(
+                    f"goal unreachable (walled off, no progress in {self._d_hist.maxlen} frames) "
+                    f"-> holding [d={d:.1f}]", throttle_duration_sec=2.0
+                )
+        # rear-follower + goal brake + turn boost + magnitude clamp + slew limit, all in control/command.py
+        turn_boost = self._turn_adapt.turn_boost if self._turn_adapt is not None else self.plan_turn_boost
+        cmd = condition_command(
+            wl, wr, self._prev_cmd,
+            max_omega=self.plan_max_omega, max_slew=self.plan_max_slew, dt=dynamics.DT,
+            turn_boost=turn_boost,
+            goal_dist=d, brake_dist=self.plan_goal_brake_dist,
+        )
+        self._prev_cmd = cmd
+        self._publish_cmd(cmd)
+        self.pub_holding.publish(Bool(data=holding))  # True = walled-off hold, False = driving
+        self._holding = holding  # colors the planned-path marker red next frame (see _publish_path)
+        self.pub_turn_boost.publish(Float32(data=float(turn_boost)))  # turn_boost in effect (debug/monitor)
+        # ADAPTIVE turn_boost (optional): pair the PREVIOUS command's differential with the yaw it
+        # produced (this frame's gyro) and slow-update the boost -- only while genuinely turning.
+        if self._turn_adapt is not None and self._imu_buffer:
+            if self._last_diff_out is not None:
+                self._turn_adapt.update(self._last_diff_out, float(self._imu_buffer[-1][2][2]))
+            self._last_diff_out = float(cmd[2] - cmd[0])  # condition_command [L, rear, R] -> (wR - wL)
+
+    def _publish_cmd(self, cmd: np.ndarray) -> None:
+        """Publish the conditioned [left, rear, right] wheel velocities to /cmd_joints.
+
+        Stamped with the current clock (not the sensor stamp) so an LLC deadman sees a fresh
+        command. VELOCITY ONLY: position/effort are left empty. Filling them with inf breaks
+        serialization across the micro-ROS/XRCE bridge, so the LLC never receives the command
+        (found live on the robot 2026-07-10)."""
+        m = JointState()
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.name = list(JOINT_NAMES)
+        m.velocity = [float(v) for v in cmd]
+        self.pub_cmd.publish(m)
 
     def _publish_path(self, xy: np.ndarray, z: float, stamp) -> None:
         path = Path()
@@ -1127,30 +1383,15 @@ class ElevationNode(Node):
         m.type = Marker.LINE_STRIP
         m.action = Marker.ADD
         m.scale.x = float(self.plan_path_width)
-        m.color = ColorRGBA(r=0.1, g=1.0, b=0.2, a=1.0)
+        # Magenta while driving; RED when the planner is HOLDING (goal walled off, no viable path)
+        # -- the path shown is the rejected explore-fallback, so red flags "not being driven".
+        if self._holding:
+            m.color = ColorRGBA(r=1.0, g=0.1, b=0.1, a=1.0)
+        else:
+            m.color = ColorRGBA(r=1.0, g=0.0, b=1.0, a=1.0)  # magenta: reads over the green height map
         m.pose.orientation.w = 1.0
         m.points = [Point(x=float(x), y=float(y), z=z) for x, y in xy]
         self.pub_path_marker.publish(m)
-
-    def _publish_fan(self, ctrl: np.ndarray, origin: np.ndarray, z: float, stamp) -> None:
-        """A subsample of the MPPI rollouts as one faint LINE_LIST marker (the "fan")."""
-        stride = max(1, int(self.plan_fan_stride))
-        m = Marker()
-        m.header.stamp = stamp
-        m.header.frame_id = self.map_frame
-        m.ns = "mppi_fan"
-        m.id = 0
-        m.type = Marker.LINE_LIST
-        m.action = Marker.ADD
-        m.scale.x = 0.02  # line width (m)
-        m.color = ColorRGBA(r=0.2, g=0.7, b=1.0, a=0.35)
-        m.pose.orientation.w = 1.0
-        for b in range(0, ctrl.shape[1], stride):
-            xy = ctrl[:, b, :2] + origin
-            for k in range(len(xy) - 1):
-                m.points.append(Point(x=float(xy[k, 0]), y=float(xy[k, 1]), z=z))
-                m.points.append(Point(x=float(xy[k + 1, 0]), y=float(xy[k + 1, 1]), z=z))
-        self.pub_fan.publish(MarkerArray(markers=[m]))
 
     # ------------------------------------------------------------------
     # IMU gravity vector -> up-in-base
