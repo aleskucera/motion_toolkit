@@ -513,8 +513,11 @@ class ElevationNode(Node):
         # HARD speed ceiling: the MPPI wheel-speed sampling box [0, plan_wmax] rad/s. The planner
         # NEVER commands above this regardless of the cost -- raising goal_running does nothing once
         # it saturates at plan_wmax. This is the real top-speed knob. Keep <= the motor safe max
-        # (plan_max_omega, the output clamp). ~1.4 m/s at 4.0; ~2.8 m/s at 8.0; ~3.5 m/s at 10.0 (r=0.35).
-        d("plan_wmax", 10.0)  # max per-wheel omega the planner may command [rad/s]
+        # (plan_max_omega, the output clamp). ~1.4 m/s at 4.0; ~1.75 m/s at 5.0 (r=0.35).
+        # NOTE (2026-07-12): with the /cmd_joints unit fix in _publish_cmd active, plan_wmax now maps
+        # to the REAL wheel speed. Bags showed the wheels only reach ~4.5-5.3 rad/s, so 5.0 is the
+        # demonstrated ceiling -- higher just re-saturates the motor and kills the turn differential.
+        d("plan_wmax", 5.0)  # max per-wheel omega the planner may command [rad/s]
         # STRAIGHT sampling prior: fraction of MPPI candidates drawn as zero-differential (straight
         # ahead) drives. Straight is usually near-optimal, so seeding it lets the elite lock onto a
         # clean straight command instead of averaging noisy micro-turns -> ~25% less lateral wander on
@@ -532,7 +535,7 @@ class ElevationNode(Node):
         # left-wheel sign flip, rear-follower, magnitude clamp, slew limit) is in control/command.py.
         d("plan_actuate", True)  # publish /cmd_joints wheel commands
         d("cmd_topic", "/cmd_joints")  # JointState wheel-velocity command topic (to the LLC)
-        d("plan_max_omega", 10.0)  # hard cap on |wheel velocity| [rad/s] -- set to the motor safe max
+        d("plan_max_omega", 5.0)  # hard cap on |wheel velocity| [rad/s] -- the motor safe max (~5, see plan_wmax)
         d("plan_max_slew", 50.0)  # hard cap on |d(cmd)/dt| per wheel [rad/s^2]
         # amplify the commanded turn differential to compensate the drivetrain (motors realize only
         # ~half the commanded wheel-speed difference outdoors). 1.0 = off; ~2.0 recovers the loss.
@@ -1350,12 +1353,23 @@ class ElevationNode(Node):
             self._last_diff_out = float(cmd[2] - cmd[0])  # condition_command [L, rear, R] -> (wR - wL)
 
     def _publish_cmd(self, cmd: np.ndarray) -> None:
-        """Publish the conditioned [left, rear, right] wheel velocities to /cmd_joints.
+        """Publish the conditioned [left, rear, right] wheel command to /cmd_joints.
+
+        `cmd` is in WHEEL rad/s (the planner/model convention). The LLC, however, consumes
+        /cmd_joints as MOTOR rev/s and internally does wheel_rad/s = cmd * 2*pi / 22.5 -- so it
+        under-drives everything by 22.5/(2*pi) ~= 3.58x. Until the LLC is fixed we compensate here by
+        converting wheel rad/s -> motor rev/s on the way out (see the TEMPORARY block below).
 
         Stamped with the current clock (not the sensor stamp) so an LLC deadman sees a fresh
         command. VELOCITY ONLY: position/effort are left empty. Filling them with inf breaks
         serialization across the micro-ROS/XRCE bridge, so the LLC never receives the command
         (found live on the robot 2026-07-10)."""
+        # ===== TEMPORARY: /cmd_joints unit compensation -- REMOVE when the LLC is fixed =====
+        # The LLC misreads /cmd_joints as motor rev/s. Convert our wheel rad/s to motor rev/s so the
+        # realized wheel speed matches intent: motor_rps = wheel_rad_s * gearbox / (2*pi), gearbox=22.5.
+        # When the LLC is changed to accept wheel rad/s, delete this line (publish `cmd` directly).
+        cmd = cmd * (22.5 / (2.0 * np.pi))
+        # ===================================================================================
         m = JointState()
         m.header.stamp = self.get_clock().now().to_msg()
         m.name = list(JOINT_NAMES)
