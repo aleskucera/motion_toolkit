@@ -104,8 +104,10 @@ class EKF6D:
     The prediction is driven by the Helhest kinematic forward model, whose nonlinear
     output f(q, u) and linearised transition F = ∂f/∂q are supplied by the caller (see
     helhest.filtering.jacobian.predict_q6d / jacobian_F_6d) — the EKF never calls the
-    model itself. The only measurement is a LiDAR ICP pose [x, y, ψ], observed through
-    H = [I₃ | 0₃] (position states measured, velocity states not).
+    model itself. Two measurement sources are supported, both observing [x, y, ψ] through
+    H = [I₃ | 0₃] (position/heading measured, velocity states not):
+        update_icp      — LiDAR ICP pose (stored R_icp)
+        update_odom_imu — wheel odometry (x, y) + IMU heading (ψ); uses stored R_odom
     """
 
     # Position states are observed, velocity states are not: z = H q with H = [I₃ | 0₃].
@@ -117,17 +119,20 @@ class EKF6D:
         P0: np.ndarray,
         Q: np.ndarray,
         R_icp: np.ndarray,
+        R_odom: np.ndarray,
     ) -> None:
         """
         x0     : [6]    initial state  [x, y, ψ, ẋ, ẏ, ψ̇]
         P0     : [6,6]  initial state covariance
         Q      : [6,6]  process noise covariance
         R_icp  : [3,3]  ICP measurement noise covariance (on [x, y, ψ])
+        R_odom : [3,3]  odom+IMU measurement noise covariance (on [x, y, ψ])
         """
         self.x: np.ndarray = x0.copy()
         self.P: np.ndarray = P0.copy()
         self.Q: np.ndarray = Q.copy()
         self.R_icp: np.ndarray = R_icp.copy()
+        self.R_odom: np.ndarray = R_odom.copy()
 
     def predict(self, F: np.ndarray, x_pred: np.ndarray) -> None:
         """Propagate the filter by one timestep.
@@ -142,6 +147,20 @@ class EKF6D:
         """Measurement update from a LiDAR ICP pose.
 
         z : [3]  observed pose  [x, y, ψ]  in world frame [m, m, rad]
+        """
+        self._update(z, self.R_icp)
+
+    def update_odom_imu(self, z: np.ndarray) -> None:
+        """Measurement update from wheel odometry (x, y) + IMU heading (ψ).
+
+        z : [3]  observed pose  [x, y, ψ]  from dead-reckoning [m, m, rad]
+            z[0:2] comes from integrated wheel-encoder translation
+            z[2]   comes from gyro / IMU heading integration
+        """
+        self._update(z, self.R_odom)
+
+    def _update(self, z: np.ndarray, R: np.ndarray) -> None:
+        """Shared EKF update for both [x, y, ψ] sensors (H = [I₃ | 0₃]).
 
         S = H P⁻ Hᵀ + R
         K = P⁻ Hᵀ S⁻¹
@@ -150,7 +169,7 @@ class EKF6D:
         P = (I₆ − K H) P⁻
         """
         H = self.H
-        S = H @ self.P @ H.T + self.R_icp
+        S = H @ self.P @ H.T + R
         # K = P Hᵀ S⁻¹; solve(S, (P Hᵀ)ᵀ)ᵀ avoids explicit inversion (S symmetric).
         K = np.linalg.solve(S, (self.P @ H.T).T).T
 

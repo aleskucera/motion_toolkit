@@ -50,13 +50,15 @@ mat_to_se2 = pipeline_sim.mat_to_se2
 #        (the sim re-derives velocity from u each step).
 # R   — ICP measurement noise on [x, y, ψ].
 
-_SIG_P0 = np.array([0.10, 0.10, np.deg2rad(2.0), 0.30, 0.30, 0.20])   # [m, m, rad, m/s, m/s, rad/s]
-_SIG_Q  = np.array([0.02, 0.02, np.deg2rad(0.5), 0.15, 0.15, 0.10])   # [m, m, rad, m/s, m/s, rad/s]
-_SIG_R  = np.array([0.05, 0.05, np.deg2rad(1.0)])                       # [m, m, rad]
+_SIG_P0   = np.array([0.10, 0.10, np.deg2rad(2.0), 0.30, 0.30, 0.20])  # [m, m, rad, m/s, m/s, rad/s]
+_SIG_Q    = np.array([0.02, 0.02, np.deg2rad(0.5), 0.15, 0.15, 0.10])  # [m, m, rad, m/s, m/s, rad/s]
+_SIG_R    = np.array([0.05, 0.05, np.deg2rad(1.0)])                      # [m, m, rad]
+_SIG_ODOM = np.array([0.10, 0.10, np.deg2rad(3.0)])                      # [m, m, rad]
 
-P0 = np.diag(_SIG_P0 ** 2)   # [6×6]  initial state covariance
-Q  = np.diag(_SIG_Q  ** 2)   # [6×6]  process-noise covariance   (baseline)
-R  = np.diag(_SIG_R  ** 2)   # [3×3]  ICP measurement-noise covariance (baseline)
+P0     = np.diag(_SIG_P0   ** 2)  # [6×6]  initial state covariance
+Q      = np.diag(_SIG_Q    ** 2)  # [6×6]  process-noise covariance   (baseline)
+R_ICP      = np.diag(_SIG_R    ** 2)  # [3×3]  ICP measurement-noise covariance (baseline)
+R_ODOM = np.diag(_SIG_ODOM ** 2)  # [3×3]  odom+IMU measurement-noise covariance
 # ---------------------------------------------------------------------------
 
 
@@ -207,7 +209,7 @@ def run_closed_loop_ekf(
             # First frame: bootstrap from ground truth.
             localizer.bootstrap(T_true, T_true)
             if use_ekf:
-                ekf = EKF6D(np.array([st.x, st.y, st.yaw, 0.0, 0.0, 0.0]), P0, Q_mat, R_mat)
+                ekf = EKF6D(np.array([st.x, st.y, st.yaw, 0.0, 0.0, 0.0]), P0, Q_mat, R_mat, R_ODOM)
             T_wb = T_true
         elif use_ekf:
             u = prev_cmd.astype(np.float64)

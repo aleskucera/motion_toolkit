@@ -7,13 +7,17 @@ with an Extended Kalman Filter over the 6-DOF Helhest state q = [x, y, ψ, ẋ, 
   PREDICT   x_pred = f(q, u)            — the ForwardSimulator kinematic model (predict_q6d)
             F = ∂f/∂q                    — the numerical 6×6 Jacobian (jacobian_F_6d)
             P⁻ = F P Fᵀ + Q
-  MEASURE   z = ICP pose [x, y, ψ]       — LiDAR is the only sensor (no odom, no IMU)
-            H = [I₃ | 0₃]
-            standard EKF update, ψ-wrapped innovation
+  MEASURE 1 z = ICP pose [x, y, ψ]       — LiDAR scan-to-map ICP (when outcome == "ok")
+            H = [I₃ | 0₃],  R_icp
+  MEASURE 2 z = odom pose [x, y, ψ]      — wheel encoder (xy) + gyro (ψ), every frame
+            H = [I₃ | 0₃],  R_ODOM       (same observation model, higher noise)
+
+Both sensors observe position/heading only; velocity states [ẋ, ẏ, ψ̇] are not directly
+measured and are driven by the kinematic predict step. The odom measurement is always
+applied (even when ICP is rejected), providing a fallback during degenerate scans.
 
 The control input u fed to PREDICT is the wheel-speed command the planner applied on the
-previous frame. ICP is seeded by the EKF's own predicted pose (replacing the odom prior),
-and a rejected/sparse ICP outcome is simply a missing measurement → predict-only step.
+previous frame. ICP is seeded by the EKF's own predicted pose (replacing the odom prior).
 
 Everything downstream of localization (mapping, cost-to-go, MPPI, drive) is unchanged and
 runs on the EKF-fused estimate. Reused verbatim from pipeline_sim: the worlds, the synthetic
@@ -65,13 +69,15 @@ _RED = ListedColormap(["#ff2020"])
 # R   — ICP measurement noise on [x, y, ψ].
 
 # sigma (std-dev) values used to build the diagonal matrices
-_SIG_P0 = np.array([0.10, 0.10, np.deg2rad(2.0), 0.30, 0.30, 0.20])   # [m, m, rad, m/s, m/s, rad/s]
-_SIG_Q  = np.array([0.02, 0.02, np.deg2rad(0.5), 0.15, 0.15, 0.10])   # [m, m, rad, m/s, m/s, rad/s]
-_SIG_R  = np.array([0.05, 0.05, np.deg2rad(1.0)])                       # [m, m, rad]
+_SIG_P0   = np.array([0.10, 0.10, np.deg2rad(2.0), 0.30, 0.30, 0.20])  # [m, m, rad, m/s, m/s, rad/s]
+_SIG_Q    = np.array([0.02, 0.02, np.deg2rad(0.5), 0.15, 0.15, 0.10])  # [m, m, rad, m/s, m/s, rad/s]
+_SIG_R_ICP    = np.array([0.05, 0.05, np.deg2rad(1.0)])                      # [m, m, rad]
+_SIG_R_ODOM = np.array([0.30, 0.30, np.deg2rad(10.0)])                      # [m, m, rad]
 
-P0 = np.diag(_SIG_P0 ** 2)   # [6×6]  initial state covariance
-Q  = np.diag(_SIG_Q  ** 2)   # [6×6]  process-noise covariance
-R  = np.diag(_SIG_R  ** 2)   # [3×3]  ICP measurement-noise covariance
+P0     = np.diag(_SIG_P0   ** 2)  # [6×6]  initial state covariance
+Q      = np.diag(_SIG_Q    ** 2)  # [6×6]  process-noise covariance
+R_ICP      = np.diag(_SIG_R_ICP    ** 2)  # [3×3]  ICP measurement-noise covariance
+R_ODOM = np.diag(_SIG_R_ODOM ** 2)  # [3×3]  odom+IMU measurement-noise covariance
 # ---------------------------------------------------------------------------
 
 def _wrap(a: float) -> float:
@@ -129,11 +135,13 @@ def run_closed_loop_ekf(
     frame_hook=None,
     dynamic: bool = False,
 ) -> dict:
-    """Closed loop driven on an EKF-fused pose estimate (LiDAR ICP the only sensor).
+    """Closed loop driven on an EKF-fused pose estimate (LiDAR ICP + odom+IMU).
 
-    Mirrors pipeline_sim.run_closed_loop stage-for-stage; only the localization estimate
-    is different: EKF predict (model + numerical Jacobian on the previous wheel command)
-    followed by an ICP measurement update.
+    Mirrors pipeline_sim.run_closed_loop stage-for-stage; the localization estimate
+    uses a three-step EKF per frame:
+      1. predict  — kinematic model f(q, u) + Jacobian F
+      2. update   — LiDAR ICP pose [x, y, ψ] (skipped when ICP is rejected)
+      3. update   — odom+IMU dead-reckoned pose [x, y, ψ] (applied every frame)
     """
     from helhest import dynamics
     from helhest import worlds as W
@@ -178,7 +186,7 @@ def run_closed_loop_ekf(
 
     # EKF process-model sims (flat ground) + filter noise model (module-level defaults).
     sim_pred, sim_jac = _build_flat_sims(scene, device)
-    R_icp = R
+    R_icp = R_ICP
     ekf: EKF6D | None = None
 
     ww = wh = int(round(win_m / cell))
@@ -200,6 +208,10 @@ def run_closed_loop_ekf(
     map_wp: wp.array | None = None
     # commanded wheel speeds [ω_L, ω_R, ω_rear] applied last frame — the EKF predict input.
     prev_cmd = np.zeros(3, np.float32)
+    # odom+IMU dead-reckoning state (absolute SE2 4×4, None until bootstrapped on frame 0).
+    T_odom: np.ndarray | None = None
+    T_true_prev: np.ndarray | None = None
+    odom_rng = np.random.default_rng(seed + 42)
     true_tr, est_tr, icp_tr = [], [], []
     err_fused, err_icp = [], []
     err_fused_rot, err_icp_rot = [], []   # heading errors [rad], wrapped to (−π, π]
@@ -224,12 +236,13 @@ def run_closed_loop_ekf(
             blo, bhi, walker = box_lo, box_hi, None
         scan_base, free_wp = pipeline_sim._scan_base(lidar, st.x, st.y, st.yaw, blo, bhi, f + 1, device)
 
-        # --- EKF localization (predict via model+Jacobian, update via ICP) ---
+        # --- EKF localization (predict via model+Jacobian, update via ICP+odom) ---
         z_icp = None
+        z_odom = None
         innovation = None
         if ekf is None:
             localizer.bootstrap(T_true, T_true)
-            ekf = EKF6D(np.array([st.x, st.y, st.yaw, 0.0, 0.0, 0.0]), P0, Q, R_icp)
+            ekf = EKF6D(np.array([st.x, st.y, st.yaw, 0.0, 0.0, 0.0]), P0, Q, R_icp, R_ODOM)
             x_pred = ekf.x.copy()
             T_wb = T_true
             icp_status = "bootstrap"
@@ -237,6 +250,9 @@ def run_closed_loop_ekf(
             # bootstrap: no predict step; P⁻ and P⁺ are both the initial covariance
             p_minus_diag = ekf.P.diagonal().copy()
             p_plus_diag = ekf.P.diagonal().copy()
+            # seed odom dead-reckoning from ground truth (same as EKF)
+            T_odom = T_true.copy()
+            T_true_prev = T_true.copy()
         else:
             u = prev_cmd.astype(np.float64)
             x_pred = predict_q6d(ekf.x, u, sim_pred)
@@ -254,7 +270,23 @@ def run_closed_loop_ekf(
                 z_icp = np.array([zx, zy, zpsi])
                 innovation = np.array([zx - ekf.x[0], zy - ekf.x[1], _wrap(zpsi - ekf.x[2])])
                 ekf.update_icp(z_icp)
-            p_plus_diag = ekf.P.diagonal().copy()   # P⁺: after update (== P⁻ if no measurement)
+
+            # --- step 3: odom+IMU measurement update ---
+            # Advance the odom dead-reckoning by one step with noise applied to the true delta.
+            D_true = invert_pose(T_true_prev) @ T_true
+            T_odom = T_odom @ pipeline_sim.odom_step(
+                D_true, dt, odom_rng,
+                source="gyro",
+                trans_noise=0.05, yaw_bias=0.0,
+                gyro_bias=np.deg2rad(0.3) * dt, gyro_noise=0.001,
+                wheel_scale=0.01,
+            )
+            T_true_prev = T_true.copy()
+            zo_x, zo_y, zo_psi = mat_to_se2(T_odom)
+            z_odom = np.array([zo_x, zo_y, zo_psi])
+            ekf.update_odom_imu(z_odom)
+
+            p_plus_diag = ekf.P.diagonal().copy()   # P⁺: after both updates
             T_wb = se2_to_mat(ekf.x[0], ekf.x[1], ekf.x[2])
         ex, ey, eyaw = mat_to_se2(T_wb)
 
@@ -333,7 +365,7 @@ def run_closed_loop_ekf(
                 xmin=xmin, ymin=ymin, cell=cell, ww=ww, wh=wh, goal=goal,
                 box_lo=box_lo, box_hi=box_hi, scene=scene, scan_world=world_corrected,
                 ekf_x=ekf.x.copy(), ekf_P=ekf.P.copy(), x_pred=x_pred.copy(),
-                z_icp=z_icp, innovation=innovation, icp_status=icp_status,
+                z_icp=z_icp, z_odom=z_odom, innovation=innovation, icp_status=icp_status,
                 true_tr=list(true_tr), est_tr=list(est_tr), icp_tr=list(icp_tr),
                 err_fused=list(err_fused), err_icp=list(err_icp),
                 err_fused_rot=list(err_fused_rot), err_icp_rot=list(err_icp_rot),
