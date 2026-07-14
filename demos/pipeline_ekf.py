@@ -202,6 +202,7 @@ def run_closed_loop_ekf(
     prev_cmd = np.zeros(3, np.float32)
     true_tr, est_tr, icp_tr = [], [], []
     err_fused, err_icp = [], []
+    err_fused_rot, err_icp_rot = [], []   # heading errors [rad], wrapped to (−π, π]
     # per-frame diagonals of P: after predict (P⁻) and after update (P⁺); shape [6] each
     p_pred_diag: list[np.ndarray] = []
     p_upd_diag: list[np.ndarray] = []
@@ -263,6 +264,9 @@ def run_closed_loop_ekf(
         icp_tr.append((icx, icy))
         err_fused.append(float(np.hypot(ex - st.x, ey - st.y)))
         err_icp.append(float(np.hypot(icx - st.x, icy - st.y)))
+        _, _, icyaw = mat_to_se2(icp_pose)
+        err_fused_rot.append(abs(_wrap(eyaw - st.yaw)))
+        err_icp_rot.append(abs(_wrap(icyaw - st.yaw)))
         p_pred_diag.append(p_minus_diag)
         p_upd_diag.append(p_plus_diag)
         if innovation is not None:
@@ -332,6 +336,7 @@ def run_closed_loop_ekf(
                 z_icp=z_icp, innovation=innovation, icp_status=icp_status,
                 true_tr=list(true_tr), est_tr=list(est_tr), icp_tr=list(icp_tr),
                 err_fused=list(err_fused), err_icp=list(err_icp),
+                err_fused_rot=list(err_fused_rot), err_icp_rot=list(err_icp_rot),
                 p_pred_diag=list(p_pred_diag), p_upd_diag=list(p_upd_diag),
                 innov_x=list(innov_x), innov_y=list(innov_y), innov_yaw=list(innov_yaw),
                 status_hist=list(status_hist), contacts=contacts,
@@ -370,9 +375,12 @@ class Dashboard:
     def __init__(self, stride, view_m):
         self.stride, self.V = stride, view_m
         self.frames: list[Image.Image] = []
-        self.fig, axes = plt.subplots(2, 3, figsize=(18, 11))
+        self.fig, axes = plt.subplots(3, 3, figsize=(18, 16))
         (self.ax_world, self.ax_scan, self.ax_track) = axes[0]
         (self.ax_global, self.ax_cov, self.ax_err) = axes[1]
+        (self.ax_err_rot, self.ax_blank1, self.ax_blank2) = axes[2]
+        self.ax_blank1.set_visible(False)
+        self.ax_blank2.set_visible(False)
         from helhest.perception import HeightMapBuilder
 
         self._HMB = HeightMapBuilder
@@ -386,7 +394,7 @@ class Dashboard:
         cell, ww, wh = s["cell"], s["ww"], s["wh"]
         gx, gy = s["goal"]
         walker = s.get("walker")
-        for a in (self.ax_world, self.ax_scan, self.ax_track, self.ax_global, self.ax_cov, self.ax_err):
+        for a in (self.ax_world, self.ax_scan, self.ax_track, self.ax_global, self.ax_cov, self.ax_err, self.ax_err_rot):
             a.clear()
 
         def big(ax):
@@ -483,6 +491,19 @@ class Dashboard:
         ae.set_ylabel("translation error (m)")
         ae.legend(loc="upper left", fontsize=8)
         ae.set_title("Localization error: EKF fused vs raw ICP  (orange = predict-only)")
+
+        # --- rotation localization error over time
+        ar = self.ax_err_rot
+        er_f = np.degrees(np.asarray(s["err_fused_rot"]))
+        er_i = np.degrees(np.asarray(s["err_icp_rot"]))
+        ar.plot(fr, er_i, "-", color="#1f77b4", lw=1.2, alpha=0.8, label="raw ICP error")
+        ar.plot(fr, er_f, "-", color="#d62728", lw=1.6, label="EKF fused error")
+        for idx in fr[rej]:
+            ar.axvspan(idx - 0.5, idx + 0.5, color="#ff7f0e", alpha=0.15)
+        ar.set_xlabel("frame")
+        ar.set_ylabel("heading error (deg)")
+        ar.legend(loc="upper left", fontsize=8)
+        ar.set_title("Rotation error: EKF fused vs raw ICP  (orange = predict-only)")
 
         self.fig.suptitle(
             f"frame {s['f']}   fused-err {ef[-1]:.2f} m   icp-err {ei[-1]:.2f} m   "
