@@ -11,7 +11,7 @@ robot 2026-07-10 (an all-positive /cmd_joints drove straight forward).
 
 This is the single place all actuator-safety logic lives, so it is auditable and unit-tested:
   1. rear-as-follower                               (rear = mean(L, R); left/right pass through)
-  2. slew-rate limit vs the last published command  (a jumpy MPPI step can't shock the drivetrain)
+  2. asymmetric accel/decel rate limit  (a jumpy MPPI step can't shock the drivetrain)
   3. a hard per-joint magnitude clamp               (final backstop below the motor's safe max)
 """
 from __future__ import annotations
@@ -31,6 +31,7 @@ def condition_command(
     max_omega: float,
     max_slew: float,
     dt: float,
+    max_decel: float | None = None,
     turn_boost: float = 1.0,
     goal_dist: float | None = None,
     brake_dist: float = 0.0,
@@ -41,7 +42,9 @@ def condition_command(
     prev: the previously PUBLISHED [left, rear, right] command. Pass zeros on the first call /
         after an e-stop so the slew limiter ramps up from rest.
     max_omega: hard cap on |wheel velocity| [rad/s] -- set to the motor's safe max.
-    max_slew: hard cap on |d(command)/dt| per joint [rad/s^2] -- limits the change over one dt.
+    max_slew: cap on |d(command)/dt| for a joint SPEEDING UP [rad/s^2] (acceleration).
+    max_decel: cap on |d(command)/dt| for a joint SLOWING toward rest [rad/s^2] (deceleration,
+        incl. the stop ramp). None = use max_slew (symmetric limit, the old behaviour).
     goal_dist: current robot->goal distance [m]. With brake_dist > 0, scales the FORWARD speed down
         on the final approach (the goal brake below). None/0 disables the brake.
     brake_dist: [m] start braking within this range of the goal. 0 = no brake.
@@ -70,7 +73,12 @@ def condition_command(
     # internal signs. Verified: forward (wl=wr=v) -> [+v, +v, +v] drove the robot straight forward.
     target = np.array([mean - 0.5 * diff, mean, mean + 0.5 * diff], dtype=np.float32)
     prev = np.asarray(prev, dtype=np.float32)
-    d = float(max_slew) * float(dt)  # max change per joint this step
-    cmd = np.clip(target, prev - d, prev + d)  # slew-rate limit
+    # Asymmetric rate limit: a joint speeding UP (|cmd| growing) is capped by max_slew (accel); a
+    # joint slowing DOWN toward rest (|cmd| shrinking, incl. the stop ramp) by max_decel. Per-joint
+    # because in a turn one wheel accelerates while the other decelerates. None = symmetric.
+    d_acc = float(max_slew) * float(dt)
+    d_dec = float(max_slew if max_decel is None else max_decel) * float(dt)
+    lim = np.where(np.abs(target) >= np.abs(prev), d_acc, d_dec)  # per joint: accel vs decel cap
+    cmd = prev + np.clip(target - prev, -lim, lim)  # rate limit
     cmd = np.clip(cmd, -float(max_omega), float(max_omega))  # hard magnitude backstop
     return cmd.astype(np.float32)

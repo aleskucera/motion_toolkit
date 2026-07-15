@@ -560,7 +560,13 @@ class ElevationNode(Node):
         d("plan_actuate", True)  # publish /cmd_joints wheel commands
         d("cmd_topic", "/cmd_joints")  # JointState wheel-velocity command topic (to the LLC)
         d("plan_max_omega", 5.0)  # hard cap on |wheel velocity| [rad/s] -- the motor safe max (~5, see plan_wmax)
-        d("plan_max_slew", 50.0)  # hard cap on |d(cmd)/dt| per wheel [rad/s^2]
+        # hard cap on |d(cmd)/dt| per wheel [rad/s^2]. At DT=0.1s the command may change by
+        # max_slew*0.1 per step; 50 let it jump 0->cruise in ONE step (harsh launch, ~5 m/s^2). 6.0
+        # ramps 0->~1.3 m/s cruise over ~0.65s (ground ~2.1 m/s^2) -- softer start/stop, still responsive.
+        d("plan_max_slew", 6.0)
+        # deceleration cap [rad/s^2] -- separate from accel so stops can be firmer than the gentle
+        # launch. 12.0 = ground ~4.2 m/s^2, stops from cruise in ~0.32s. None/<=0 would mean symmetric.
+        d("plan_max_decel", 12.0)
         # amplify the commanded turn differential. 1.0 = off. REVISED 2026-07-15: post-fix bags showed
         # the differential is realized ~1:1 below the motor ceiling -- the earlier "~half" was SATURATION
         # (over-commanded wheels), not a real drivetrain gain. So boosting over-turns below the limit and
@@ -679,6 +685,7 @@ class ElevationNode(Node):
         self.plan_actuate: bool = g("plan_actuate")
         self.plan_max_omega: float = g("plan_max_omega")
         self.plan_max_slew: float = g("plan_max_slew")
+        self.plan_max_decel: float = g("plan_max_decel")
         self.plan_turn_boost: float = g("plan_turn_boost")
         self.plan_turn_boost_adapt: bool = g("plan_turn_boost_adapt")
         self.plan_turn_boost_tau: float = g("plan_turn_boost_tau")
@@ -1337,7 +1344,8 @@ class ElevationNode(Node):
             if self.plan_actuate:
                 cmd = condition_command(
                     0.0, 0.0, self._prev_cmd, max_omega=self.plan_max_omega,
-                    max_slew=self.plan_max_slew, dt=dynamics.DT, turn_boost=self.plan_turn_boost,
+                    max_slew=self.plan_max_slew, max_decel=self.plan_max_decel, dt=dynamics.DT,
+                    turn_boost=self.plan_turn_boost,
                 )
                 self._prev_cmd = cmd
                 self._publish_cmd(cmd)
@@ -1420,7 +1428,8 @@ class ElevationNode(Node):
         turn_boost = self._turn_adapt.turn_boost if self._turn_adapt is not None else self.plan_turn_boost
         cmd = condition_command(
             wl, wr, self._prev_cmd,
-            max_omega=self.plan_max_omega, max_slew=self.plan_max_slew, dt=dynamics.DT,
+            max_omega=self.plan_max_omega, max_slew=self.plan_max_slew,
+            max_decel=self.plan_max_decel, dt=dynamics.DT,
             turn_boost=turn_boost,
             goal_dist=d, brake_dist=self.plan_goal_brake_dist,
         )
