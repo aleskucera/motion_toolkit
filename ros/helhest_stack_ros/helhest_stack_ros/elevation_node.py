@@ -529,13 +529,15 @@ class ElevationNode(Node):
         # Small enough that a genuine need to turn still wins; >~0.1 starts refusing hard turns.
         d("plan_turn", 0.03)
         # HARD speed ceiling: the MPPI wheel-speed sampling box [0, plan_wmax] rad/s. The planner
-        # NEVER commands above this regardless of the cost -- raising goal_running does nothing once
-        # it saturates at plan_wmax. This is the real top-speed knob. Keep <= the motor safe max
-        # (plan_max_omega, the output clamp). ~1.4 m/s at 4.0; ~1.75 m/s at 5.0 (r=0.35).
-        # NOTE (2026-07-12): with the /cmd_joints unit fix in _publish_cmd active, plan_wmax now maps
-        # to the REAL wheel speed. Bags showed the wheels only reach ~4.5-5.3 rad/s, so 5.0 is the
-        # demonstrated ceiling -- higher just re-saturates the motor and kills the turn differential.
-        d("plan_wmax", 5.0)  # max per-wheel omega the planner may command [rad/s]
+        # NEVER commands above this regardless of the cost. This is the real top-speed knob.
+        # ~1.4 m/s at 4.0; ~1.75 m/s at 5.0 (r=0.35). With the /cmd_joints unit fix in _publish_cmd
+        # active, plan_wmax maps to the REAL wheel speed.
+        # TURNING HEADROOM (2026-07-15): the motor ceiling is ~5.3 rad/s. Post-fix bags showed the
+        # turn differential is realized ~1:1 BELOW the ceiling but collapses as the wheels approach it
+        # (the outer wheel mean+diff/2 pegs). So keep plan_wmax a notch BELOW the ceiling (4.0) -- both
+        # wheels then stay <5.3 even in a turn, so the differential survives. Trades ~0.35 m/s of top
+        # speed for reliable turning. (The turn "defect" was mostly this saturation, not a fixed gain.)
+        d("plan_wmax", 4.0)  # max per-wheel omega the planner may command [rad/s] -- below the ceiling
         # STRAIGHT sampling prior: fraction of MPPI candidates drawn as zero-differential (straight
         # ahead) drives. Straight is usually near-optimal, so seeding it lets the elite lock onto a
         # clean straight command instead of averaging noisy micro-turns -> ~25% less lateral wander on
@@ -555,10 +557,12 @@ class ElevationNode(Node):
         d("cmd_topic", "/cmd_joints")  # JointState wheel-velocity command topic (to the LLC)
         d("plan_max_omega", 5.0)  # hard cap on |wheel velocity| [rad/s] -- the motor safe max (~5, see plan_wmax)
         d("plan_max_slew", 50.0)  # hard cap on |d(cmd)/dt| per wheel [rad/s^2]
-        # amplify the commanded turn differential to compensate the drivetrain (motors realize only
-        # ~half the commanded wheel-speed difference outdoors). 1.0 = off; ~2.0 recovers the loss.
-        # HOTFIX for a motor-control defect -- see docs/turn_differential_hotfix.md.
-        d("plan_turn_boost", 2.0)
+        # amplify the commanded turn differential. 1.0 = off. REVISED 2026-07-15: post-fix bags showed
+        # the differential is realized ~1:1 below the motor ceiling -- the earlier "~half" was SATURATION
+        # (over-commanded wheels), not a real drivetrain gain. So boosting over-turns below the limit and
+        # worsens saturation at it. Keep at 1.0 now that plan_wmax leaves turning headroom; the fixed-2.0
+        # story in docs/turn_differential_hotfix.md is superseded.
+        d("plan_turn_boost", 1.0)
         # OPTIONAL: self-tune plan_turn_boost online from gyro feedback (control/turn_adapt.py) so the
         # realized yaw matches the plan across terrains + the drivetrain defect -- makes the fixed
         # plan_turn_boost adaptive. False = off (use the fixed value above). When on, plan_turn_boost
