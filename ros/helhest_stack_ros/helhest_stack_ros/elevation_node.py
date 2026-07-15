@@ -132,6 +132,7 @@ _DYN_BUILD = frozenset(
         "dynamic_el_min_deg",
         "dynamic_el_max_deg",
         "dynamic_margin_m",
+        "dynamic_margin_m_follow",
         "dynamic_margin_rel",
         "dynamic_min_range_m",
         "device",
@@ -388,6 +389,10 @@ class ElevationNode(Node):
         # ground, never re-hit), so its trail still carves — measured unchanged 8->25. Cost: a
         # vacated spot lingers ~2.5 s (25 frames @ 10 Hz) before clearing. Makes the frontier safe.
         d("carve_persist_frames", 25)
+        # Follow-mode override for carve_persist_frames (used only when goal_source==follow): the
+        # followed person's trail must clear fast or it walls off the moving goal, and following is
+        # slow/open so the grazed-wall erosion that motivates 25 is a smaller risk. Live-tunable.
+        d("carve_persist_frames_follow", 5)
         # Age out a BETWEEN-BEAM speck: a map point on a bearing no beam reached, but whose
         # NEIGHBOURS were scanned, is dropped after this many frames (0 disables). Gated to NEAR +
         # IN-FRONT space (the two params below): ungated, the coarse-elevation gap test erased 37%
@@ -396,6 +401,7 @@ class ElevationNode(Node):
         # wheel-occlusion shadows off to the sides. Near+front confines it to the path specks.
         d("carve_gap_frames", 8)
         d("carve_gap_max_range_m", 2.5)  # only gap-carve within this range (0 = no range gate)
+        d("carve_gap_max_range_m_follow", 10.0)  # follow-mode override: wider gap-carve for the trail
         # Only gap-carve within this half-cone (deg) of the robot heading; excludes the wheel
         # shadows (~55-87° off heading) and the rear. 0 = no forward gate (carve all around).
         d("carve_gap_fwd_deg", 45.0)
@@ -404,6 +410,10 @@ class ElevationNode(Node):
         d("dynamic_el_min_deg", -90.0)  # full hemisphere (world-frame binning, robust to mount)
         d("dynamic_el_max_deg", 90.0)
         d("dynamic_margin_m", 0.3)  # carve only if the scan is farther by this + range*margin_rel
+        # follow-mode override: smaller margin -> more aggressive visibility carve (clears the person's
+        # trail faster, at the cost of eroding more static geometry -- acceptable in follow). Applied by
+        # _build_dynamic_filter when goal_source==follow; a goal_source change rebuilds the filter.
+        d("dynamic_margin_m_follow", 0.1)
         d("dynamic_margin_rel", 0.05)  # range-proportional slack; absorbs angular-bin quantization
         #                                on slanted/radial walls that else reads as seen-through
         d("dynamic_min_range_m", 0.5)
@@ -629,8 +639,11 @@ class ElevationNode(Node):
         self.icp_yaw_search_deg: float = g("icp_yaw_search_deg")
         self.dynamic_enable: bool = g("dynamic_enable")
         self.carve_persist_frames: int = g("carve_persist_frames")
+        self.carve_persist_frames_follow: int = g("carve_persist_frames_follow")
         self.carve_gap_frames: int = g("carve_gap_frames")
         self.carve_gap_max_range_m: float = g("carve_gap_max_range_m")
+        self.carve_gap_max_range_m_follow: float = g("carve_gap_max_range_m_follow")
+        self.dynamic_margin_m_follow: float = g("dynamic_margin_m_follow")
         self.carve_gap_fwd_rad: float = np.deg2rad(g("carve_gap_fwd_deg"))
         self.dynamic_frontier_enable: bool = g("dynamic_frontier_enable")
         self.dynamic_frontier_max_range_m: float = g("dynamic_frontier_max_range_m")
@@ -737,12 +750,15 @@ class ElevationNode(Node):
 
     def _build_dynamic_filter(self) -> None:
         g = lambda k: self.get_parameter(k).value  # noqa: E731
+        # follow mode uses a smaller carve margin (more aggressive) -- baked into the filter here, so a
+        # goal_source change triggers a rebuild (see _on_parameters_changed).
+        margin = g("dynamic_margin_m_follow") if g("goal_source") == "follow" else g("dynamic_margin_m")
         cfg = DynamicFilterConfig(
             az_bins=g("dynamic_az_bins"),
             el_bins=g("dynamic_el_bins"),
             el_min_deg=g("dynamic_el_min_deg"),
             el_max_deg=g("dynamic_el_max_deg"),
-            margin_m=g("dynamic_margin_m"),
+            margin_m=margin,
             margin_rel=g("dynamic_margin_rel"),
             min_range_m=g("dynamic_min_range_m"),
         )
@@ -894,8 +910,8 @@ class ElevationNode(Node):
                 self._build_aligner()
             if names & _ACC_BUILD:
                 self._build_accumulator()
-            if names & _DYN_BUILD:
-                self._build_dynamic_filter()
+            if names & _DYN_BUILD or "goal_source" in names:
+                self._build_dynamic_filter()  # goal_source switches the follow vs default margin
             if names & _OUTLIER_BUILD:
                 self._build_outlier_filter()
             if self.plan_enable and (names & _PLAN_BUILD or self.planner is None):
@@ -1022,7 +1038,12 @@ class ElevationNode(Node):
         # things). Carve the previous map by visibility against the fresh scan.
         carve = None
         streak_out = None
-        persist = self.carve_persist_frames
+        # Follow mode carves AGGRESSIVELY: the followed person's trail must clear fast or it walls off
+        # the moving goal, and following is slow/open so eroding some static geometry is acceptable.
+        # Shorter persist + wider gap-carve here; the smaller carve margin is baked in _build_dynamic_filter.
+        follow = self.goal_source == "follow"
+        persist = self.carve_persist_frames_follow if follow else self.carve_persist_frames
+        gap_max_range = self.carve_gap_max_range_m_follow if follow else self.carve_gap_max_range_m
         streak_mode = self.dynamic_enable and persist > 1
         if self.dynamic_enable and self.map_wp is not None and len(self.map_wp) > 0:
             world_T_sensor = world_T_base @ base_T_sensor
@@ -1046,7 +1067,7 @@ class ElevationNode(Node):
                 fwd_az = float(np.arctan2(world_T_base[1, 0], world_T_base[0, 0]))
                 carve, streak_out = self.dynamic_filter.carve_streak(
                     self.map_wp, carve_scan, sensor_origin, streak_in, persist,
-                    self.carve_gap_frames, self.carve_gap_max_range_m, fwd_az,
+                    self.carve_gap_frames, gap_max_range, fwd_az,
                     self.carve_gap_fwd_rad,
                 )
             elif self.dynamic_recency_enable and self.map_ages is not None:
