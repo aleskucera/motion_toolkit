@@ -38,6 +38,8 @@ windows:
           - <%= exec_sh %> bash -c '<%= dev %> && python3 -m helhest_stack_ros.elevation_node_ekf <%= args %>; exec bash'
         - rviz:
           - <%= exec_sh %> bash -c '<%= ros %> && rviz2 -d "<%= repo %>/ros/helhest_stack_ros/rviz/elevation.rviz"; exec bash'
+        - traj:
+          - <%= exec_sh %> bash -c '<%= ros %> && python3 "<%= repo %>/ros/traj_logger.py"; exec bash'
   - shell:
       panes:
         - <%= exec_sh %> bash -c '<%= dev %>; exec bash'

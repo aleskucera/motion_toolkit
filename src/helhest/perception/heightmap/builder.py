@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -59,8 +58,8 @@ class HeightMapBuilder:
             raise ValueError("Invalid bounds.")
         self.resolution = resolution
         self.bounds = bounds
-        self.width = int(math.ceil((xmax - xmin) / resolution))
-        self.height = int(math.ceil((ymax - ymin) / resolution))
+        self.width = int(round((xmax - xmin) / resolution))
+        self.height = int(round((ymax - ymin) / resolution))
         self.shape = (self.height, self.width)
         self.device = wp.get_device(device)
 

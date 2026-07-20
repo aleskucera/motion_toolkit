@@ -1052,9 +1052,10 @@ class ElevationNode(Node):
             scan_wp = wp.array(scan_base, dtype=wp.vec3, device=self.device)
             scan_wp = self._denoise(scan_wp, base_T_sensor)
         else:
-            # sweep_delta (odom translation, gyro rotation) feeds the deskew only; the EKF,
-            # not the localizer's odom prediction, drives the pose estimate now.
-            _, sweep_delta = self.localizer.predict(odom_T_base, imu_R_base)
+            # Seed ICP from the odom-predicted pose (same as the plain node): odom translation
+            # + gyro rotation applied to the last accepted pose. The EKF predict still runs to
+            # evolve the filter state; its measurement update then refines the accepted ICP pose.
+            world_T_base_pred, sweep_delta = self.localizer.predict(odom_T_base, imu_R_base)
             if self.deskew_enable:
                 scan_base = self._deskew(
                     scan_base, point_times, sweep_delta, cloud_msg.header.stamp
@@ -1079,11 +1080,6 @@ class ElevationNode(Node):
             self.ekf.predict(F, x_pred)
             self._ck("ekf_predict")
 
-            # Seed ICP with the predicted pose (planar predict spliced onto the previous
-            # fused pose's z/roll/pitch so the gravity prior and submap crop see a real SE(3)).
-            world_T_base_pred = _splice_planar(
-                self._world_T_base, self.ekf.x[0], self.ekf.x[1], self.ekf.x[2]
-            )
             outcome = self.localizer.update(
                 scan_wp,
                 world_T_base_pred,
