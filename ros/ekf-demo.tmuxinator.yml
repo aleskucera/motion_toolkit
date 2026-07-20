@@ -1,5 +1,7 @@
 # tmuxinator start ekf-demo
 # BAG=~/motion_toolkit/bags/outdoor_experiment_new2 RATE=0.25 tmuxinator start ekf-demo
+# Default replays ONLY the bag's inputs so the live node regenerates all outputs (no duplicate
+# /frame_marker etc.). FULL_REPLAY=1 tmuxinator start ekf-demo replays every topic.
 <%
   home    = ENV['HOME']
   exec_sh = "#{home}/exec.sh"
@@ -11,6 +13,13 @@
   extra  += ' -p dynamic_recency_enable:=true'                                                         if ENV['RECENCY']
   extra  += " -p icp_yaw_restarts:=#{ENV['YAW']}"                                                     if ENV['YAW']
   args    = extra.empty? ? '' : "--ros-args#{extra}"
+  full_replay = ENV['FULL_REPLAY'] && !ENV['FULL_REPLAY'].empty?
+  # Default: replay ONLY the bag's sensor/odom inputs (+ static TF + recorded goals) and let the
+  # LIVE node regenerate every output. Without this, the bag's recorded /frame_marker, /planned_path*,
+  # /cmd_joints and dynamic /tf collide with the live node's publications (the alternating #N markers,
+  # TF flicker). Set FULL_REPLAY=1 to replay every recorded topic instead (e.g. to view the original
+  # run without running the node).
+  play_topics = full_replay ? '' : ' --topics /ouster/points /odom_2d /imu/data /ouster/imu /tf_static /goal_pose'
   dds     = "export FASTRTPS_DEFAULT_PROFILES_FILE=\"#{repo}/ros/fastdds_shm.xml\" && export FASTDDS_DEFAULT_PROFILES_FILE=\"#{repo}/ros/fastdds_shm.xml\""
   ros     = "source /opt/ros/jazzy/setup.bash && export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST && #{dds}"
   dev     = "source \"#{repo}/ros/dev-shell.sh\" && export PYTHONPATH=\"#{repo}/ros/helhest_stack_ros:$PYTHONPATH\" && export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST && #{dds}"
@@ -24,7 +33,7 @@ windows:
       layout: main-vertical
       panes:
         - bag:
-          - <%= exec_sh %> bash -c '<%= ros %> && ros2 bag play "<%= bag %>" --rate <%= rate %> --loop --start-paused; exec bash'
+          - <%= exec_sh %> bash -c '<%= ros %> && ros2 bag play "<%= bag %>" --rate <%= rate %> --loop --start-paused<%= play_topics %>; exec bash'
         - node:
           - <%= exec_sh %> bash -c '<%= dev %> && python3 -m helhest_stack_ros.elevation_node_ekf <%= args %>; exec bash'
         - rviz:
