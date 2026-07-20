@@ -1,0 +1,142 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /ouster_points1
+        - /Odometry1
+      Splitter Ratio: 0.5
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Cell Size: 1
+      Plane Cell Count: 40
+      Color: 100; 100; 100
+      Reference Frame: odom
+      Enabled: true
+      Value: true
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Show Names: true
+      Marker Scale: 0.5
+      Value: true
+    # Raw Ouster cloud colored by height — the primary thing to see in a bag-only replay.
+    # Best-effort QoS is required; a reliable subscriber receives nothing from the driver.
+    - Alpha: 1
+      Autocompute Value Bounds:
+        Max Value: 3
+        Min Value: -1
+        Value: true
+      Axis: Z
+      Class: rviz_default_plugins/PointCloud2
+      Color Transformer: AxisColor
+      Decay Time: 0
+      Enabled: true
+      Name: ouster_points
+      Position Transformer: XYZ
+      Selectable: true
+      Size (m): 0.02
+      Style: Points
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /ouster/points
+      Use Fixed Frame: true
+      Value: true
+    # Robot position and heading from the recorded odom->base_link TF.
+    - Class: rviz_default_plugins/Axes
+      Name: robot_pose
+      Enabled: true
+      Reference Frame: base_link
+      Length: 0.8
+      Radius: 0.1
+      Value: true
+    # Odometry trail: shows the path the robot drove as a sequence of pose arrows.
+    - Class: rviz_default_plugins/Odometry
+      Name: Odometry
+      Enabled: true
+      Keep: 500
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /odom_2d
+      Angle Tolerance: 0.1
+      Position Tolerance: 0.1
+      Shape:
+        Arrow Length: 0.3
+        Shaft Length: 0.1
+        Shaft Radius: 0.02
+        Head Length: 0.07
+        Head Radius: 0.04
+        Value: Arrow
+      Value: true
+    # Recorded MPPI planned path — the trajectory the planner committed to each frame.
+    # Magenta while driving, red when the planner was holding (goal walled off).
+    - Class: rviz_default_plugins/Marker
+      Name: planned_path_marker
+      Enabled: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        Value: /planned_path_marker
+      Value: true
+    # Recorded frame counter label floating above the robot.
+    - Class: rviz_default_plugins/Marker
+      Name: frame_number
+      Enabled: true
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        Value: /frame_marker
+      Value: true
+    # Recorded navigation goals (set via RViz 2D Nav Goal during the original run).
+    - Class: rviz_default_plugins/Pose
+      Name: goal_pose
+      Color: 255; 170; 0
+      Shape: Arrow
+      Enabled: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+        Value: /goal_pose
+      Value: true
+  Global Options:
+    Background Color: 33; 33; 40
+    Fixed Frame: odom
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 20
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Name: Current View
+      Pitch: 1.0
+      Yaw: 3.14
+      # Follow the robot as the bag plays.
+      Target Frame: base_link
+    Saved: ~
+Window Geometry:
+  Height: 900
+  Width: 1400
+  Hidden:
+    - /Views1

@@ -1,0 +1,25 @@
+# tmuxinator start bag-view
+# BAG=~/motion_toolkit/bags/outdoor_experiment_new2 RATE=0.5 tmuxinator start bag-view
+# Replays the full bag (all recorded topics) and opens RViz for visualization.
+# No node is started — you see exactly what was recorded.
+<%
+  home    = ENV['HOME']
+  exec_sh = "#{home}/exec.sh"
+  repo    = "#{home}/motion_toolkit"
+  bag     = ENV['BAG']  || "#{repo}/bags/outdoor_experiment_new2"
+  rate    = ENV['RATE'] || '1.0'
+  dds     = "export FASTRTPS_DEFAULT_PROFILES_FILE=\"#{repo}/ros/fastdds_shm.xml\" && export FASTDDS_DEFAULT_PROFILES_FILE=\"#{repo}/ros/fastdds_shm.xml\""
+  ros     = "source /opt/ros/jazzy/setup.bash && export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST && #{dds}"
+%>
+
+name: bag-view
+root: <%= repo %>
+
+windows:
+  - view:
+      layout: main-vertical
+      panes:
+        - bag:
+          - <%= exec_sh %> bash -c '<%= ros %> && ros2 bag play "<%= bag %>" --rate <%= rate %> --loop --start-paused; exec bash'
+        - rviz:
+          - <%= exec_sh %> bash -c '<%= ros %> && rviz2 -d "<%= repo %>/ros/helhest_stack_ros/rviz/bag_view.rviz"; exec bash'
