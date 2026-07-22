@@ -87,14 +87,17 @@ placed into the map exactly where ICP put it.
           ┌──────────────────┐    ┌───────────┴──────────────────────┐
           │ localizer.       │    │  EKF predict step                │
           │ predict()        │    │                                  │
-          │                  │    │  u = _prev_meas_wheel            │
-          │  odom Δ trans    │    │    (measured /joint_states)      │
-          │  gyro Δ rot      │    │                                  │
-          │                  │    │  x_pred = predict_q6d(ekf.x, u) │
-          │  → world_T_base  │    │  F      = jacobian_F_6d(ekf.x,u)│
-          │    _pred         │    │  r = clamp(dt/DT, 0.5, 3.0)     │  ← dt from cloud stamps
-          │  → sweep_delta   │    │  scale Δxy,Δψ,F[0:2,2] by r     │
-          └────────┬─────────┘    │  ekf.predict(F,x_pred,q_scale=r)│
+          │                  │    │  u  = _prev_meas_wheel           │
+          │  odom Δ trans    │    │       (measured /joint_states)   │
+          │  gyro Δ rot      │    │  ωz = _gyro_wz_mean(t0, t1)     │ ← IMU gyro (slip-immune)
+          │                  │    │       fallback: wheel diff       │
+          │                  │    │  x_pred = predict_q6d(ekf.x,    │
+          │  → world_T_base  │    │             u, omega_z=ωz)       │
+          │    _pred         │    │  F      = jacobian_F_6d(ekf.x,  │
+          │  → sweep_delta   │    │             u, omega_z=ωz)       │
+          └────────┬─────────┘    │  r = clamp(dt/DT, 0.5, 3.0)     │  ← dt from cloud stamps
+                   │              │  scale Δxy,Δψ,F[0:2,2] by r     │
+                   │              │  ekf.predict(F,x_pred,q_scale=r) │
                    │              │   → ekf.x updated (x,y,ψ,ẋ,ẏ,ψ̇)│
                    │              │   → ekf.P updated  (Q×r growth)  │
                    │              └──────────────────────────────────┘
@@ -222,7 +225,7 @@ rejects.
 | **x/y/yaw source (export)** | raw ICP | EKF-blended (physics predict + ICP update) |
 | **z/roll/pitch source** | raw ICP | raw ICP (same) |
 | **Fallback when ICP rejects** | odom-predicted pose | EKF-predicted pose (physics model) |
-| **Physics model input** | n/a | `_prev_meas_wheel` — measured `/joint_states` |
+| **Physics model input** | n/a | `_prev_meas_wheel` (wheel speeds) + `_gyro_wz_mean` (IMU ωz, slip-immune yaw) |
 | **Localizer seed override** | n/a | `set_corrected_pose(world_T_base)` each frame |
 | **ICP measurement noise** | n/a | adaptive: `R_ICP × (rms/rms_nom)² × (N_nom/N_inl)` |
 | **Innovation gate** | n/a | Mahalanobis χ²(3); skip if `yᵀS⁻¹y > icp_chi2_thresh` |
@@ -233,10 +236,18 @@ rejects.
 
 ## Bag replay behaviour
 
-The EKF predict step is driven by `_prev_meas_wheel` — measured wheel velocities
-read directly from the `/joint_states` feedback topic. This is the same signal
-regardless of whether the MPPI planner is running or a bag is being replayed, so
-the physics prediction tracks the actual motion in both cases. The previous design
-used the MPPI planner's commanded output (`_prev_cmd_model`), which diverged during
-bag replay because the live planner generated commands for a different trajectory
-than the one in the bag.
+The EKF predict step is driven by two inputs:
+
+- **Translation** (`_prev_meas_wheel`): measured wheel velocities from `/joint_states`.
+  The same signal in live operation and bag replay, so the prediction tracks the
+  actual motion in both cases.
+- **Yaw** (`_gyro_wz_mean`): the base-frame IMU gyro rate averaged over the
+  inter-cloud window, replacing the wheel-differential yaw estimate. The gyro is
+  immune to wheel slip and lateral-dynamics model error, which caused the EKF heading
+  to lag ICP by up to 9° during turns — the χ² gate would then reject valid ICP
+  corrections for the duration of the turn. Falls back to the wheel differential when
+  no IMU samples are available.
+
+The previous design used the MPPI planner's commanded output (`_prev_cmd_model`),
+which diverged during bag replay because the live planner generated commands for a
+different trajectory than the one in the bag.

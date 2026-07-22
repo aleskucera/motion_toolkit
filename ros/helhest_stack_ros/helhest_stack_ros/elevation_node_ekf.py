@@ -551,15 +551,26 @@ class ElevationNode(Node):
         # diverged ones >=0.086, so 0.08 separates them. 0 = off (library default).
         d("icp_max_rms_residual_m", 0.08)
         # Adaptive ICP measurement noise (R_ICP): scale = (rms / rms_nom)² × (N_nom / N_inl).
-        # At nominal values scale = 1 and R_ICP is used as-is; worse alignments get larger R.
-        d("icp_r_rms_nom", 0.04)   # [m] RMS reference — half the reject threshold
-        d("icp_r_inl_nom", 2000)   # [#] inlier-count reference for the adaptive scale
+        # At nominal values scale = 1 and R_ICP is used as-is; worse alignments get larger R,
+        # better ones get smaller R. Calibrate *_nom to your sensor's typical operating point
+        # (measured mean values) so scale ≈ 1 at normal conditions. Too-low inl_nom or too-high
+        # rms_nom makes scale << 1, shrinking R, tightening the chi² gate, and causing false rejects.
+        d("icp_r_rms_nom", 0.015)  # [m] RMS reference at nominal operating conditions
+        d("icp_r_inl_nom", 4800)   # [#] inlier-count reference at nominal operating conditions
         # Mahalanobis χ²(3) innovation gate: skip the EKF update if yᵀ S⁻¹ y exceeds this.
         # 7.815 = 95%, 9.0 ≈ 97%, 11.345 = 99%; 0.0 disables the gate.
-        d("icp_chi2_thresh", 9.0)
+        # NOTE: This robot is a skid-steerer with zero wheel differential during turns (both
+        # wheels spin at equal speed while the body slides laterally). The kinematic model has
+        # no way to predict lateral sliding, so the process model is ~0.5-1.0m wrong during
+        # every turn regardless of gyro correction. The gate at 9.0 fires on virtually every
+        # turn frame — it blocks valid ICP corrections without protecting against bad ICP.
+        # Disabled (0.0) by default; quality-based outlier rejection is handled by the
+        # localizer's own rms/inlier gates. Raise only if ICP quality is unreliable.
+        d("icp_chi2_thresh", 0.0)
         # Force-accept the ICP update (ignore the chi² gate) after this many consecutive
         # rejections — prevents the filter from silently walking its ICP seed away from
-        # the map during sustained filter divergence. 0 = never force-accept (not recommended).
+        # the map during sustained filter divergence. 0 = never force-accept.
+        # Only active when icp_chi2_thresh > 0.
         d("icp_chi2_max_rejects", 5)
         # Yaw multi-start: run this many ICPs from headings spread over icp_yaw_search_deg about
         # the prediction and keep the best fit — escapes the wrong rotational basin under fast
@@ -1119,13 +1130,20 @@ class ElevationNode(Node):
             if self._prev_cloud_t is not None:
                 dt_ratio = float(np.clip((t_cloud - self._prev_cloud_t) / dynamics.DT, 0.5, 3.0))
 
+            # Gyro yaw rate averaged over the inter-cloud window: slip-immune heading prediction.
+            # Falls back to None when no IMU samples are available (first frame, IMU dropout),
+            # which causes predict_q6d / jacobian_F_6d to use the wheel-differential model.
+            omega_z = self._gyro_wz_mean(
+                self._prev_cloud_t if self._prev_cloud_t is not None else t_cloud,
+                t_cloud,
+            )
             u = self._prev_meas_wheel
             off_x, off_y = float(self.ekf.x[0]), float(self.ekf.x[1])
             q_local = self.ekf.x.copy()
             q_local[0] = 0.0
             q_local[1] = 0.0
-            x_pred = predict_q6d(q_local, u, self.sim_pred)
-            F = jacobian_F_6d(q_local, u, self.sim_jac)
+            x_pred = predict_q6d(q_local, u, self.sim_pred, omega_z=omega_z)
+            F = jacobian_F_6d(q_local, u, self.sim_jac, omega_z=omega_z)
             # Scale the xy pose delta (rollout started at the origin, so x_pred[0:2] IS the delta).
             x_pred[0] = dt_ratio * x_pred[0] + off_x
             x_pred[1] = dt_ratio * x_pred[1] + off_y
@@ -1801,6 +1819,18 @@ class ElevationNode(Node):
         self._gyro_R_base = R
         self._gyro_t = t
         return R.copy()
+
+    def _gyro_wz_mean(self, t0: float, t1: float) -> float | None:
+        """Mean base-frame yaw rate [rad/s] averaged over IMU samples in (t0, t1].
+
+        Returns None when no buffered samples fall in the window (e.g. the first
+        inter-cloud interval before IMU messages have arrived, or an IMU dropout).
+        Falls back gracefully so the caller can use the wheel-differential model.
+        """
+        samples = [w[2] for ts, _q, w in self._imu_buffer if t0 < ts <= t1]
+        if not samples:
+            return None
+        return float(sum(samples) / len(samples))
 
     def _gyro_base_rotation(self, frame_id: str) -> np.ndarray | None:
         """Cached base_R_imu (rotation only) from the static IMU mount TF, or None if not ready yet.

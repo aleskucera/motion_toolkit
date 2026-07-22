@@ -23,6 +23,7 @@ import warp as wp
 
 from helhest.engine import ForwardSimulator
 
+from helhest.dynamics import DT as _DT
 from helhest.model import HALF_TRACK
 from helhest.model import WHEEL_RADIUS
 
@@ -47,22 +48,35 @@ def _q6d_from_batch(
     turn: np.ndarray,
     b: int,
     u: np.ndarray,
+    omega_z: float | None = None,
 ) -> np.ndarray:
     """Extract one 6D next-state vector from a batch simulator readback.
 
-    ctrl  : controlled.numpy()  shape [T+1, B, 3]  — (x, y, yaw) at each step
-    deriv : derived.numpy()     shape [T+1, B, 3]  — (z, pitch, roll)
-    turn  : turning.numpy()     shape [T,   B, 2]  — (alpha, x_icr) this step
-    b     : batch index
-    u     : wheel-speed command [omega_L, omega_R, omega_rear]
+    ctrl    : controlled.numpy()  shape [T+1, B, 3]  — (x, y, yaw) at each step
+    deriv   : derived.numpy()     shape [T+1, B, 3]  — (z, pitch, roll)
+    turn    : turning.numpy()     shape [T,   B, 2]  — (alpha, x_icr) this step
+    b       : batch index
+    u       : wheel-speed command [omega_L, omega_R, omega_rear]
+    omega_z : measured base-frame gyro yaw rate [rad/s].  When provided, it
+              replaces the wheel-differential yaw rate (slip-immune).  The xy
+              translation is taken from the simulator rollout.
     """
-    x_n, y_n, psi_n = ctrl[1, b]
+    x_n, y_n, psi_sim = ctrl[1, b]
     _z_n, theta_n, phi_n = deriv[1, b]
     alpha, x_icr = turn[0, b]
 
-    # Body-frame twist from wheel speeds and terrain-derived turning params.
+    # Body-frame forward speed: unaffected by slip, so always from wheel average.
     vx_b = WHEEL_RADIUS * (u[0] + u[1]) / 2.0
-    yaw_rate = WHEEL_RADIUS * (u[1] - u[0]) / (2.0 * HALF_TRACK * alpha)
+
+    if omega_z is not None:
+        # Gyro-driven yaw: immune to wheel slip.  Override the heading that the
+        # simulator integrated internally with psi_start + omega_z * DT.
+        yaw_rate = omega_z
+        psi_n = float(ctrl[0, b][2]) + omega_z * _DT
+    else:
+        yaw_rate = WHEEL_RADIUS * (u[1] - u[0]) / (2.0 * HALF_TRACK * alpha)
+        psi_n = psi_sim
+
     vy_b = -x_icr * yaw_rate
 
     # Rotate body-frame twist into world frame using the full settled orientation.
@@ -76,6 +90,7 @@ def jacobian_F_6d(
     u0: np.ndarray,
     sim: ForwardSimulator,
     eps: float = 1e-4,
+    omega_z: float | None = None,
 ) -> np.ndarray:
     """Discrete 6×6 state-transition Jacobian F = ∂q_next/∂q at (q0, u0).
 
@@ -83,8 +98,9 @@ def jacobian_F_6d(
     zero — see module docstring).  All 6 perturbed rollouts run in a single
     batched GPU launch; sim must be pre-built with batch_size=6, n_steps=1 and
     terrain already loaded.
-    q0 : [6]  current state [x, y, ψ, ẋᵂ, ẏᵂ, ψ̇]
-    u0 : [3]  wheel speeds  [ω_L, ω_R, ω_rear]  (rad/s)
+    q0      : [6]  current state [x, y, ψ, ẋᵂ, ẏᵂ, ψ̇]
+    u0      : [3]  wheel speeds  [ω_L, ω_R, ω_rear]  (rad/s)
+    omega_z : measured gyro yaw rate [rad/s]; see _q6d_from_batch.
     eps=1e-4 is chosen for float32 simulator output: smaller eps causes
     cancellation error; the O(eps²) central-difference truncation error is
     negligible at this scale.
@@ -117,8 +133,8 @@ def jacobian_F_6d(
     for j in range(3):
         b_plus = 2 * j
         b_minus = 2 * j + 1
-        q_plus = _q6d_from_batch(ctrl, deriv, turn, b_plus, u0)
-        q_minus = _q6d_from_batch(ctrl, deriv, turn, b_minus, u0)
+        q_plus = _q6d_from_batch(ctrl, deriv, turn, b_plus, u0, omega_z)
+        q_minus = _q6d_from_batch(ctrl, deriv, turn, b_minus, u0, omega_z)
         F[:, j] = (q_plus - q_minus) / (2.0 * eps)
     # Columns 3–5 remain zero: stored velocity q[3:6] is never read by the
     # simulator, so perturbing it has no effect on q_next.
@@ -130,6 +146,7 @@ def predict_q6d(
     q0: np.ndarray,
     u0: np.ndarray,
     sim: ForwardSimulator,
+    omega_z: float | None = None,
 ) -> np.ndarray:
     """Nonlinear 6-D forward prediction q_next = f(q0, u0) at one timestep.
 
@@ -137,8 +154,9 @@ def predict_q6d(
     rollout) rather than its derivative, sharing the same twist/rotation extraction
     (_q6d_from_batch) so f and ∂f/∂q stay consistent. Only q0[0:3] seeds the sim; the
     stored velocity q0[3:6] is never read (see module docstring).
-    q0 : [6]  current state [x, y, ψ, ẋᵂ, ẏᵂ, ψ̇]
-    u0 : [3]  wheel speeds  [ω_L, ω_R, ω_rear]  (rad/s)
+    q0      : [6]  current state [x, y, ψ, ẋᵂ, ẏᵂ, ψ̇]
+    u0      : [3]  wheel speeds  [ω_L, ω_R, ω_rear]  (rad/s)
+    omega_z : measured gyro yaw rate [rad/s]; see _q6d_from_batch.
     sim must be pre-built with batch_size=1, n_steps=1 and terrain already loaded.
     """
     assert sim.batch_size == 1 and sim.n_steps == 1, (
@@ -157,7 +175,7 @@ def predict_q6d(
     ctrl = sim.controlled.numpy()  # [2, 1, 3]
     deriv = sim.derived.numpy()    # [2, 1, 3]
     turn = sim.turning.numpy()     # [1, 1, 2]
-    return _q6d_from_batch(ctrl, deriv, turn, 0, u0)
+    return _q6d_from_batch(ctrl, deriv, turn, 0, u0, omega_z)
 
 
 #------------------------------------------

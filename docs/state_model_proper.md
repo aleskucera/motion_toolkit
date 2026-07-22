@@ -41,6 +41,16 @@ q_5 &= v_x^B \sin q_3 + v_y^B \cos q_3
 
 The turning parameters $\alpha$ and $x_\text{ICR}$ are grip- and terrain-dependent; see `motion_model.md` for their definitions.
 
+### Gyro-augmented variant (used in `elevation_node_ekf`)
+
+In the EKF predict step the wheel-differential yaw rate is replaced by the base-frame IMU gyro rate, averaged over the inter-cloud window:
+
+$$q_6 = \dot{\psi} = \bar{\omega}_z^\text{gyro}$$
+
+$v_y^B$ is updated accordingly ($v_y^B = -x_\text{ICR}\,\bar{\omega}_z^\text{gyro}$); $v_x^B$ is unchanged. The Jacobian structure is identical — $\omega_z^\text{gyro}$ is an exogenous input, not a state, so $F$ retains the same sparsity. The xy translation is still taken from the `ForwardSimulator` rollout (which uses the wheel model internally); the within-step heading inconsistency is second-order over $\Delta t = 0.1\,\text{s}$ and is negligible.
+
+**Rationale:** during turns the wheel-differential model underestimates rotation because the effective grip factor $\alpha$ is only an approximation; the gyro measures actual rotation regardless of slip.
+
 ---
 
 ## 3. System linearisation 
