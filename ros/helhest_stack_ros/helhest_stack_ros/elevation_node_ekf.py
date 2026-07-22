@@ -340,7 +340,7 @@ class ElevationNode(Node):
         self._gyro_t: float | None = None
         self._base_R_gyro: np.ndarray | None = None  # cached static base<-imu rotation for the gyro
         self._consecutive_rejects = 0  # for reset-on-sustained-divergence
-        self._consecutive_chi2_rejects = 0  # for chi²-gate force-accept escape
+
         self._prof: dict[str, float] = {}  # per-stage cumulative seconds (profile_stages)
         self._prof_n = 0
         self._prof_t = 0.0
@@ -554,24 +554,9 @@ class ElevationNode(Node):
         # At nominal values scale = 1 and R_ICP is used as-is; worse alignments get larger R,
         # better ones get smaller R. Calibrate *_nom to your sensor's typical operating point
         # (measured mean values) so scale ≈ 1 at normal conditions. Too-low inl_nom or too-high
-        # rms_nom makes scale << 1, shrinking R, tightening the chi² gate, and causing false rejects.
+        # rms_nom makes scale << 1, over-shrinking R and giving ICP too much trust.
         d("icp_r_rms_nom", 0.015)  # [m] RMS reference at nominal operating conditions
         d("icp_r_inl_nom", 4800)   # [#] inlier-count reference at nominal operating conditions
-        # Mahalanobis χ²(3) innovation gate: skip the EKF update if yᵀ S⁻¹ y exceeds this.
-        # 7.815 = 95%, 9.0 ≈ 97%, 11.345 = 99%; 0.0 disables the gate.
-        # NOTE: This robot is a skid-steerer with zero wheel differential during turns (both
-        # wheels spin at equal speed while the body slides laterally). The kinematic model has
-        # no way to predict lateral sliding, so the process model is ~0.5-1.0m wrong during
-        # every turn regardless of gyro correction. The gate at 9.0 fires on virtually every
-        # turn frame — it blocks valid ICP corrections without protecting against bad ICP.
-        # Disabled (0.0) by default; quality-based outlier rejection is handled by the
-        # localizer's own rms/inlier gates. Raise only if ICP quality is unreliable.
-        d("icp_chi2_thresh", 0.0)
-        # Force-accept the ICP update (ignore the chi² gate) after this many consecutive
-        # rejections — prevents the filter from silently walking its ICP seed away from
-        # the map during sustained filter divergence. 0 = never force-accept.
-        # Only active when icp_chi2_thresh > 0.
-        d("icp_chi2_max_rejects", 5)
         # Yaw multi-start: run this many ICPs from headings spread over icp_yaw_search_deg about
         # the prediction and keep the best fit — escapes the wrong rotational basin under fast
         # skid-steer yaw. 1 = single ICP (off). GPU-parallel-friendly; costs ~N ICP launches.
@@ -748,8 +733,7 @@ class ElevationNode(Node):
         self.icp_max_rms_residual_m: float = g("icp_max_rms_residual_m")
         self.icp_r_rms_nom: float = g("icp_r_rms_nom")
         self.icp_r_inl_nom: int = g("icp_r_inl_nom")
-        self.icp_chi2_thresh: float = g("icp_chi2_thresh")
-        self.icp_chi2_max_rejects: int = g("icp_chi2_max_rejects")
+
         self.icp_yaw_restarts: int = g("icp_yaw_restarts")
         self.icp_yaw_search_deg: float = g("icp_yaw_search_deg")
         self.dynamic_enable: bool = g("dynamic_enable")
@@ -872,7 +856,6 @@ class ElevationNode(Node):
         self.ekf = None  # re-bootstrap on the next scan
         self._world_T_base = None
         self._prev_meas_wheel = np.zeros(3, np.float64)
-        self._consecutive_chi2_rejects = 0
         self._prev_cloud_t = None  # don't carry a stale dt across a filter rebuild
 
     def _build_accumulator(self) -> None:
@@ -1183,26 +1166,7 @@ class ElevationNode(Node):
                 scale = (rms / self.icp_r_rms_nom) ** 2 * (self.icp_r_inl_nom / max(outcome.num_inliers, 1))
                 R_adaptive = R_ICP * scale
                 z = np.array(mat_to_se2(outcome.pose))
-                applied = self.ekf.update_icp(z, R=R_adaptive, chi2_thresh=self.icp_chi2_thresh)
-                if applied:
-                    self._consecutive_chi2_rejects = 0
-                else:
-                    self._consecutive_chi2_rejects += 1
-                    if 0 < self.icp_chi2_max_rejects <= self._consecutive_chi2_rejects:
-                        # Sustained gating means the FILTER diverged from the map (the map is
-                        # still written from accepted raw ICP, so it remains trustworthy). Snap
-                        # the filter back before the drifting seed trips the localizer's gates.
-                        self.ekf.update_icp(z, R=R_adaptive)  # chi2_thresh=0.0 → force-accept
-                        self._consecutive_chi2_rejects = 0
-                        self.get_logger().warn(
-                            f"F{self._frame} chi2 gate: {self.icp_chi2_max_rejects} consecutive "
-                            "rejections -> force-accepted ICP update (filter snapped to map)"
-                        )
-                    else:
-                        self.get_logger().warn(
-                            f"F{self._frame} chi2 gate: update skipped "
-                            f"({self._consecutive_chi2_rejects}/{self.icp_chi2_max_rejects})"
-                        )
+                self.ekf.update_icp(z, R=R_adaptive)
             # Reconstruct the SE(3) pose from the fused planar state, keeping the ICP pose's
             # z/roll/pitch (hybrid splice, docs/ekf.md 4.4). On a fallback (reject/sparse)
             # outcome.pose is the predicted seed and the state is unchanged, so this is a no-op.
