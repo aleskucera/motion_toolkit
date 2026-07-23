@@ -39,7 +39,7 @@ windows:
         - rviz:
           - <%= exec_sh %> bash -c '<%= ros %> && rviz2 -d "<%= repo %>/ros/helhest_stack_ros/rviz/elevation.rviz"; exec bash'
         - traj:
-          - <%= exec_sh %> bash -c '<%= ros %> && python3 "<%= repo %>/ros/traj_logger.py"; exec bash'
+          - <%= exec_sh %> bash -c 'echo "[traj_logger] paused — use ekf-demo for EKF trajectory logging"; exec bash'
   - shell:
       panes:
         - <%= exec_sh %> bash -c '<%= dev %>; exec bash'

@@ -228,8 +228,9 @@ localizer rejects.
 The EKF predict step is driven by two inputs:
 
 - **Translation** (`_prev_meas_wheel`): measured wheel velocities from `/joint_states`.
-  The same signal in live operation and bag replay, so the prediction tracks the
-  actual motion in both cases.
+  The same signal in live operation and bag replay (`ekf-demo` play_topics must
+  include `/joint_states`; without it predict gets `u = [0,0,0]`), so the prediction
+  tracks the actual motion in both cases.
 - **Yaw** (`_gyro_wz_mean`): the base-frame IMU gyro rate averaged over the
   inter-cloud window, replacing the wheel-differential yaw estimate. The gyro is
   immune to wheel slip and lateral-dynamics model error, which caused the EKF heading

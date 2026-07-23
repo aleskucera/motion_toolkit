@@ -17,9 +17,11 @@
   # Default: replay ONLY the bag's sensor/odom inputs (+ static TF + recorded goals) and let the
   # LIVE node regenerate every output. Without this, the bag's recorded /frame_marker, /planned_path*,
   # /cmd_joints and dynamic /tf collide with the live node's publications (the alternating #N markers,
-  # TF flicker). Set FULL_REPLAY=1 to replay every recorded topic instead (e.g. to view the original
-  # run without running the node).
-  play_topics = full_replay ? '' : ' --topics /ouster/points /odom_2d /imu/data /ouster/imu /tf_static /goal_pose'
+  # TF flicker). /joint_states IS an input (measured wheel speeds → EKF predict u); omit it and
+  # predict gets u=[0,0,0] every frame. Do NOT add /cmd_joints — that is a live-node output and
+  # would also diverge from the bag trajectory if used as the predict drive. Set FULL_REPLAY=1 to
+  # replay every recorded topic instead (e.g. to view the original run without running the node).
+  play_topics = full_replay ? '' : ' --topics /ouster/points /odom_2d /imu/data /ouster/imu /joint_states /tf_static /goal_pose'
   dds     = "export FASTRTPS_DEFAULT_PROFILES_FILE=\"#{repo}/ros/fastdds_shm.xml\" && export FASTDDS_DEFAULT_PROFILES_FILE=\"#{repo}/ros/fastdds_shm.xml\""
   ros     = "source /opt/ros/jazzy/setup.bash && export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST && #{dds}"
   dev     = "source \"#{repo}/ros/dev-shell.sh\" && export PYTHONPATH=\"#{repo}/ros/helhest_stack_ros:$PYTHONPATH\" && export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST && #{dds}"
@@ -39,7 +41,7 @@ windows:
         - rviz:
           - <%= exec_sh %> bash -c '<%= ros %> && rviz2 -d "<%= repo %>/ros/helhest_stack_ros/rviz/elevation.rviz"; exec bash'
         - traj:
-          - <%= exec_sh %> bash -c '<%= ros %> && python3 "<%= repo %>/ros/traj_logger.py"; exec bash'
+          - <%= exec_sh %> bash -c '<%= ros %> && python3 "<%= repo %>/ros/ekf_traj_logger.py" --report all; exec bash'
         - diag:
           - <%= exec_sh %> bash -c '<%= ros %> && ros2 topic echo /ekf/diagnostics; exec bash'
   - shell:

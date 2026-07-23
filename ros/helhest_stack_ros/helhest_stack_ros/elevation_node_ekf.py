@@ -342,6 +342,9 @@ class ElevationNode(Node):
         self._gyro_t: float | None = None
         self._base_R_gyro: np.ndarray | None = None  # cached static base<-imu rotation for the gyro
         self._consecutive_rejects = 0  # for reset-on-sustained-divergence
+        # Covariance snapshot taken right after ekf.predict(), before ekf.update_icp().
+        # Used by _publish_ekf_diag to emit both P⁻ (predicted) and P⁺ (posterior) metrics.
+        self._P_pred: np.ndarray | None = None
 
         self._prof: dict[str, float] = {}  # per-stage cumulative seconds (profile_stages)
         self._prof_n = 0
@@ -401,6 +404,7 @@ class ElevationNode(Node):
         )  # turn_boost in effect (debug)
         # EKF debug topics — informational only; no stack component subscribes to these.
         self.pub_ekf_odom = self.create_publisher(Odometry, "ekf/odom", 10)
+        self.pub_ekf_pose_pred = self.create_publisher(PoseStamped, "ekf/pose_pred", 10)
         self.pub_ekf_nis = self.create_publisher(Float32, "ekf/nis_icp", 10)
         self.pub_ekf_diag = self.create_publisher(DiagnosticArray, "ekf/diagnostics", 10)
         self.add_on_set_parameters_callback(self._on_parameters_changed)
@@ -560,7 +564,7 @@ class ElevationNode(Node):
         # sub-threshold RMS cannot be an aliased fit, so the cap should not apply. Set to ~half
         # of icp_max_rms_residual_m (e.g. 0.04 m) to recover well-converged registrations after
         # odom drift. 0.0 = disabled (default, no behaviour change).
-        d("icp_rms_bypass_trans_m", 0.04)
+        d("icp_rms_bypass_trans_m", 0.00)
         # Adaptive ICP measurement noise (R_ICP): scale = (rms / rms_nom)² × (N_nom / N_inl).
         # At nominal values scale = 1 and R_ICP is used as-is; worse alignments get larger R,
         # better ones get smaller R. Calibrate *_nom to your sensor's typical operating point
@@ -584,6 +588,7 @@ class ElevationNode(Node):
             "profile_stages", False
         )  # GPU-synced per-stage timing, logged every 30 frames (debugging)
         # EKF debug publishing (informational only — nothing in the stack subscribes to these):
+        #   ekf/pose_pred     — geometry_msgs/PoseStamped: planar x/y/ψ after predict (pre-ICP)
         #   ekf/odom          — nav_msgs/Odometry: fused pose+twist with full 6x6 covariance
         #   ekf/nis_icp       — std_msgs/Float32: NIS of the ICP update (χ²(3), mean≈3)
         #   ekf/diagnostics   — diagnostic_msgs/DiagnosticArray: per-frame scalar summary
@@ -1159,6 +1164,9 @@ class ElevationNode(Node):
             self.ekf.predict(F, x_pred, q_scale=dt_ratio)
             self._prev_cloud_t = t_cloud
             self._ck("ekf_predict")
+            if self.publish_ekf_debug:
+                self._publish_ekf_pose_pred(cloud_msg.header.stamp)
+                self._P_pred = self.ekf.P.copy()  # P⁻: before ICP update overwrites P
 
             outcome = self.localizer.update(
                 scan_wp,
@@ -1890,11 +1898,30 @@ class ElevationNode(Node):
         dt_ratio: float,
         stamp,
     ) -> None:
-        """Publish all three EKF debug topics for this frame."""
+        """Publish post-update EKF debug topics for this frame (pose_pred is published earlier)."""
         self._publish_ekf_odom(world_T_base, stamp)
         self._publish_ekf_diag(outcome, nis, innov, r_scale, dt_ratio, stamp)
         if nis is not None:
             self.pub_ekf_nis.publish(Float32(data=float(nis)))
+
+    def _publish_ekf_pose_pred(self, stamp) -> None:
+        """Publish planar x/y/ψ after the predict step (pre-ICP measurement update).
+
+        Same stamp as the cloud / later ekf/odom so a logger can pair predict vs update.
+        """
+        if self.ekf is None:
+            return
+        x, y, psi = float(self.ekf.x[0]), float(self.ekf.x[1]), float(self.ekf.x[2])
+        half = 0.5 * psi
+        msg = PoseStamped()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.map_frame
+        msg.pose.position.x = x
+        msg.pose.position.y = y
+        msg.pose.position.z = 0.0
+        msg.pose.orientation.z = float(np.sin(half))
+        msg.pose.orientation.w = float(np.cos(half))
+        self.pub_ekf_pose_pred.publish(msg)
 
     def _publish_ekf_odom(self, world_T_base: np.ndarray, stamp) -> None:
         """Publish nav_msgs/Odometry with the fused EKF pose, twist, and covariance.
@@ -1996,6 +2023,15 @@ class ElevationNode(Node):
           num_inliers       — ICP inlier count
           dt_ratio          — real inter-cloud dt / model DT (1.0 = on-time)
           consecutive_rejects — sustained reject counter (triggers map reset at threshold)
+
+          Covariance fields (present when publish_ekf_debug is true):
+          cov_pred_{x,y,psi,vx,vy,psidot} — diagonal of P⁻ (after predict, before update)
+          cov_upd_{x,y,psi,vx,vy,psidot}  — diagonal of P⁺ (after update; equals P⁻ on reject)
+          cov_pred_trace   — trace(P⁻): total predicted uncertainty
+          cov_pred_logdet  — log|det(P⁻)|: PSD size of predicted covariance
+          cov_upd_trace    — trace(P⁺): total posterior uncertainty
+          cov_upd_logdet   — log|det(P⁺)|: PSD size of posterior covariance
+          cov_updated      — "1" if ICP update was applied this frame, "0" for predict-only
         """
         level = DiagnosticStatus.OK
         if outcome.status != "ok":
@@ -2022,6 +2058,24 @@ class ElevationNode(Node):
             kv("dt_ratio", f"{dt_ratio:.3f}"),
             kv("consecutive_rejects", str(self._consecutive_rejects)),
         ]
+        # Covariance diagnostics — appended only when P_pred was captured this frame.
+        # P_pred = P⁻ (after predict, before update); self.ekf.P = P⁺ (after update, or P⁻
+        # if no update occurred because status != "ok").
+        if self._P_pred is not None:
+            P_pred = self._P_pred
+            P_upd = self.ekf.P
+            _state_names = ["x", "y", "psi", "vx", "vy", "psidot"]
+            for i, name in enumerate(_state_names):
+                values.append(kv(f"cov_pred_{name}", f"{P_pred[i, i]:.6g}"))
+            for i, name in enumerate(_state_names):
+                values.append(kv(f"cov_upd_{name}", f"{P_upd[i, i]:.6g}"))
+            # PSD-size scalars computed from the full matrix (not just the diagonal).
+            values.append(kv("cov_pred_trace", f"{float(np.trace(P_pred)):.6g}"))
+            values.append(kv("cov_pred_logdet", f"{float(np.linalg.slogdet(P_pred)[1]):.6g}"))
+            values.append(kv("cov_upd_trace", f"{float(np.trace(P_upd)):.6g}"))
+            values.append(kv("cov_upd_logdet", f"{float(np.linalg.slogdet(P_upd)[1]):.6g}"))
+            # "1" when an ICP measurement update actually happened this frame, "0" for predict-only.
+            values.append(kv("cov_updated", "1" if outcome.status == "ok" else "0"))
         ds = DiagnosticStatus()
         ds.level = level
         ds.name = "ekf_localization"
