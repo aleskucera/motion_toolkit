@@ -557,6 +557,11 @@ class ElevationNode(Node):
         # signal that lets the rot cap relax safely. Good rotate fits ~0.03-0.055, aliased/
         # diverged ones >=0.086, so 0.08 separates them. 0 = off (library default).
         d("icp_max_rms_residual_m", 0.08)
+        # Bypass the translation correction cap when ICP RMS is strictly below this value — a
+        # sub-threshold RMS cannot be an aliased fit, so the cap should not apply. Set to ~half
+        # of icp_max_rms_residual_m (e.g. 0.04 m) to recover well-converged registrations after
+        # odom drift. 0.0 = disabled (default, no behaviour change).
+        d("icp_rms_bypass_trans_m", 0.04)
         # Adaptive ICP measurement noise (R_ICP): scale = (rms / rms_nom)² × (N_nom / N_inl).
         # At nominal values scale = 1 and R_ICP is used as-is; worse alignments get larger R,
         # better ones get smaller R. Calibrate *_nom to your sensor's typical operating point
@@ -743,6 +748,7 @@ class ElevationNode(Node):
         self.icp_max_corr_rot_rad: float = float(np.deg2rad(g("icp_max_corr_rot_deg")))
         self.icp_min_submap_points: int = g("icp_min_submap_points")
         self.icp_max_rms_residual_m: float = g("icp_max_rms_residual_m")
+        self.icp_rms_bypass_trans_m: float = g("icp_rms_bypass_trans_m")
         self.icp_r_rms_nom: float = g("icp_r_rms_nom")
         self.icp_r_inl_nom: int = g("icp_r_inl_nom")
 
@@ -839,6 +845,7 @@ class ElevationNode(Node):
             max_correction_trans_m=self.icp_max_corr_trans_m,
             max_correction_rot_rad=self.icp_max_corr_rot_rad,
             max_rms_residual_m=self.icp_max_rms_residual_m,
+            min_rms_to_bypass_trans_m=self.icp_rms_bypass_trans_m,
             yaw_restarts=self.icp_yaw_restarts,
             yaw_search_deg=self.icp_yaw_search_deg,
         )

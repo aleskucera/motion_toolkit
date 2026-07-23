@@ -441,6 +441,11 @@ class ElevationNode(Node):
         # signal that lets the rot cap relax safely. Good rotate fits ~0.03-0.055, aliased/
         # diverged ones >=0.086, so 0.08 separates them. 0 = off (library default).
         d("icp_max_rms_residual_m", 0.08)
+        # Bypass the translation correction cap when ICP RMS is strictly below this value — a
+        # sub-threshold RMS cannot be an aliased fit, so the cap should not apply. Set to ~half
+        # of icp_max_rms_residual_m (e.g. 0.04 m) to recover well-converged registrations after
+        # odom drift. 0.0 = disabled (default, no behaviour change).
+        d("icp_rms_bypass_trans_m", 0.0)
         # Yaw multi-start: run this many ICPs from headings spread over icp_yaw_search_deg about
         # the prediction and keep the best fit — escapes the wrong rotational basin under fast
         # skid-steer yaw. 1 = single ICP (off). GPU-parallel-friendly; costs ~N ICP launches.
@@ -600,6 +605,7 @@ class ElevationNode(Node):
         self.icp_max_corr_rot_rad: float = float(np.deg2rad(g("icp_max_corr_rot_deg")))
         self.icp_min_submap_points: int = g("icp_min_submap_points")
         self.icp_max_rms_residual_m: float = g("icp_max_rms_residual_m")
+        self.icp_rms_bypass_trans_m: float = g("icp_rms_bypass_trans_m")
         self.icp_yaw_restarts: int = g("icp_yaw_restarts")
         self.icp_yaw_search_deg: float = g("icp_yaw_search_deg")
         self.dynamic_enable: bool = g("dynamic_enable")
@@ -692,6 +698,7 @@ class ElevationNode(Node):
             max_correction_trans_m=self.icp_max_corr_trans_m,
             max_correction_rot_rad=self.icp_max_corr_rot_rad,
             max_rms_residual_m=self.icp_max_rms_residual_m,
+            min_rms_to_bypass_trans_m=self.icp_rms_bypass_trans_m,
             yaw_restarts=self.icp_yaw_restarts,
             yaw_search_deg=self.icp_yaw_search_deg,
         )

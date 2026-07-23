@@ -50,6 +50,12 @@ class LocalizerConfig:
     # a perfectly good alignment routinely plateaus just above it and burns all iterations
     # without ever tripping it, so gating on it rejects good registrations.
     max_rms_residual_m: float = 0.0
+    # Bypass the translation correction cap when the RMS is strictly below this value.
+    # An aliased ICP result cannot produce sub-threshold RMS with many inliers, so the
+    # cap only harms genuinely clean fits that happen to correct a large odom drift.
+    # 0.0 disables the bypass (default — no change in behaviour vs. the plain trans cap).
+    # Typical value: ~half of max_rms_residual_m (e.g. 0.04 m when the cap is 0.08 m).
+    min_rms_to_bypass_trans_m: float = 0.0
     # Yaw multi-start: run this many ICPs from initial headings spread across
     # +-yaw_search_deg/2 about the predicted yaw, and keep the best-fitting (lowest RMS with
     # enough inliers). Escapes the wrong rotational basin a single init falls into under fast
@@ -199,9 +205,15 @@ class Localizer:
             if result.num_inliers > 0
             else float("inf")
         )
+        # Translation cap: normal rail OR bypassed when the fit is exceptionally clean.
+        # An aliased basin cannot produce rms < min_rms_to_bypass_trans_m with many inliers,
+        # so a sub-threshold RMS is evidence the correction is genuine, not a hallucination.
+        trans_ok = trans <= cfg.max_correction_trans_m or (
+            cfg.min_rms_to_bypass_trans_m > 0.0 and rms < cfg.min_rms_to_bypass_trans_m
+        )
         accepted = (
             result.num_inliers >= cfg.min_inliers
-            and trans <= cfg.max_correction_trans_m
+            and trans_ok
             and rot <= cfg.max_correction_rot_rad
             and (cfg.max_rms_residual_m <= 0.0 or rms <= cfg.max_rms_residual_m)
         )
